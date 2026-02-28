@@ -59,7 +59,7 @@ use bitcoin::{
 use mining_sv2::{SetCustomMiningJob, SubmitSharesExtended};
 use std::{collections::HashMap, convert::TryInto, marker::PhantomData};
 use template_distribution_sv2::{NewTemplate, SetNewPrevHash as SetNewPrevHashTdp};
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Mining Server abstraction of a Sv2 Extended Channel.
 ///
@@ -795,6 +795,17 @@ where
 
             Ok(ShareValidationResult::Valid(share_hash.to_raw_hash()))
         } else {
+            let current_target_bytes = self.target.to_be_bytes();
+            warn!(
+                "DIFFICULTY_TOO_LOW: channel_id={}, job_id={}, share={}, job_target={}, current_target={}, is_active={}, targets_match={}",
+                self.channel_id,
+                job_id,
+                bytes_to_hex(&share_hash_target_bytes),
+                bytes_to_hex(&job_target_bytes),
+                bytes_to_hex(&current_target_bytes),
+                is_active_job,
+                *job_target == self.target,
+            );
             Err(ShareValidationError::DoesNotMeetTarget)
         }
     }
