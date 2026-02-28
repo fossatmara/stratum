@@ -30,7 +30,7 @@ use mining_sv2::{
     NewExtendedMiningJob, SetCustomMiningJob, SetCustomMiningJobSuccess,
     SetNewPrevHash as SetNewPrevHashMp, SubmitSharesExtended,
 };
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// A type alias representing an extended mining job tied to a specific `extranonce_prefix` and target.
 ///
@@ -501,20 +501,45 @@ impl<'a> ExtendedChannel<'a> {
         full_extranonce.extend_from_slice(job.1.as_slice());
         full_extranonce.extend_from_slice(share.extranonce.inner_as_ref());
 
+        let cb_prefix = job.0.coinbase_tx_prefix.inner_as_ref();
+        let cb_suffix = job.0.coinbase_tx_suffix.inner_as_ref();
+        let merkle_path_ref = job.0.merkle_path.inner_as_ref();
+
+        warn!(
+            "COINBASE_DEBUG_CLIENT: channel_id={}, job_id={}, extranonce_prefix={}, share_extranonce={}, full_extranonce={}, cb_prefix_len={}, cb_prefix={}, cb_suffix_len={}, cb_suffix={}, merkle_path_len={}",
+            self.channel_id,
+            job_id,
+            bytes_to_hex(job.1.as_slice()),
+            bytes_to_hex(share.extranonce.inner_as_ref()),
+            bytes_to_hex(&full_extranonce),
+            cb_prefix.len(),
+            bytes_to_hex(cb_prefix),
+            cb_suffix.len(),
+            bytes_to_hex(cb_suffix),
+            merkle_path_ref.len(),
+        );
+
         // calculate the merkle root from:
         // - job coinbase_tx_prefix
         // - full extranonce
         // - job coinbase_tx_suffix
         // - job merkle_path
         let merkle_root: [u8; 32] = merkle_root_from_path(
-            job.0.coinbase_tx_prefix.inner_as_ref(),
-            job.0.coinbase_tx_suffix.inner_as_ref(),
+            cb_prefix,
+            cb_suffix,
             full_extranonce.as_ref(),
-            &job.0.merkle_path.inner_as_ref(),
+            &merkle_path_ref,
         )
         .ok_or(ShareValidationError::Invalid)?
         .try_into()
         .expect("merkle root must be 32 bytes");
+
+        warn!(
+            "COINBASE_DEBUG_CLIENT: channel_id={}, job_id={}, merkle_root={}",
+            self.channel_id,
+            job_id,
+            bytes_to_hex(&merkle_root),
+        );
 
         let chain_tip = self
             .chain_tip
