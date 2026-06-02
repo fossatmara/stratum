@@ -205,6 +205,11 @@ pub enum Scenario {
     /// Hashrate steps by `delta_pct` at [`STEP_EVENT_AT_SECS`]; tests
     /// reaction time and sensitivity.
     Step { delta_pct: i32 },
+    /// Hashrate is stable for `settle_minutes` (creating a counter of
+    /// that age since the algorithm won't fire during steady-state),
+    /// then steps by `delta_pct`. Tests reaction time as a function of
+    /// counter age — the key variable identified during calibration.
+    SettledStep { settle_minutes: u64, delta_pct: i32 },
     /// A scenario described directly as a phase list. Lets new
     /// scenarios (stall, sustained noise, transient spike, slow ramp)
     /// compose the [`Phase`] primitives without adding a new variant
@@ -252,6 +257,27 @@ impl Scenario {
                     None,
                 )
             }
+            Scenario::SettledStep {
+                settle_minutes,
+                delta_pct,
+            } => {
+                let settle_secs = settle_minutes * 60;
+                let observation_window = 60 * 60; // 60 min post-step
+                let post = TRUE_HASHRATE * (1.0 + *delta_pct as f32 / 100.0);
+                (
+                    vec![
+                        Phase::Hold {
+                            secs: settle_secs,
+                            h: TRUE_HASHRATE,
+                        },
+                        Phase::Hold {
+                            secs: observation_window,
+                            h: post,
+                        },
+                    ],
+                    None,
+                )
+            }
             Scenario::Custom {
                 phases,
                 initial_estimate,
@@ -272,6 +298,18 @@ impl Scenario {
                 } else {
                     format!("step_minus_{}_at_15min", delta_pct.unsigned_abs())
                 }
+            }
+            Scenario::SettledStep {
+                settle_minutes,
+                delta_pct,
+            } => {
+                let sign = if *delta_pct >= 0 { "plus" } else { "minus" };
+                format!(
+                    "settled_{}min_step_{}_{}",
+                    settle_minutes,
+                    sign,
+                    delta_pct.unsigned_abs()
+                )
             }
             Scenario::Custom { name, .. } => name.clone(),
         }
@@ -302,6 +340,25 @@ impl Scenario {
             return Some(Self::Step {
                 delta_pct: -(d as i32),
             });
+        }
+        // settled_<N>min_step_plus_<D> or settled_<N>min_step_minus_<D>
+        if let Some(rest) = s.strip_prefix("settled_") {
+            let (mins_str, after_min) = rest.split_once("min_step_")?;
+            let settle_minutes: u64 = mins_str.parse().ok()?;
+            if let Some(d_str) = after_min.strip_prefix("plus_") {
+                let d: u32 = d_str.parse().ok()?;
+                return Some(Self::SettledStep {
+                    settle_minutes,
+                    delta_pct: d as i32,
+                });
+            }
+            if let Some(d_str) = after_min.strip_prefix("minus_") {
+                let d: u32 = d_str.parse().ok()?;
+                return Some(Self::SettledStep {
+                    settle_minutes,
+                    delta_pct: -(d as i32),
+                });
+            }
         }
         None
     }
@@ -611,6 +668,10 @@ fn render_summary(results: &[CellResult], w: &mut String) {
         ScenarioFilter::ColdStart => matches!(scen, Scenario::ColdStart),
         ScenarioFilter::StepDelta(d) => {
             matches!(scen, Scenario::Step { delta_pct } if delta_pct == d)
+        }
+        ScenarioFilter::SettledStepDelta { settle_minutes: sm, delta_pct: d } => {
+            matches!(scen, Scenario::SettledStep { settle_minutes, delta_pct }
+                if *settle_minutes == *sm && *delta_pct == *d)
         }
     };
 

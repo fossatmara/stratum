@@ -98,11 +98,11 @@ pub use metrics::{
     derived_registry, jitter_distribution, jitter_for_trial, reaction_sensitivity,
     reaction_time_distribution, reaction_time_for_trial, registry, registry_by_id,
     settled_accuracy_distribution, settled_accuracy_for_trial, BaselineValue, Bias,
-    ConvergenceTime, DecouplingScore, DerivedMetric, Direction, Distribution, Jitter, Metric,
-    MetricCategory, MetricClass, MetricValues, OperationalFitness, RampTargetOvershoot,
-    ReactionAsymmetry, ReactionTime, ScenarioFilter, SettledAccuracy, SummaryFmt, SummarySpec,
-    Tolerance, ToleranceCheck, Variance, CI_SEED, DEFAULT_CI_RESAMPLES,
-    DEFAULT_JITTER_CEILING_PER_MIN,
+    ComprehensiveFitness, ConvergenceTime, CounterAgeSensitivity, DecouplingScore, DerivedMetric,
+    Direction, Distribution, Jitter, Metric, MetricCategory, MetricClass, MetricValues,
+    OperationalFitness, RampTargetOvershoot, ReactionAsymmetry, ReactionTime, ScenarioFilter,
+    SettledAccuracy, SettledReactionTime, SummaryFmt, SummarySpec, Tolerance, ToleranceCheck,
+    Variance, CI_SEED, DEFAULT_CI_RESAMPLES, DEFAULT_JITTER_CEILING_PER_MIN,
 };
 pub use rng::{sample_exponential, sample_poisson, XorShift64};
 pub use schedule::HashrateSchedule;

@@ -515,6 +515,7 @@ pub enum ScenarioFilter {
     Stable,
     ColdStart,
     StepDelta(i32),
+    SettledStepDelta { settle_minutes: u64, delta_pct: i32 },
 }
 
 /// Value-formatting choice for a [`SummarySpec`].
@@ -565,6 +566,7 @@ pub fn registry() -> Vec<Box<dyn Metric>> {
             event_at_secs: STEP_EVENT_AT_SECS,
             react_window_secs: REACT_WINDOW_SECS,
         }),
+        Box::new(SettledReactionTime),
         Box::new(Bias {
             settle_after_secs: INTROSPECTION_SETTLE_AFTER_SECS,
         }),
@@ -1240,6 +1242,243 @@ impl Metric for ReactionTime {
                     .map(|r| format!(" {:.2} |", r))
                     .unwrap_or_else(|| " — |".to_string());
                 w.push_str(&cell_value);
+            }
+            w.push('\n');
+        }
+        w.push('\n');
+    }
+}
+
+/// Reaction time for [`Scenario::SettledStep`] scenarios. The event time
+/// is derived from the cell's `settle_minutes` field (not hardcoded),
+/// and the observation window is 60 minutes — long enough to capture
+/// the slow reactions that occur at high counter ages.
+///
+/// Emits: `settled_reaction_rate`, `settled_reaction_rate_5min`,
+/// `settled_reaction_p10_secs` through `settled_reaction_p99_secs`.
+#[derive(Debug, Clone)]
+pub struct SettledReactionTime;
+
+impl Metric for SettledReactionTime {
+    fn id(&self) -> &'static str {
+        "settled_reaction_time"
+    }
+    fn category(&self) -> MetricCategory {
+        MetricCategory::Behavioral
+    }
+    fn class(&self) -> MetricClass {
+        MetricClass::MustHave
+    }
+    fn applies_to(&self, cell: &Cell) -> bool {
+        matches!(cell.scenario, Scenario::SettledStep { .. })
+    }
+    fn compute(&self, trials: &[Trial], cell: &Cell) -> MetricValues {
+        let settle_minutes = match cell.scenario {
+            Scenario::SettledStep { settle_minutes, .. } => settle_minutes,
+            _ => return MetricValues::new(),
+        };
+        let event_at_secs = settle_minutes * 60;
+        let window_60min = 60 * 60;
+        let window_5min = 5 * 60;
+
+        let (rate_60, dist_60) = reaction_time_distribution(trials, event_at_secs, window_60min);
+        let (rate_5, _) = reaction_time_distribution(trials, event_at_secs, window_5min);
+
+        // Actual counter age at step time: time since the last fire
+        // before the event. This shows whether the intended settle
+        // duration actually produces the expected counter age, or
+        // whether jitter fires keep the counter young.
+        let actual_ages: Vec<f64> = trials
+            .iter()
+            .map(|trial| {
+                let last_fire_before = trial
+                    .ticks
+                    .iter()
+                    .filter(|t| t.fired && t.t_secs <= event_at_secs)
+                    .map(|t| t.t_secs)
+                    .max()
+                    .unwrap_or(0);
+                (event_at_secs - last_fire_before) as f64
+            })
+            .collect();
+        let age_dist = Distribution::new(actual_ages);
+
+        let mut v = MetricValues::new();
+        let (rate_lo, rate_hi) = proportion_ci(rate_60, trials.len());
+        v.set_with_ci("settled_reaction_rate", Some(rate_60), rate_lo, rate_hi);
+        v.set("settled_reaction_rate_5min", Some(rate_5));
+        dist_60.record_percentile(&mut v, "settled_reaction_p10_secs", 10.0);
+        dist_60.record_percentile(&mut v, "settled_reaction_p25_secs", 25.0);
+        dist_60.record_percentile(&mut v, "settled_reaction_p50_secs", 50.0);
+        dist_60.record_percentile(&mut v, "settled_reaction_p75_secs", 75.0);
+        dist_60.record_percentile(&mut v, "settled_reaction_p90_secs", 90.0);
+        dist_60.record_percentile(&mut v, "settled_reaction_p95_secs", 95.0);
+        dist_60.record_percentile(&mut v, "settled_reaction_p99_secs", 99.0);
+        v.set("settled_reaction_mean_secs", dist_60.mean());
+        // Actual counter age at step time
+        age_dist.record_percentile(&mut v, "actual_counter_age_p10_secs", 10.0);
+        age_dist.record_percentile(&mut v, "actual_counter_age_p50_secs", 50.0);
+        age_dist.record_percentile(&mut v, "actual_counter_age_p90_secs", 90.0);
+        v.set("actual_counter_age_mean_secs", age_dist.mean());
+        v
+    }
+    fn tolerance_checks(&self, cell: &Cell) -> Vec<ToleranceCheck> {
+        let delta_mag = match cell.scenario {
+            Scenario::SettledStep { delta_pct, .. } => delta_pct.unsigned_abs(),
+            _ => return vec![],
+        };
+        let mut checks = vec![];
+        if delta_mag >= 50 {
+            checks.push(ToleranceCheck {
+                key: "settled_reaction_rate",
+                tolerance: Tolerance::WithinCi {
+                    direction: Direction::HigherIsBetter,
+                    extra_abs: 0.02,
+                    extra_mul: None,
+                },
+            });
+        }
+        checks
+    }
+    fn summary_specs(&self) -> Vec<SummarySpec> {
+        vec![
+            SummarySpec {
+                label: "reaction rate (60min counter, -50%)",
+                key: "settled_reaction_rate",
+                direction: Direction::HigherIsBetter,
+                scenario_filter: ScenarioFilter::SettledStepDelta {
+                    settle_minutes: 60,
+                    delta_pct: -50,
+                },
+                fmt: SummaryFmt::Percentage,
+            },
+            SummarySpec {
+                label: "reaction p50 (60min counter, -50%)",
+                key: "settled_reaction_p50_secs",
+                direction: Direction::LowerIsBetter,
+                scenario_filter: ScenarioFilter::SettledStepDelta {
+                    settle_minutes: 60,
+                    delta_pct: -50,
+                },
+                fmt: SummaryFmt::Duration,
+            },
+        ]
+    }
+    fn render_markdown(&self, results: &[crate::baseline::CellResult], w: &mut String) {
+        use crate::baseline::{fmt_duration, fmt_pct, unique_rates};
+
+        let settled_results: Vec<&crate::baseline::CellResult> = results
+            .iter()
+            .filter(|r| matches!(r.scenario, Scenario::SettledStep { .. }))
+            .collect();
+        if settled_results.is_empty() {
+            return;
+        }
+
+        let rates = unique_rates(results);
+        let settle_values: Vec<u64> = {
+            let mut sv: Vec<u64> = settled_results
+                .iter()
+                .filter_map(|r| match r.scenario {
+                    Scenario::SettledStep { settle_minutes, .. } => Some(settle_minutes),
+                    _ => None,
+                })
+                .collect();
+            sv.sort_unstable();
+            sv.dedup();
+            sv
+        };
+
+        // For each delta direction, emit a 2D table: share_rate × counter_age
+        for (label, delta_sign) in &[("-50% step", -50i32), ("+50% step", 50i32)] {
+            w.push_str(&format!(
+                "## Reaction time to {} by counter age\n\n",
+                label
+            ));
+            w.push_str("| share/min |");
+            for sm in &settle_values {
+                w.push_str(&format!(" {}min |", sm));
+            }
+            w.push_str("\n| --- |");
+            for _ in &settle_values {
+                w.push_str(" --- |");
+            }
+            w.push('\n');
+
+            for &spm in &rates {
+                w.push_str(&format!("| {} |", spm));
+                for &sm in &settle_values {
+                    let key = format!("settled_{}min_step_{}_{}", sm,
+                        if *delta_sign >= 0 { "plus" } else { "minus" },
+                        delta_sign.unsigned_abs());
+                    let cell = results.iter().find(|r| {
+                        r.shares_per_minute as u32 == spm && r.scenario_key() == key
+                    });
+                    let val = cell.and_then(|c| c.get("settled_reaction_p50_secs"));
+                    w.push_str(&format!(" {} |", fmt_duration(val)));
+                }
+                w.push('\n');
+            }
+            w.push('\n');
+
+            // Also emit the reaction rate (60-min window) table
+            w.push_str(&format!(
+                "### Reaction rate (60-min window) — {}\n\n",
+                label
+            ));
+            w.push_str("| share/min |");
+            for sm in &settle_values {
+                w.push_str(&format!(" {}min |", sm));
+            }
+            w.push_str("\n| --- |");
+            for _ in &settle_values {
+                w.push_str(" --- |");
+            }
+            w.push('\n');
+
+            for &spm in &rates {
+                w.push_str(&format!("| {} |", spm));
+                for &sm in &settle_values {
+                    let key = format!("settled_{}min_step_{}_{}", sm,
+                        if *delta_sign >= 0 { "plus" } else { "minus" },
+                        delta_sign.unsigned_abs());
+                    let cell = results.iter().find(|r| {
+                        r.shares_per_minute as u32 == spm && r.scenario_key() == key
+                    });
+                    let val = cell.and_then(|c| c.get("settled_reaction_rate"));
+                    w.push_str(&format!(" {} |", fmt_pct(val)));
+                }
+                w.push('\n');
+            }
+            w.push('\n');
+        }
+
+        // Actual counter age table (one table, using -50% step data)
+        w.push_str("## Actual counter age at step time (p50)\n\n");
+        w.push_str(
+            "Shows the actual time since last fire before the step event. \
+             If jitter fires keep the counter young, this will be much less \
+             than the intended settle duration.\n\n",
+        );
+        w.push_str("| share/min |");
+        for sm in &settle_values {
+            w.push_str(&format!(" settle={}min |", sm));
+        }
+        w.push_str("\n| --- |");
+        for _ in &settle_values {
+            w.push_str(" --- |");
+        }
+        w.push('\n');
+
+        for &spm in &rates {
+            w.push_str(&format!("| {} |", spm));
+            for &sm in &settle_values {
+                let key = format!("settled_{}min_step_minus_50", sm);
+                let cell = results.iter().find(|r| {
+                    r.shares_per_minute as u32 == spm && r.scenario_key() == key
+                });
+                let val = cell.and_then(|c| c.get("actual_counter_age_p50_secs"));
+                w.push_str(&format!(" {} |", fmt_duration(val)));
             }
             w.push('\n');
         }
@@ -1999,6 +2238,8 @@ pub trait DerivedMetric: Send + Sync + Debug {
 pub fn derived_registry() -> Vec<Box<dyn DerivedMetric>> {
     vec![
         Box::new(OperationalFitness),
+        Box::new(CounterAgeSensitivity),
+        Box::new(ComprehensiveFitness),
         Box::new(DecouplingScore),
         Box::new(ReactionAsymmetry),
     ]
@@ -2570,6 +2811,289 @@ impl DerivedMetric for ReactionAsymmetry {
     }
 }
 
+// ---- CounterAgeSensitivity -------------------------------------------------
+
+/// Counter-age sensitivity: measures how well the algorithm detects
+/// partial hashrate degradation (-10%) when the counter is mature
+/// (60 min since last fire).
+///
+/// The **score** is the `settled_reaction_rate` from the
+/// `SettledStep { settle_minutes: 60, delta_pct: -10 }` cell — the
+/// probability of detecting a 10% hashrate drop within 60 minutes at
+/// a mature counter age. This directly answers the operationally
+/// relevant question: "can the algorithm notice slow degradation
+/// (thermal throttle, failing ASICs) under typical conditions?"
+///
+/// Diagnostic ratios (p50 reaction time at 60-min / 5-min counter)
+/// are also emitted for both -50% and -10% steps, explaining *why*
+/// the score is what it is.
+#[derive(Debug, Clone, Default)]
+pub struct CounterAgeSensitivity;
+
+impl DerivedMetric for CounterAgeSensitivity {
+    fn id(&self) -> &'static str {
+        "counter_age_sensitivity"
+    }
+
+    fn class(&self) -> MetricClass {
+        MetricClass::MustHave
+    }
+
+    fn compute(&self, results: &[crate::baseline::CellResult]) -> Vec<(f32, MetricValues)> {
+        #[derive(Default)]
+        struct Inputs {
+            young_50_p50: Option<f64>,
+            mature_50_p50: Option<f64>,
+            young_10_p50: Option<f64>,
+            mature_10_p50: Option<f64>,
+            mature_10_rate: Option<f64>,
+        }
+
+        let mut by_spm: HashMap<u32, Inputs> = HashMap::new();
+
+        for r in results {
+            let spm = r.shares_per_minute as u32;
+            let entry = by_spm.entry(spm).or_default();
+            match r.scenario {
+                Scenario::SettledStep {
+                    settle_minutes: 5,
+                    delta_pct: -50,
+                } => {
+                    entry.young_50_p50 = r.get("settled_reaction_p50_secs");
+                }
+                Scenario::SettledStep {
+                    settle_minutes: 60,
+                    delta_pct: -50,
+                } => {
+                    entry.mature_50_p50 = r.get("settled_reaction_p50_secs");
+                }
+                Scenario::SettledStep {
+                    settle_minutes: 5,
+                    delta_pct: -10,
+                } => {
+                    entry.young_10_p50 = r.get("settled_reaction_p50_secs");
+                }
+                Scenario::SettledStep {
+                    settle_minutes: 60,
+                    delta_pct: -10,
+                } => {
+                    entry.mature_10_p50 = r.get("settled_reaction_p50_secs");
+                    entry.mature_10_rate = r.get("settled_reaction_rate");
+                }
+                _ => {}
+            }
+        }
+
+        let mut entries: Vec<_> = by_spm.into_iter().collect();
+        entries.sort_by_key(|&(spm, _)| spm);
+
+        entries
+            .into_iter()
+            .filter_map(|(spm, inp)| {
+                let mut mv = MetricValues::new();
+                let mut has_any = false;
+
+                // Diagnostic ratios
+                if let (Some(y), Some(m)) = (inp.young_50_p50, inp.mature_50_p50) {
+                    if y > 0.0 {
+                        mv.set("ratio_50pct", Some(m / y));
+                        has_any = true;
+                    }
+                }
+                if let (Some(y), Some(m)) = (inp.young_10_p50, inp.mature_10_p50) {
+                    if y > 0.0 {
+                        mv.set("ratio_10pct", Some(m / y));
+                        has_any = true;
+                    }
+                }
+
+                // Score: P[detect -10% drop within 60min at mature counter]
+                // This is the operationally relevant capability measure.
+                if let Some(rate) = inp.mature_10_rate {
+                    mv.set("score", Some(rate));
+                    has_any = true;
+                }
+
+                if has_any {
+                    Some((spm as f32, mv))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn tolerance_checks(&self, _spm: f32) -> Vec<ToleranceCheck> {
+        vec![ToleranceCheck {
+            key: "score",
+            tolerance: Tolerance::WithinCi {
+                direction: Direction::HigherIsBetter,
+                extra_abs: 0.05,
+                extra_mul: None,
+            },
+        }]
+    }
+
+    fn summary_specs(&self) -> Vec<SummarySpec> {
+        vec![
+            SummarySpec {
+                label: "mature-counter detection (-10%)",
+                key: "score",
+                direction: Direction::HigherIsBetter,
+                scenario_filter: ScenarioFilter::Any,
+                fmt: SummaryFmt::Percentage,
+            },
+            SummarySpec {
+                label: "counter-age ratio (-50%)",
+                key: "ratio_50pct",
+                direction: Direction::LowerIsBetter,
+                scenario_filter: ScenarioFilter::Any,
+                fmt: SummaryFmt::Float3,
+            },
+        ]
+    }
+
+    fn render_markdown(&self, results: &[crate::baseline::CellResult], w: &mut String) {
+        let computed = self.compute(results);
+        if computed.is_empty() {
+            return;
+        }
+        w.push_str("## Counter-age sensitivity (per share rate)\n\n");
+        w.push_str(
+            "Score = P[detect -10% drop within 60 min at 60-min counter age]. \
+             Higher is better — the operationally relevant measure of whether \
+             the algorithm can notice partial degradation under typical conditions. \
+             Ratios show p50 reaction time at mature vs young counter for diagnostics.\n\n",
+        );
+        w.push_str("| share/min | score | ratio (-50%) | ratio (-10%) |\n");
+        w.push_str("| --- | --- | --- | --- |\n");
+        for (spm, mv) in &computed {
+            let score = mv
+                .get("score")
+                .map(|v| format!("{:.1}%", v * 100.0))
+                .unwrap_or_else(|| "—".to_string());
+            let r50 = mv
+                .get("ratio_50pct")
+                .map(|v| format!("{:.1}×", v))
+                .unwrap_or_else(|| "—".to_string());
+            let r10 = mv
+                .get("ratio_10pct")
+                .map(|v| format!("{:.1}×", v))
+                .unwrap_or_else(|| "—".to_string());
+            w.push_str(&format!("| {} | {} | {} | {} |\n", *spm as u32, score, r50, r10));
+        }
+        w.push('\n');
+    }
+}
+
+// ---- ComprehensiveFitness -------------------------------------------------
+
+/// Composite metric that combines [`OperationalFitness`] (80%) with
+/// counter-age independence (20%). This is the single scalar the
+/// automated parameter search should optimize.
+///
+/// ```text
+/// comprehensive = 0.80 × operational_fitness + 0.20 × counter_age_score
+/// ```
+///
+/// Where `counter_age_score` is `CounterAgeSensitivity.score` (1.0 for
+/// age-independent algorithms, approaching 0.0 for algorithms whose
+/// reaction time degrades linearly with counter age).
+#[derive(Debug, Clone, Default)]
+pub struct ComprehensiveFitness;
+
+impl DerivedMetric for ComprehensiveFitness {
+    fn id(&self) -> &'static str {
+        "comprehensive_fitness"
+    }
+
+    fn class(&self) -> MetricClass {
+        MetricClass::MustHave
+    }
+
+    fn compute(&self, results: &[crate::baseline::CellResult]) -> Vec<(f32, MetricValues)> {
+        let op_scores: HashMap<u32, f64> = OperationalFitness
+            .compute(results)
+            .into_iter()
+            .filter_map(|(spm, mv)| mv.get("score").map(|s| (spm as u32, s)))
+            .collect();
+
+        let ca_scores: HashMap<u32, f64> = CounterAgeSensitivity
+            .compute(results)
+            .into_iter()
+            .filter_map(|(spm, mv)| mv.get("score").map(|s| (spm as u32, s)))
+            .collect();
+
+        let mut spms: Vec<u32> = op_scores.keys().copied().collect();
+        spms.sort_unstable();
+
+        spms.into_iter()
+            .filter_map(|spm| {
+                let op = *op_scores.get(&spm)?;
+                let ca = ca_scores.get(&spm).copied().unwrap_or(1.0);
+                let comprehensive = 0.80 * op + 0.20 * ca;
+
+                let mut mv = MetricValues::new();
+                mv.set("score", Some(comprehensive));
+                mv.set("operational_component", Some(op));
+                mv.set("counter_age_component", Some(ca));
+                Some((spm as f32, mv))
+            })
+            .collect()
+    }
+
+    fn tolerance_checks(&self, _spm: f32) -> Vec<ToleranceCheck> {
+        vec![ToleranceCheck {
+            key: "score",
+            tolerance: Tolerance::WithinCi {
+                direction: Direction::HigherIsBetter,
+                extra_abs: 0.05,
+                extra_mul: None,
+            },
+        }]
+    }
+
+    fn summary_specs(&self) -> Vec<SummarySpec> {
+        vec![SummarySpec {
+            label: "comprehensive fitness",
+            key: "score",
+            direction: Direction::HigherIsBetter,
+            scenario_filter: ScenarioFilter::Any,
+            fmt: SummaryFmt::Float3,
+        }]
+    }
+
+    fn render_markdown(&self, results: &[crate::baseline::CellResult], w: &mut String) {
+        let computed = self.compute(results);
+        if computed.is_empty() {
+            return;
+        }
+        w.push_str("## Comprehensive fitness (per share rate)\n\n");
+        w.push_str(
+            "`0.80 × operational_fitness + 0.20 × counter_age_independence`. \
+             Higher is better.\n\n",
+        );
+        w.push_str("| share/min | comprehensive | operational | counter-age |\n");
+        w.push_str("| --- | --- | --- | --- |\n");
+        for (spm, mv) in &computed {
+            let comp = mv
+                .get("score")
+                .map(|v| format!("{:.3}", v))
+                .unwrap_or_else(|| "—".to_string());
+            let op = mv
+                .get("operational_component")
+                .map(|v| format!("{:.3}", v))
+                .unwrap_or_else(|| "—".to_string());
+            let ca = mv
+                .get("counter_age_component")
+                .map(|v| format!("{:.3}", v))
+                .unwrap_or_else(|| "—".to_string());
+            w.push_str(&format!("| {} | {} | {} | {} |\n", *spm as u32, comp, op, ca));
+        }
+        w.push('\n');
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -2985,6 +3509,7 @@ mod tests {
                 "settled_accuracy",
                 "jitter",
                 "reaction_time",
+                "settled_reaction_time",
                 "bias",
                 "variance",
                 "ramp_target_overshoot",
@@ -3003,6 +3528,8 @@ mod tests {
             ids,
             vec![
                 "operational_fitness",
+                "counter_age_sensitivity",
+                "comprehensive_fitness",
                 "decoupling_score",
                 "reaction_asymmetry"
             ]
@@ -3472,5 +3999,179 @@ mod tests {
         assert!(out.contains("Reaction asymmetry"));
         assert!(out.contains("δ=50%"));
         assert!(out.contains("+0.10")); // signed format
+    }
+
+    // ---- CounterAgeSensitivity ----
+
+    fn settled_cell(spm: f32, settle_minutes: u64, delta_pct: i32, p50_secs: f64) -> CellResult {
+        settled_cell_with_rate(spm, settle_minutes, delta_pct, p50_secs, 1.0)
+    }
+
+    fn settled_cell_with_rate(
+        spm: f32,
+        settle_minutes: u64,
+        delta_pct: i32,
+        p50_secs: f64,
+        reaction_rate: f64,
+    ) -> CellResult {
+        let mut r = CellResult::new(
+            spm,
+            Scenario::SettledStep {
+                settle_minutes,
+                delta_pct,
+            },
+        );
+        let mut mv = MetricValues::new();
+        mv.set("settled_reaction_rate", Some(reaction_rate));
+        mv.set("settled_reaction_p50_secs", Some(p50_secs));
+        r.metrics.insert("settled_reaction_time", mv);
+        r
+    }
+
+    #[test]
+    fn counter_age_sensitivity_ratio_1_for_age_independent() {
+        let cells = vec![
+            settled_cell(12.0, 5, -50, 120.0),
+            settled_cell(12.0, 60, -50, 120.0),
+            settled_cell_with_rate(12.0, 60, -10, 300.0, 0.85),
+        ];
+        let out = CounterAgeSensitivity.compute(&cells);
+        assert_eq!(out.len(), 1);
+        let (spm, mv) = &out[0];
+        assert_eq!(*spm, 12.0);
+        let ratio = mv.get("ratio_50pct").unwrap();
+        assert!((ratio - 1.0).abs() < 0.01, "ratio should be 1.0, got {}", ratio);
+        // Score is the mature-counter -10% detection rate
+        let score = mv.get("score").unwrap();
+        assert!((score - 0.85).abs() < 0.01, "score should be 0.85, got {}", score);
+    }
+
+    #[test]
+    fn counter_age_sensitivity_high_ratio_for_age_dependent() {
+        let cells = vec![
+            settled_cell(12.0, 5, -50, 120.0),
+            settled_cell(12.0, 60, -50, 1200.0),
+            settled_cell_with_rate(12.0, 60, -10, 3000.0, 0.05), // barely detects
+        ];
+        let out = CounterAgeSensitivity.compute(&cells);
+        assert_eq!(out.len(), 1);
+        let (_, mv) = &out[0];
+        let ratio = mv.get("ratio_50pct").unwrap();
+        assert!((ratio - 10.0).abs() < 0.01, "ratio should be 10.0, got {}", ratio);
+        // Score is the low detection rate
+        let score = mv.get("score").unwrap();
+        assert!((score - 0.05).abs() < 0.01, "score should be 0.05, got {}", score);
+    }
+
+    #[test]
+    fn counter_age_sensitivity_empty_without_settled_cells() {
+        let cells = vec![CellResult::new(12.0, Scenario::Stable)];
+        let out = CounterAgeSensitivity.compute(&cells);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn counter_age_sensitivity_handles_missing_mature_cell() {
+        // Only young cell, no mature — should produce no output
+        let cells = vec![settled_cell(12.0, 5, -50, 120.0)];
+        let out = CounterAgeSensitivity.compute(&cells);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn counter_age_sensitivity_multiple_share_rates() {
+        let cells = vec![
+            settled_cell(6.0, 5, -50, 120.0),
+            settled_cell(6.0, 60, -50, 600.0),
+            settled_cell_with_rate(6.0, 60, -10, 1800.0, 0.50),
+            settled_cell(20.0, 5, -50, 60.0),
+            settled_cell(20.0, 60, -50, 60.0),
+            settled_cell_with_rate(20.0, 60, -10, 300.0, 0.90),
+        ];
+        let out = CounterAgeSensitivity.compute(&cells);
+        assert_eq!(out.len(), 2);
+        // spm=6: ratio=5.0, score=0.50
+        let (spm6, mv6) = &out[0];
+        assert_eq!(*spm6, 6.0);
+        assert!((mv6.get("ratio_50pct").unwrap() - 5.0).abs() < 0.01);
+        assert!((mv6.get("score").unwrap() - 0.50).abs() < 0.01);
+        // spm=20: ratio=1.0, score=0.90
+        let (spm20, mv20) = &out[1];
+        assert_eq!(*spm20, 20.0);
+        assert!((mv20.get("ratio_50pct").unwrap() - 1.0).abs() < 0.01);
+        assert!((mv20.get("score").unwrap() - 0.90).abs() < 0.01);
+    }
+
+    // ---- ComprehensiveFitness ----
+
+    #[test]
+    fn comprehensive_fitness_combines_operational_and_counter_age() {
+        let mut cells = vec![
+            CellResult::new(12.0, Scenario::Stable),
+            CellResult::new(12.0, Scenario::Step { delta_pct: -10 }),
+            CellResult::new(12.0, Scenario::Step { delta_pct: -50 }),
+            CellResult::new(12.0, Scenario::ColdStart),
+            settled_cell(12.0, 5, -50, 120.0),
+            settled_cell(12.0, 60, -50, 120.0),
+            settled_cell_with_rate(12.0, 60, -10, 300.0, 0.80),
+        ];
+        let mut stable_mv = MetricValues::new();
+        stable_mv.set("jitter_mean_per_min", Some(0.0));
+        stable_mv.set("upward_step_magnitude_p95", Some(1.0));
+        cells[0].metrics.insert("jitter", stable_mv);
+        let mut step_mag_mv = MetricValues::new();
+        step_mag_mv.set("upward_step_magnitude_p95", Some(1.0));
+        cells[0].metrics.insert("upward_step_magnitude", step_mag_mv);
+
+        let out = ComprehensiveFitness.compute(&cells);
+        assert!(!out.is_empty());
+        let (spm, mv) = &out[0];
+        assert_eq!(*spm, 12.0);
+        let comp = mv.get("score").unwrap();
+        let op = mv.get("operational_component").unwrap();
+        let ca = mv.get("counter_age_component").unwrap();
+        // counter_age_component = mature-counter detection rate = 0.80
+        assert!((ca - 0.80).abs() < 0.01);
+        let expected = 0.80 * op + 0.20 * ca;
+        assert!(
+            (comp - expected).abs() < 0.001,
+            "comprehensive={} != 0.80*{}+0.20*{}={}",
+            comp, op, ca, expected
+        );
+    }
+
+    #[test]
+    fn comprehensive_fitness_penalizes_age_dependent() {
+        // Good: detects 90% at mature counter; Bad: detects 5%
+        let cells_good = vec![
+            settled_cell_with_rate(12.0, 60, -10, 300.0, 0.90),
+        ];
+        let cells_bad = vec![
+            settled_cell_with_rate(12.0, 60, -10, 3000.0, 0.05),
+        ];
+        let ca_good = CounterAgeSensitivity.compute(&cells_good);
+        let ca_bad = CounterAgeSensitivity.compute(&cells_bad);
+        let score_good = ca_good[0].1.get("score").unwrap();
+        let score_bad = ca_bad[0].1.get("score").unwrap();
+        assert!(
+            score_good > score_bad,
+            "high detection rate ({}) should score higher than low ({})",
+            score_good,
+            score_bad
+        );
+    }
+
+    #[test]
+    fn comprehensive_fitness_defaults_to_1_without_counter_age_data() {
+        let cells = vec![
+            CellResult::new(12.0, Scenario::Stable),
+            CellResult::new(12.0, Scenario::ColdStart),
+        ];
+        let out = ComprehensiveFitness.compute(&cells);
+        if !out.is_empty() {
+            let (_, mv) = &out[0];
+            let ca = mv.get("counter_age_component").unwrap_or(1.0);
+            assert!((ca - 1.0).abs() < 0.01, "should default to 1.0 without data");
+        }
     }
 }

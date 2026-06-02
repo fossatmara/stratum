@@ -751,6 +751,40 @@ impl Grid {
         }
     }
 
+    /// Counter-age characterization grid: tests reaction time as a
+    /// function of how long the algorithm has been settled (counter
+    /// age) before a step change. Produces the 2D table
+    /// (share_rate × counter_age) that maps directly to shape-proxy
+    /// calibration results.
+    ///
+    /// Uses `ClassicComposed` (the threshold-ladder algorithm) since
+    /// counter age is the defining variable for the classic algo's
+    /// `StepFunction` boundary. Also includes `VardiffState` (now
+    /// AdaCUSUM) for comparison.
+    pub fn settled_step() -> Self {
+        let settle_values: Vec<u64> = vec![5, 15, 30, 60, 120];
+        let deltas: Vec<i32> = vec![-50, 50];
+        let mut scenarios = Vec::new();
+        for &settle in &settle_values {
+            for &delta in &deltas {
+                scenarios.push(Scenario::SettledStep {
+                    settle_minutes: settle,
+                    delta_pct: delta,
+                });
+            }
+        }
+        Self {
+            algorithms: vec![
+                AlgorithmSpec::classic_composed(),
+                AlgorithmSpec::classic_vardiff_state(),
+            ],
+            share_rates: vec![6.0, 8.0, 10.0, 12.0, 15.0, 20.0, 25.0, 30.0],
+            scenarios,
+            trial_count: DEFAULT_TRIAL_COUNT,
+            base_seed: DEFAULT_BASELINE_SEED,
+        }
+    }
+
     /// All cells in the grid (the (share_rate, scenario) tuples).
     /// Independent of the algorithm axis.
     pub fn cells(&self) -> Vec<Cell> {

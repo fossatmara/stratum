@@ -87,12 +87,21 @@ fn main() -> std::io::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."));
 
-    // The canonical scenario set: cold start + stable + 8 step deltas.
-    // Matches `Grid::default_classic` and the existing checked-in
-    // baseline so seed derivation stays consistent.
+    // The canonical scenario set: cold start + stable + 8 step deltas
+    // + 4 counter-age scenarios for sensitivity characterization.
     let mut scenarios = vec![Scenario::ColdStart, Scenario::Stable];
     for &delta in &[-50i32, -25, -10, -5, 5, 10, 25, 50] {
         scenarios.push(Scenario::Step { delta_pct: delta });
+    }
+    // Counter-age characterization: young (5min) vs mature (60min) counter
+    // at both large (-50%) and moderate (-10%) step magnitudes.
+    for &settle in &[5u64, 60] {
+        for &delta in &[-50i32, -10] {
+            scenarios.push(Scenario::SettledStep {
+                settle_minutes: settle,
+                delta_pct: delta,
+            });
+        }
     }
 
     let paired = env::var("VARDIFF_COMPARE_PAIRED")
@@ -296,6 +305,10 @@ fn cell_matches(scen: &Scenario, f: &ScenarioFilter) -> bool {
         ScenarioFilter::ColdStart => matches!(scen, Scenario::ColdStart),
         ScenarioFilter::StepDelta(d) => {
             matches!(scen, Scenario::Step { delta_pct } if delta_pct == d)
+        }
+        ScenarioFilter::SettledStepDelta { settle_minutes: sm, delta_pct: d } => {
+            matches!(scen, Scenario::SettledStep { settle_minutes, delta_pct }
+                if *settle_minutes == *sm && *delta_pct == *d)
         }
     }
 }

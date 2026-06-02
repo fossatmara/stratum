@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use vardiff_sim::baseline::{CellResult, Scenario, DEFAULT_BASELINE_SEED, DEFAULT_TRIAL_COUNT};
 use vardiff_sim::grid::{AlgorithmSpec, Grid};
-use vardiff_sim::metrics::{DerivedMetric, OperationalFitness};
+use vardiff_sim::metrics::{ComprehensiveFitness, DerivedMetric, OperationalFitness};
 
 fn main() -> std::io::Result<()> {
     let trial_count = env_or("VARDIFF_ITER_TRIALS", DEFAULT_TRIAL_COUNT);
@@ -25,6 +25,14 @@ fn main() -> std::io::Result<()> {
     let mut scenarios = vec![Scenario::ColdStart, Scenario::Stable];
     for &d in &[-50i32, -25, -10, -5, 5, 10, 25, 50] {
         scenarios.push(Scenario::Step { delta_pct: d });
+    }
+    for &settle in &[5u64, 60] {
+        for &delta in &[-50i32, -10] {
+            scenarios.push(Scenario::SettledStep {
+                settle_minutes: settle,
+                delta_pct: delta,
+            });
+        }
     }
     let share_rates = vec![6.0, 8.0, 10.0, 12.0, 15.0, 20.0, 30.0];
 
@@ -101,27 +109,37 @@ fn build_report(
     results: &HashMap<String, Vec<CellResult>>,
     trial_count: usize,
 ) -> String {
-    // Compute average fitness across all SPM to rank algorithms
-    let mut algo_fitness: Vec<(String, f64)> = results
+    // Compute average comprehensive fitness across all SPM to rank algorithms
+    let mut algo_fitness: Vec<(String, f64, f64)> = results
         .keys()
         .map(|name| {
             let cells = &results[name];
-            let scores = OperationalFitness.compute(cells);
-            let avg: f64 = if scores.is_empty() {
+            let comp_scores = ComprehensiveFitness.compute(cells);
+            let op_scores = OperationalFitness.compute(cells);
+            let comp_avg: f64 = if comp_scores.is_empty() {
                 0.0
             } else {
-                scores
+                comp_scores
                     .iter()
                     .filter_map(|(_, mv)| mv.get("score"))
                     .sum::<f64>()
-                    / scores.len() as f64
+                    / comp_scores.len() as f64
             };
-            (name.clone(), avg)
+            let op_avg: f64 = if op_scores.is_empty() {
+                0.0
+            } else {
+                op_scores
+                    .iter()
+                    .filter_map(|(_, mv)| mv.get("score"))
+                    .sum::<f64>()
+                    / op_scores.len() as f64
+            };
+            (name.clone(), comp_avg, op_avg)
         })
         .collect();
     algo_fitness.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
-    let sorted_names: Vec<&str> = algo_fitness.iter().map(|(n, _)| n.as_str()).collect();
+    let sorted_names: Vec<&str> = algo_fitness.iter().map(|(n, _, _)| n.as_str()).collect();
 
     let mut out = String::new();
     out.push_str(&format!(
@@ -130,21 +148,22 @@ fn build_report(
         share_rates.first().unwrap_or(&0.0) as &f32,
         share_rates.last().unwrap_or(&0.0) as &f32,
     ));
-    out.push_str("Algorithms sorted by mean operational fitness (best first).\n");
+    out.push_str("Algorithms sorted by mean comprehensive fitness (best first).\n");
     out.push_str("**Bold** = best value at that SPM for that metric.\n\n");
 
     // Ranking table
     out.push_str("## Overall ranking\n\n");
-    out.push_str("| Rank | Algorithm | Mean Fitness |\n");
-    out.push_str("| --- | --- | --- |\n");
-    for (i, (name, score)) in algo_fitness.iter().enumerate() {
+    out.push_str("| Rank | Algorithm | Comprehensive | Operational |\n");
+    out.push_str("| --- | --- | --- | --- |\n");
+    for (i, (name, comp, op)) in algo_fitness.iter().enumerate() {
         let marker = if i == 0 { " ★" } else { "" };
         out.push_str(&format!(
-            "| {} | {}{} | {:.3} |\n",
+            "| {} | {}{} | {:.3} | {:.3} |\n",
             i + 1,
             name,
             marker,
-            score
+            comp,
+            op
         ));
     }
     out.push('\n');
