@@ -74,6 +74,7 @@ pub struct EstimatorSnapshot {
 ///
 /// Implementations: [`CumulativeCounter`] (classic),
 /// [`EwmaEstimator`] (EWMA / FullRemedy),
+/// [`SpmRatioEstimator`] (EWMA with pure SPM-ratio conversion),
 /// [`SlidingWindowEstimator`] (Sliding-Window).
 pub trait Estimator: Debug + Send + Sync {
     /// Record `n_shares` new arrivals since the last fire.
@@ -294,6 +295,125 @@ impl Estimator for EwmaEstimator {
             Ok(h) => h as f32,
             Err(_) => ctx.current_hashrate * realized_share_per_min as f32 / ctx.shares_per_minute,
         };
+        EstimatorSnapshot {
+            h_estimate,
+            realized_share_per_min,
+            n_shares: self.shares_count(),
+            dt_secs,
+            uncertainty: None,
+        }
+    }
+}
+
+/// SPM-ratio estimator: EWMA-smoothed share rate, converted to a
+/// hashrate estimate purely via linear SPM-ratio scaling.
+///
+/// This is mathematically equivalent to `EwmaEstimator`'s linear
+/// fallback path (`current_hashrate * realized_spm / shares_per_minute`),
+/// but uses it as the PRIMARY conversion — never attempting the
+/// `hash_rate_from_target` U256 arithmetic path. This avoids any
+/// precision issues from U256 truncation and makes the conversion
+/// trivially auditable.
+///
+/// ## EWMA smoothing
+///
+/// Identical to [`EwmaEstimator`]:
+///
+/// ```text
+/// alpha = exp(-tick_secs / tau_secs)
+/// rate_per_tick <- alpha * rate_per_tick + (1 - alpha) * n
+/// ```
+///
+/// ## Snapshot conversion
+///
+/// ```text
+/// realized_spm = rate_per_tick * (60 / tick_secs)
+/// h_estimate = current_hashrate * (realized_spm / shares_per_minute)
+/// ```
+///
+/// No U256 arithmetic. No fallback branches.
+///
+/// ## When to use
+///
+/// Prefer this over `EwmaEstimator` when:
+/// - The deployment has hit U256 precision edge cases (very low/high SPM)
+/// - Simplicity and auditability are priorities
+/// - The linear-scaling assumption holds (target was set for
+///   `current_hashrate` at the configured `shares_per_minute`)
+#[derive(Debug)]
+pub struct SpmRatioEstimator {
+    /// Time constant in seconds. Common values: 30, 60, 120, 300.
+    pub tau_secs: u64,
+    /// Tick interval in seconds. Must match the trial driver's tick
+    /// cadence for the EWMA's effective tau to be correct.
+    pub tick_secs: u64,
+    /// Current rate estimate in shares-per-tick.
+    rate_per_tick: f64,
+    /// Number of observations since the last reset. The first
+    /// observation initializes `rate_per_tick` directly (no decay yet).
+    n_observations: u32,
+}
+
+impl SpmRatioEstimator {
+    /// Constructs an SPM-ratio estimator with the given time constant.
+    /// `tick_secs` defaults to 60 (matching the trial driver's default
+    /// tick interval).
+    pub fn new(tau_secs: u64) -> Self {
+        Self {
+            tau_secs,
+            tick_secs: 60,
+            rate_per_tick: 0.0,
+            n_observations: 0,
+        }
+    }
+
+    /// Decay factor per tick: `exp(-tick_secs / tau_secs)`.
+    fn alpha(&self) -> f64 {
+        (-(self.tick_secs as f64) / (self.tau_secs as f64)).exp()
+    }
+}
+
+impl Estimator for SpmRatioEstimator {
+    fn observe(&mut self, n_shares: u32) {
+        let n = n_shares as f64;
+        if self.n_observations == 0 {
+            self.rate_per_tick = n;
+        } else {
+            let alpha = self.alpha();
+            self.rate_per_tick = alpha * self.rate_per_tick + (1.0 - alpha) * n;
+        }
+        self.n_observations = self.n_observations.saturating_add(1);
+    }
+
+    fn on_fire(&mut self, new_hashrate: f32, old_hashrate: f32) {
+        if old_hashrate <= 0.0 || new_hashrate <= 0.0 {
+            self.rate_per_tick = 0.0;
+            self.n_observations = 0;
+            return;
+        }
+
+        // Rescale the smoothed rate by the retarget ratio, identical to
+        // EwmaEstimator: future shares at the same true hashrate arrive
+        // at rate = old_rate / R under the new (harder/easier) target.
+        let ratio = new_hashrate as f64 / old_hashrate as f64;
+        if ratio > 0.0 && ratio.is_finite() {
+            self.rate_per_tick /= ratio;
+        } else {
+            self.rate_per_tick = 0.0;
+            self.n_observations = 0;
+        }
+    }
+
+    fn shares_count(&self) -> u32 {
+        self.rate_per_tick.round().max(0.0) as u32
+    }
+
+    fn snapshot(&self, dt_secs: u64, ctx: &EstimatorContext) -> EstimatorSnapshot {
+        let realized_share_per_min = self.rate_per_tick * (60.0 / self.tick_secs as f64);
+
+        // Pure linear scaling — no U256 arithmetic.
+        let h_estimate = ctx.current_hashrate * realized_share_per_min as f32 / ctx.shares_per_minute;
+
         EstimatorSnapshot {
             h_estimate,
             realized_share_per_min,
@@ -1106,5 +1226,104 @@ mod tests {
         };
         let snap = e.snapshot(60, &ctx);
         assert!((snap.realized_share_per_min - 12.0).abs() < 1e-3);
+    }
+
+    // ---- SpmRatioEstimator ----
+
+    #[test]
+    fn spm_ratio_converges_to_steady_input() {
+        // Feed a constant stream of 12 shares per tick; the EWMA should
+        // converge to 12 regardless of tau.
+        let mut e = SpmRatioEstimator::new(120);
+        for _ in 0..200 {
+            e.observe(12);
+        }
+        assert!(
+            (e.rate_per_tick - 12.0).abs() < 1e-6,
+            "rate_per_tick should converge to 12.0, got {}",
+            e.rate_per_tick
+        );
+    }
+
+    #[test]
+    fn spm_ratio_snapshot_returns_correct_estimate() {
+        // At steady state with realized_spm == shares_per_minute,
+        // h_estimate should equal current_hashrate.
+        let mut e = SpmRatioEstimator::new(60);
+        for _ in 0..100 {
+            e.observe(30);
+        }
+        // rate_per_tick ≈ 30, tick_secs = 60, realized_spm = 30.
+        let target = Target::MAX;
+        let ctx = EstimatorContext {
+            current_hashrate: 1.0e15,
+            current_target: &target,
+            shares_per_minute: 30.0,
+        };
+        let snap = e.snapshot(60, &ctx);
+        // h_estimate = 1e15 * (30 / 30) = 1e15
+        let relative_error = ((snap.h_estimate as f64) - 1.0e15).abs() / 1.0e15;
+        assert!(
+            relative_error < 1e-6,
+            "h_estimate should be ~1e15, got {} (relative err {})",
+            snap.h_estimate,
+            relative_error
+        );
+        assert!((snap.realized_share_per_min - 30.0).abs() < 1e-6);
+
+        // Now test with realized_spm != shares_per_minute (miner is 2x faster).
+        let mut e2 = SpmRatioEstimator::new(60);
+        for _ in 0..100 {
+            e2.observe(60); // 60 shares per tick → 60 spm
+        }
+        let ctx2 = EstimatorContext {
+            current_hashrate: 1.0e15,
+            current_target: &target,
+            shares_per_minute: 30.0,
+        };
+        let snap2 = e2.snapshot(60, &ctx2);
+        // h_estimate = 1e15 * (60 / 30) = 2e15
+        let relative_error2 = ((snap2.h_estimate as f64) - 2.0e15).abs() / 2.0e15;
+        assert!(
+            relative_error2 < 1e-6,
+            "h_estimate should be ~2e15, got {} (relative err {})",
+            snap2.h_estimate,
+            relative_error2
+        );
+    }
+
+    #[test]
+    fn spm_ratio_on_fire_rescales_correctly() {
+        let mut e = SpmRatioEstimator::new(60);
+        for _ in 0..50 {
+            e.observe(30);
+        }
+        // rate_per_tick ≈ 30.0
+        let rate_before = e.rate_per_tick;
+
+        // Fire: new target is 2x harder (hashrate doubled).
+        // Expected: rate_per_tick /= 2.0 (miner finds shares half as often).
+        e.on_fire(2.0e15, 1.0e15);
+        let expected = rate_before / 2.0;
+        assert!(
+            (e.rate_per_tick - expected).abs() < 1e-9,
+            "rate_per_tick should be {} after on_fire, got {}",
+            expected,
+            e.rate_per_tick
+        );
+        // n_observations preserved (not reset).
+        assert!(e.n_observations > 0);
+    }
+
+    #[test]
+    fn spm_ratio_on_fire_with_zero_hashrate_resets() {
+        let mut e = SpmRatioEstimator::new(60);
+        for _ in 0..10 {
+            e.observe(10);
+        }
+        // Zero old_hashrate → full reset.
+        e.on_fire(1.0e15, 0.0);
+        assert_eq!(e.rate_per_tick, 0.0);
+        assert_eq!(e.n_observations, 0);
     }
 }

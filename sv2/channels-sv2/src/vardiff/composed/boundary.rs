@@ -11,6 +11,7 @@
 //! their threshold based on estimator confidence.
 
 use std::fmt::Debug;
+use std::sync::atomic::{AtomicI8, AtomicU32, Ordering};
 
 use super::estimator::EstimatorSnapshot;
 
@@ -410,6 +411,136 @@ impl Boundary for AsymmetricCusumBoundary {
     }
 }
 
+/// Sign-persistence CUSUM: an asymmetric rate-adaptive boundary that
+/// additionally tracks consecutive ticks where the deviation has the same
+/// sign and lowers the threshold when the sign has been consistent for
+/// many ticks.
+///
+/// **Insight (PID integral term analogy):** A persistent sub-threshold drift
+/// in one direction — even if each individual tick is below the firing
+/// threshold — represents strong evidence of a genuine hashrate change.
+/// This boundary captures that insight: after `n` consecutive same-sign
+/// ticks the threshold is reduced by `sign_persistence_discount × (n-1)`,
+/// capped at `max_sign_discount`.
+///
+/// ## State tracking
+///
+/// The `Boundary` trait takes `&self` (immutable). To track sign persistence
+/// across calls, this struct uses atomic types with `Ordering::Relaxed`.
+/// This is safe because vardiff evaluation is single-threaded per channel;
+/// the atomics are merely an interior-mutability mechanism, not a
+/// cross-thread synchronization primitive.
+pub struct SignPersistenceCusumBoundary {
+    /// Base sensitivity (same as AsymmetricCusumBoundary).
+    pub base_sensitivity: f64,
+    /// Reference SPM for rate scaling.
+    pub reference_spm: f64,
+    /// Minimum threshold floor.
+    pub floor: f64,
+    /// Multiplier applied when firing would TIGHTEN difficulty.
+    pub tighten_multiplier: f64,
+    /// Tick interval.
+    pub tick_secs: u64,
+    /// Threshold reduction per consecutive same-sign tick (fractional).
+    /// E.g., 0.02 = 2% reduction per tick.
+    pub sign_persistence_discount: f64,
+    /// Maximum total discount (fractional cap).
+    /// E.g., 0.4 = at most 40% threshold reduction.
+    pub max_sign_discount: f64,
+    /// Number of consecutive ticks with the same sign.
+    consecutive_count: AtomicU32,
+    /// Last observed sign: +1 (over-performing), -1 (under-performing), 0 (unset).
+    last_sign: AtomicI8,
+}
+
+impl SignPersistenceCusumBoundary {
+    /// Constructs with default reference_spm=30 and tick_secs=60.
+    pub fn new(
+        base_sensitivity: f64,
+        floor: f64,
+        tighten_multiplier: f64,
+        sign_persistence_discount: f64,
+        max_sign_discount: f64,
+    ) -> Self {
+        Self {
+            base_sensitivity,
+            reference_spm: 30.0,
+            floor,
+            tighten_multiplier: tighten_multiplier.max(1.0),
+            tick_secs: 60,
+            sign_persistence_discount,
+            max_sign_discount,
+            consecutive_count: AtomicU32::new(0),
+            last_sign: AtomicI8::new(0),
+        }
+    }
+}
+
+impl Debug for SignPersistenceCusumBoundary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignPersistenceCusumBoundary")
+            .field("base_sensitivity", &self.base_sensitivity)
+            .field("reference_spm", &self.reference_spm)
+            .field("floor", &self.floor)
+            .field("tighten_multiplier", &self.tighten_multiplier)
+            .field("tick_secs", &self.tick_secs)
+            .field("sign_persistence_discount", &self.sign_persistence_discount)
+            .field("max_sign_discount", &self.max_sign_discount)
+            .field("consecutive_count", &self.consecutive_count.load(Ordering::Relaxed))
+            .field("last_sign", &self.last_sign.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+impl Boundary for SignPersistenceCusumBoundary {
+    fn threshold(&self, dt_secs: u64, shares_per_minute: f32, snap: &EstimatorSnapshot) -> f64 {
+        // Step 1: Compute the base threshold exactly like AsymmetricCusumBoundary.
+        let n_ticks = (dt_secs as f64 / self.tick_secs as f64).max(1.0);
+
+        let spm_factor = ((shares_per_minute as f64) / self.reference_spm).sqrt();
+        let sensitivity = self.base_sensitivity * spm_factor;
+
+        let effective_floor = match &snap.uncertainty {
+            Some(u) if u.ratio_std > 0.0 => self.floor + u.ratio_std * 0.5,
+            _ => self.floor,
+        };
+
+        let base_threshold_fraction = (sensitivity / n_ticks) + effective_floor;
+
+        // Apply asymmetric tighten multiplier.
+        let would_tighten = snap.realized_share_per_min > shares_per_minute as f64;
+        let asymmetric_threshold = if would_tighten {
+            base_threshold_fraction * self.tighten_multiplier
+        } else {
+            base_threshold_fraction
+        };
+
+        // Step 2: Determine current sign.
+        let current_sign: i8 = if snap.realized_share_per_min > shares_per_minute as f64 {
+            1
+        } else {
+            -1
+        };
+
+        // Step 3: Update sign persistence state.
+        let stored_sign = self.last_sign.load(Ordering::Relaxed);
+        let consecutive = if current_sign == stored_sign {
+            self.consecutive_count.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            self.last_sign.store(current_sign, Ordering::Relaxed);
+            self.consecutive_count.store(1, Ordering::Relaxed);
+            1
+        };
+
+        // Step 4: Compute discount from sign persistence.
+        let discount = (self.sign_persistence_discount * (consecutive - 1) as f64)
+            .min(self.max_sign_discount);
+
+        // Step 5: Apply discount and convert to percentage points.
+        asymmetric_threshold * (1.0 - discount) * 100.0
+    }
+}
+
 impl Boundary for CusumBoundary {
     fn threshold(&self, dt_secs: u64, _shares_per_minute: f32, snap: &EstimatorSnapshot) -> f64 {
         let n_ticks = (dt_secs as f64 / self.tick_secs as f64).max(1.0);
@@ -553,5 +684,140 @@ mod tests {
                 b.threshold(dt, spm, &dummy_snap())
             );
         }
+    }
+
+    // ---- SignPersistenceCusumBoundary ----
+
+    #[test]
+    fn sign_persistence_first_tick_matches_asymmetric() {
+        // On the first call the sign-persistence boundary should return
+        // the same threshold as an equivalent AsymmetricCusumBoundary
+        // (discount is 0 on the first tick: consecutive=1, discount = 0.02*(1-1) = 0).
+        let asym = AsymmetricCusumBoundary::new(3.0, 0.05, 2.0);
+        let sp = SignPersistenceCusumBoundary::new(3.0, 0.05, 2.0, 0.02, 0.4);
+
+        let snap = dummy_snap(); // realized_share_per_min=12.0
+        let spm = 30.0f32; // realized < configured → under-performing → ease direction
+
+        let t_asym = asym.threshold(120, spm, &snap);
+        let t_sp = sp.threshold(120, spm, &snap);
+        assert!(
+            (t_asym - t_sp).abs() < 1e-10,
+            "first tick: asymmetric={}, sign_persistence={}",
+            t_asym,
+            t_sp
+        );
+    }
+
+    #[test]
+    fn sign_persistence_decreases_threshold_on_consecutive_same_sign() {
+        let sp = SignPersistenceCusumBoundary::new(3.0, 0.05, 2.0, 0.02, 0.4);
+        // Under-performing snap: realized_spm=12 < configured_spm=30
+        let snap = dummy_snap();
+        let spm = 30.0f32;
+
+        let t1 = sp.threshold(120, spm, &snap);
+        let t2 = sp.threshold(120, spm, &snap);
+        let t3 = sp.threshold(120, spm, &snap);
+
+        // Each consecutive same-sign tick should reduce the threshold.
+        assert!(
+            t2 < t1,
+            "second tick {} should be less than first {}",
+            t2,
+            t1
+        );
+        assert!(
+            t3 < t2,
+            "third tick {} should be less than second {}",
+            t3,
+            t2
+        );
+
+        // Verify the discount magnitude: tick 2 discount = 0.02*(2-1)=0.02
+        let expected_t2 = t1 * (1.0 - 0.02);
+        assert!(
+            (t2 - expected_t2).abs() < 1e-10,
+            "t2={}, expected={}",
+            t2,
+            expected_t2
+        );
+    }
+
+    #[test]
+    fn sign_persistence_resets_on_sign_reversal() {
+        let sp = SignPersistenceCusumBoundary::new(3.0, 0.05, 2.0, 0.02, 0.4);
+        let spm = 30.0f32;
+
+        // Under-performing: realized=12 < spm=30
+        let snap_under = dummy_snap();
+        let _t1 = sp.threshold(120, spm, &snap_under);
+        let _t2 = sp.threshold(120, spm, &snap_under);
+        let t3 = sp.threshold(120, spm, &snap_under); // consecutive=3, discount=0.04
+
+        // Now flip sign: over-performing (realized=40 > spm=30)
+        let snap_over = EstimatorSnapshot {
+            h_estimate: 1.0e15,
+            realized_share_per_min: 40.0,
+            n_shares: 40,
+            dt_secs: 60,
+            uncertainty: None,
+        };
+
+        // After sign reversal, consecutive resets to 1 → discount = 0.
+        // But note: direction also changes (now tightening), so threshold
+        // itself may be different. The key property is that consecutive reset
+        // means no discount.
+        let t_reversed = sp.threshold(120, spm, &snap_over);
+
+        // Compute what AsymmetricCusumBoundary would give for the over-performing case.
+        let asym = AsymmetricCusumBoundary::new(3.0, 0.05, 2.0);
+        let t_asym_over = asym.threshold(120, spm, &snap_over);
+
+        assert!(
+            (t_reversed - t_asym_over).abs() < 1e-10,
+            "after reversal: got={}, expected asymmetric={}",
+            t_reversed,
+            t_asym_over
+        );
+
+        // Also verify t3 had an active discount (was less than the base).
+        let t_asym_under = asym.threshold(120, spm, &snap_under);
+        assert!(
+            t3 < t_asym_under,
+            "t3={} should be less than base asymmetric={}",
+            t3,
+            t_asym_under
+        );
+    }
+
+    #[test]
+    fn sign_persistence_caps_at_max_discount() {
+        // With discount=0.10 per tick and max=0.4, the cap is reached at
+        // consecutive=5 (discount = 0.10 * 4 = 0.40 = max).
+        let sp = SignPersistenceCusumBoundary::new(3.0, 0.05, 2.0, 0.10, 0.4);
+        let snap = dummy_snap(); // under-performing
+        let spm = 30.0f32;
+
+        let t1 = sp.threshold(120, spm, &snap); // consecutive=1, discount=0.00
+        let _t2 = sp.threshold(120, spm, &snap); // consecutive=2, discount=0.10
+        let _t3 = sp.threshold(120, spm, &snap); // consecutive=3, discount=0.20
+        let _t4 = sp.threshold(120, spm, &snap); // consecutive=4, discount=0.30
+        let t5 = sp.threshold(120, spm, &snap); // consecutive=5, discount=0.40 (capped)
+        let t6 = sp.threshold(120, spm, &snap); // consecutive=6, discount=0.40 (still capped)
+
+        let expected_capped = t1 * (1.0 - 0.4);
+        assert!(
+            (t5 - expected_capped).abs() < 1e-10,
+            "t5={}, expected capped={}",
+            t5,
+            expected_capped
+        );
+        assert!(
+            (t6 - expected_capped).abs() < 1e-10,
+            "t6={}, expected capped={}",
+            t6,
+            expected_capped
+        );
     }
 }

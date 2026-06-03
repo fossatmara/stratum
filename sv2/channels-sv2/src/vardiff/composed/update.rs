@@ -8,6 +8,7 @@
 
 use super::estimator::EstimatorSnapshot;
 use std::fmt::Debug;
+use std::sync::atomic::{AtomicI8, AtomicU32, Ordering};
 
 /// Axis 4: when the algorithm decides to fire, by how much does it move
 /// the target?
@@ -279,6 +280,108 @@ impl UpdateRule for AdaptivePartialRetarget {
     }
 }
 
+/// Accelerating partial retarget: tracks consecutive same-direction fires
+/// and accelerates η accordingly.
+///
+/// ```text
+/// direction = sign(h_estimate - current_hashrate)
+/// if direction == last_direction:
+///     consecutive_same_direction += 1
+/// else:
+///     consecutive_same_direction = 1
+///     last_direction = direction
+/// η_effective = min(eta_base + acceleration × (consecutive - 1), eta_max)
+/// new_hashrate = current + η_effective × (h_estimate - current)
+/// ```
+///
+/// The intuition is that a single fire near the boundary is uncertain —
+/// use the conservative `eta_base`. But when the estimator keeps pulling
+/// in the same direction across multiple fires, confidence grows and the
+/// controller should converge faster. The acceleration ramps η up to
+/// `eta_max` over consecutive same-direction fires.
+///
+/// This variant is a drop-in replacement for [`PartialRetarget`] in
+/// scenarios where slow convergence at `η = 0.2` is acceptable for
+/// stability but cold-start or step-change convergence needs a boost
+/// without switching to [`AdaptivePartialRetarget`]'s margin-based
+/// scaling.
+pub struct AcceleratingPartialRetarget {
+    /// Starting damping factor (e.g., 0.2).
+    pub eta_base: f32,
+    /// Maximum damping factor cap (e.g., 0.6).
+    pub eta_max: f32,
+    /// η increase per consecutive same-direction fire (e.g., 0.1).
+    pub acceleration: f32,
+    /// Number of consecutive fires in the same direction.
+    consecutive_same_direction: AtomicU32,
+    /// Last observed direction: +1 (tighten), -1 (loosen), 0 (initial).
+    last_direction: AtomicI8,
+}
+
+impl Debug for AcceleratingPartialRetarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcceleratingPartialRetarget")
+            .field("eta_base", &self.eta_base)
+            .field("eta_max", &self.eta_max)
+            .field("acceleration", &self.acceleration)
+            .field(
+                "consecutive_same_direction",
+                &self.consecutive_same_direction.load(Ordering::Relaxed),
+            )
+            .field(
+                "last_direction",
+                &self.last_direction.load(Ordering::Relaxed),
+            )
+            .finish()
+    }
+}
+
+impl AcceleratingPartialRetarget {
+    pub fn new(eta_base: f32, eta_max: f32, acceleration: f32) -> Self {
+        Self {
+            eta_base,
+            eta_max,
+            acceleration,
+            consecutive_same_direction: AtomicU32::new(0),
+            last_direction: AtomicI8::new(0),
+        }
+    }
+}
+
+impl UpdateRule for AcceleratingPartialRetarget {
+    fn next_hashrate(
+        &self,
+        snap: &EstimatorSnapshot,
+        current_hashrate: f32,
+        _delta: f64,
+        _threshold: f64,
+        _shares_per_minute: f32,
+    ) -> f32 {
+        // Determine direction: +1 if estimate pulls up (tighten), -1 if down.
+        let direction: i8 = if snap.h_estimate > current_hashrate {
+            1
+        } else {
+            -1
+        };
+
+        let last = self.last_direction.load(Ordering::Relaxed);
+        let consecutive = if direction == last {
+            let c = self.consecutive_same_direction.fetch_add(1, Ordering::Relaxed) + 1;
+            c
+        } else {
+            self.last_direction.store(direction, Ordering::Relaxed);
+            self.consecutive_same_direction.store(1, Ordering::Relaxed);
+            1
+        };
+
+        let eta_effective = (self.eta_base
+            + self.acceleration * (consecutive - 1) as f32)
+            .min(self.eta_max);
+
+        current_hashrate + eta_effective * (snap.h_estimate - current_hashrate)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,5 +517,80 @@ mod tests {
         let u = FullRetargetNoClamp;
         let h = u.next_hashrate(&snap(-1.0e10, 100.0, 60), 1.0e15, 50.0, 50.0, 12.0);
         assert_eq!(h, 0.0);
+    }
+
+    // ---- AcceleratingPartialRetarget ----
+
+    #[test]
+    fn accelerating_first_fire_uses_eta_base() {
+        let u = AcceleratingPartialRetarget::new(0.2, 0.6, 0.1);
+        // current = 1e15, h_estimate = 2e15, direction = +1 (first fire).
+        // η_effective = 0.2 + 0.1 × (1 - 1) = 0.2.
+        // new = 1e15 + 0.2 × (2e15 − 1e15) = 1.2e15.
+        let h = u.next_hashrate(&snap(2.0e15, 12.0, 60), 1.0e15, 100.0, 50.0, 12.0);
+        assert!(
+            (h - 1.2e15).abs() / 1.2e15 < 1e-5,
+            "first fire: expected 1.2e15, got {}",
+            h
+        );
+    }
+
+    #[test]
+    fn accelerating_second_same_direction_uses_eta_base_plus_acceleration() {
+        let u = AcceleratingPartialRetarget::new(0.2, 0.6, 0.1);
+        // First fire: direction = +1.
+        let h1 = u.next_hashrate(&snap(2.0e15, 12.0, 60), 1.0e15, 100.0, 50.0, 12.0);
+        // Second fire: same direction (+1). consecutive = 2.
+        // η_effective = 0.2 + 0.1 × (2 - 1) = 0.3.
+        // new = h1 + 0.3 × (2.0e15 − h1).
+        let h2 = u.next_hashrate(&snap(2.0e15, 12.0, 60), h1, 100.0, 50.0, 12.0);
+        let expected = h1 + 0.3 * (2.0e15 - h1);
+        assert!(
+            (h2 - expected).abs() / expected < 1e-5,
+            "second same-dir fire: expected {}, got {}",
+            expected,
+            h2
+        );
+    }
+
+    #[test]
+    fn accelerating_direction_reversal_resets_to_eta_base() {
+        let u = AcceleratingPartialRetarget::new(0.2, 0.6, 0.1);
+        // Fire twice in +1 direction to build up consecutive count.
+        let h1 = u.next_hashrate(&snap(2.0e15, 12.0, 60), 1.0e15, 100.0, 50.0, 12.0);
+        let _h2 = u.next_hashrate(&snap(2.0e15, 12.0, 60), h1, 100.0, 50.0, 12.0);
+        // Now fire in -1 direction (h_estimate < current). Resets to 1.
+        // η_effective = 0.2 + 0.1 × (1 - 1) = 0.2.
+        let current = 2.0e15;
+        let estimate = 1.0e15;
+        let h3 = u.next_hashrate(&snap(estimate, 12.0, 60), current, 100.0, 50.0, 12.0);
+        let expected = current + 0.2 * (estimate - current);
+        assert!(
+            (h3 - expected).abs() / expected < 1e-5,
+            "direction reversal: expected {}, got {}",
+            expected,
+            h3
+        );
+    }
+
+    #[test]
+    fn accelerating_caps_at_eta_max() {
+        let u = AcceleratingPartialRetarget::new(0.2, 0.6, 0.1);
+        // Fire 10 times in the same direction to exceed eta_max.
+        let mut current = 1.0e15;
+        for _ in 0..10 {
+            current = u.next_hashrate(&snap(2.0e15, 12.0, 60), current, 100.0, 50.0, 12.0);
+        }
+        // By the 10th fire: consecutive = 10, η = 0.2 + 0.1 × 9 = 1.1 → capped at 0.6.
+        // Verify the 11th fire uses η_max = 0.6.
+        let h_before = current;
+        let h_after = u.next_hashrate(&snap(2.0e15, 12.0, 60), h_before, 100.0, 50.0, 12.0);
+        let expected = h_before + 0.6 * (2.0e15 - h_before);
+        assert!(
+            (h_after - expected).abs() / expected < 1e-5,
+            "eta_max cap: expected {}, got {}",
+            expected,
+            h_after
+        );
     }
 }
