@@ -9,12 +9,17 @@ use super::{error::VardiffError, Vardiff};
 
 /// Variable difficulty controller.
 ///
-/// Internally uses: `EwmaEstimator(120s) +
+/// Internally uses: `CumulativeCounter +
 /// AsymmetricCusumBoundary(s=1.5, floor=0.05, tighten=3.0) +
 /// AcceleratingPartialRetarget(base=0.2, max=0.6, acc=0.2)`.
 ///
+/// Uses CumulativeCounter (not EwmaEstimator) because production callers
+/// invoke observe(1) per share rather than once per tick — EWMA's per-call
+/// decay breaks under this calling convention. CumulativeCounter simply
+/// accumulates and computes realized SPM at snapshot time.
+///
 /// The AcceleratingPartialRetarget ramps η on consecutive same-direction
-/// fires (0.2 → 0.4 → 0.6), giving 22% faster convergence after step
+/// fires (0.2 → 0.4 → 0.6), giving faster convergence after step
 /// changes with zero jitter cost vs fixed η.
 ///
 /// See `sim/docs/PID_INVESTIGATION.md` for the derivation and parameter sweep.
@@ -44,11 +49,11 @@ impl VardiffState {
         clock: Arc<dyn Clock>,
     ) -> Result<Self, VardiffError> {
         use crate::vardiff::composed::{
-            AcceleratingPartialRetarget, AsymmetricCusumBoundary, Composed, EwmaEstimator,
+            AcceleratingPartialRetarget, AsymmetricCusumBoundary, Composed, CumulativeCounter,
         };
         Ok(VardiffState {
             inner: Box::new(Composed::new(
-                EwmaEstimator::new(120),
+                CumulativeCounter::new(),
                 AsymmetricCusumBoundary::new(1.5, 0.05, 3.0),
                 AcceleratingPartialRetarget::new(0.2, 0.6, 0.2),
                 min_allowed_hashrate,
