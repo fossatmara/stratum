@@ -77,7 +77,14 @@ pub struct EstimatorSnapshot {
 /// [`SpmRatioEstimator`] (EWMA with pure SPM-ratio conversion),
 /// [`SlidingWindowEstimator`] (Sliding-Window).
 pub trait Estimator: Debug + Send + Sync {
-    /// Record `n_shares` new arrivals since the last fire.
+    /// Record `n_shares` new arrivals.
+    ///
+    /// **Calling convention**: callers may invoke this either once per
+    /// tick with the full batch count (`observe(12)`) or once per
+    /// individual share arrival (`observe(1)` × 12). Implementations
+    /// MUST produce correct results under both patterns. Estimators
+    /// that apply per-call temporal decay (e.g., EWMA) must accumulate
+    /// shares internally and defer the decay to `snapshot()`.
     fn observe(&mut self, n_shares: u32);
 
     /// Notification that the algorithm fired and changed the target.
@@ -193,14 +200,22 @@ impl Estimator for CumulativeCounter {
 /// time interval between calls — so this impl assumes each `observe`
 /// represents exactly one tick of duration `tick_secs`. The Composed
 /// adapter's trial driver calls `add_shares` once per tick, so this
-/// assumption holds for all framework-driven scenarios. Custom callers
-/// driving observe directly should match the tick cadence to keep the
-/// EWMA's effective time constant accurate; otherwise the discrete
-/// decay rate diverges from `exp(-real_dt / tau_secs)`.
-///
 /// `realized_share_per_min` returned from `snapshot` is the rate
 /// estimate converted to shares-per-minute: `rate_per_tick × (60 /
 /// tick_secs)`.
+///
+/// ## Calling convention safety
+///
+/// `observe()` simply accumulates shares into a pending counter.
+/// The EWMA decay is applied once per `snapshot()` call (which the
+/// `Composed` adapter calls once per vardiff tick). This makes the
+/// estimator immune to whether the caller invokes `observe(12)` once
+/// or `observe(1)` twelve times — both produce identical results.
+///
+/// After snapshot computes the blended rate, `on_fire()` (or the next
+/// `snapshot()` via atomic CAS) advances the tick state. The atomics
+/// satisfy the `Send + Sync` trait bounds without actual concurrent
+/// access — `Vardiff` objects are always behind `&mut self`.
 #[derive(Debug)]
 pub struct EwmaEstimator {
     /// Time constant in seconds. Common values: 30, 60, 120, 300.
@@ -208,11 +223,13 @@ pub struct EwmaEstimator {
     /// Tick interval in seconds. Must match the trial driver's tick
     /// cadence for the EWMA's effective τ to be correct.
     pub tick_secs: u64,
-    /// Current rate estimate in shares-per-tick.
-    rate_per_tick: f64,
-    /// Number of observations since the last reset. The first
-    /// observation initializes `rate_per_tick` directly (no decay yet).
-    n_observations: u32,
+    /// Current rate estimate in shares-per-tick (after last snapshot).
+    /// Stored as bits via AtomicU64 for Send+Sync.
+    rate_bits: std::sync::atomic::AtomicU64,
+    /// Shares accumulated since last snapshot (pending for next decay step).
+    pending_shares: std::sync::atomic::AtomicU32,
+    /// Number of ticks (snapshots) since the last reset.
+    n_ticks: std::sync::atomic::AtomicU32,
 }
 
 impl EwmaEstimator {
@@ -220,74 +237,102 @@ impl EwmaEstimator {
     /// defaults to 60 (matching the trial driver's default tick
     /// interval).
     pub fn new(tau_secs: u64) -> Self {
+        use std::sync::atomic::AtomicU32;
+        use std::sync::atomic::AtomicU64;
         Self {
             tau_secs,
             tick_secs: 60,
-            rate_per_tick: 0.0,
-            n_observations: 0,
+            rate_bits: AtomicU64::new(0.0f64.to_bits()),
+            pending_shares: AtomicU32::new(0),
+            n_ticks: AtomicU32::new(0),
         }
     }
 
     /// Decay factor per tick: `exp(-tick_secs / tau_secs)`.
-    /// Computed each call rather than cached so changes to `tau_secs`
-    /// or `tick_secs` take effect immediately. The cost is negligible.
     fn alpha(&self) -> f64 {
         (-(self.tick_secs as f64) / (self.tau_secs as f64)).exp()
+    }
+
+    fn get_rate(&self) -> f64 {
+        f64::from_bits(self.rate_bits.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    fn set_rate(&self, rate: f64) {
+        self.rate_bits
+            .store(rate.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Returns the current smoothed rate (shares per tick). For testing.
+    pub fn rate_per_tick(&self) -> f64 {
+        self.get_rate()
     }
 }
 
 impl Estimator for EwmaEstimator {
     fn observe(&mut self, n_shares: u32) {
-        let n = n_shares as f64;
-        if self.n_observations == 0 {
-            self.rate_per_tick = n;
-        } else {
-            let alpha = self.alpha();
-            self.rate_per_tick = alpha * self.rate_per_tick + (1.0 - alpha) * n;
-        }
-        self.n_observations = self.n_observations.saturating_add(1);
+        *self.pending_shares.get_mut() = self.pending_shares.get_mut().saturating_add(n_shares);
     }
 
     fn on_fire(&mut self, new_hashrate: f32, old_hashrate: f32) {
+        let pending = *self.pending_shares.get_mut();
+        let n_ticks = *self.n_ticks.get_mut();
+
+        // Flush pending shares into the EWMA before rescaling.
+        if pending > 0 {
+            let n = pending as f64;
+            let rate = if n_ticks == 0 {
+                n
+            } else {
+                let alpha = self.alpha();
+                alpha * self.get_rate() + (1.0 - alpha) * n
+            };
+            self.set_rate(rate);
+            *self.n_ticks.get_mut() = n_ticks + 1;
+            *self.pending_shares.get_mut() = 0;
+        }
+
         if old_hashrate <= 0.0 || new_hashrate <= 0.0 {
-            // Can't compute ratio — full reset
-            self.rate_per_tick = 0.0;
-            self.n_observations = 0;
+            self.set_rate(0.0);
+            *self.n_ticks.get_mut() = 0;
             return;
         }
 
-        // The retarget changes the reference point. If the target moved by
-        // factor R = new/old, then future shares at the same true hashrate
-        // will arrive at rate = old_rate / R (fewer shares at higher difficulty).
-        // Scale the EWMA's smoothed rate by this factor so it starts from a
-        // reasonable baseline rather than zero.
-        //
-        // For PartialRetarget (small moves), R ≈ 1.0 and the scaled rate is
-        // close to the current smoothed rate — preserving most information.
-        // For FullRetarget (jumping to estimate), R can be large and the
-        // scaled rate may be inaccurate — but even an approximate starting
-        // point is better than zero (which forces the EWMA to re-learn from
-        // scratch, causing a lag spike visible as settling delay).
+        // Rescale: if target moved by R = new/old, future shares at
+        // the same true hashrate arrive at rate = old_rate / R.
         let ratio = new_hashrate as f64 / old_hashrate as f64;
         if ratio > 0.0 && ratio.is_finite() {
-            self.rate_per_tick /= ratio;
-            // Keep observation count — the estimate is still informed by
-            // prior data, just rescaled. Clearing n_observations would cause
-            // the next observe() to skip the exponential blend.
+            self.set_rate(self.get_rate() / ratio);
         } else {
-            self.rate_per_tick = 0.0;
-            self.n_observations = 0;
+            self.set_rate(0.0);
+            *self.n_ticks.get_mut() = 0;
         }
     }
 
     fn shares_count(&self) -> u32 {
-        self.rate_per_tick.round().max(0.0) as u32
+        self.pending_shares.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn snapshot(&self, dt_secs: u64, ctx: &EstimatorContext) -> EstimatorSnapshot {
-        let realized_share_per_min = self.rate_per_tick * (60.0 / self.tick_secs as f64);
-        // Same conversion path as CumulativeCounter: prefer
-        // hash_rate_from_target, fall back to linear scaling.
+        // Apply EWMA decay with the pending shares as this tick's observation.
+        let pending = self.pending_shares.load(std::sync::atomic::Ordering::Relaxed);
+        let n_ticks = self.n_ticks.load(std::sync::atomic::Ordering::Relaxed);
+        let n = pending as f64;
+
+        let rate = if n_ticks == 0 {
+            n
+        } else {
+            let alpha = self.alpha();
+            alpha * self.get_rate() + (1.0 - alpha) * n
+        };
+
+        // Advance state: flush pending into rate, increment tick count.
+        self.set_rate(rate);
+        self.n_ticks
+            .store(n_ticks + 1, std::sync::atomic::Ordering::Relaxed);
+        self.pending_shares
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+
+        let realized_share_per_min = rate * (60.0 / self.tick_secs as f64);
         let h_estimate = match hash_rate_from_target(
             ctx.current_target.to_le_bytes().into(),
             realized_share_per_min,
@@ -370,6 +415,11 @@ impl SpmRatioEstimator {
     /// Decay factor per tick: `exp(-tick_secs / tau_secs)`.
     fn alpha(&self) -> f64 {
         (-(self.tick_secs as f64) / (self.tau_secs as f64)).exp()
+    }
+
+    /// Returns the current smoothed rate (shares per tick). For testing.
+    pub fn rate_per_tick(&self) -> f64 {
+        self.rate_per_tick
     }
 }
 
@@ -968,60 +1018,67 @@ mod tests {
 
     // ---- EwmaEstimator ----
 
+    /// Simulate one tick: add shares, then call snapshot to flush the
+    /// EWMA state (mirroring how `Composed` drives the estimator).
+    fn ewma_tick(e: &mut EwmaEstimator, n_shares: u32) {
+        e.observe(n_shares);
+        let target = Target::MAX;
+        let ctx = EstimatorContext {
+            current_hashrate: 1.0e15,
+            current_target: &target,
+            shares_per_minute: 12.0,
+        };
+        e.snapshot(60, &ctx);
+    }
+
     #[test]
     fn ewma_first_observation_sets_rate_directly() {
         let mut e = EwmaEstimator::new(60);
-        e.observe(12);
-        // First obs initializes rate without decay.
-        assert!((e.rate_per_tick - 12.0).abs() < 1e-9);
+        ewma_tick(&mut e, 12);
+        assert!((e.rate_per_tick() - 12.0).abs() < 1e-9);
     }
 
     #[test]
     fn ewma_converges_to_steady_input() {
-        // Feed a constant stream of 12 shares per tick; EWMA should
-        // converge to 12 regardless of tau.
         let mut e = EwmaEstimator::new(120);
         for _ in 0..200 {
-            e.observe(12);
+            ewma_tick(&mut e, 12);
         }
-        assert!((e.rate_per_tick - 12.0).abs() < 1e-6);
+        assert!((e.rate_per_tick() - 12.0).abs() < 1e-6);
     }
 
     #[test]
     fn ewma_with_long_tau_responds_slowly_to_change() {
-        // Long tau → small alpha → strong memory of past values.
         let mut e = EwmaEstimator::new(600);
         for _ in 0..10 {
-            e.observe(10);
+            ewma_tick(&mut e, 10);
         }
-        // After 10 ticks the rate should be ≈ 10.
-        assert!((e.rate_per_tick - 10.0).abs() < 1.0);
+        assert!((e.rate_per_tick() - 10.0).abs() < 1.0);
         // Now switch to 0; one tick later the rate should still be
         // mostly 10 (long memory).
-        e.observe(0);
+        ewma_tick(&mut e, 0);
         // alpha = exp(-60/600) ≈ 0.905. new rate ≈ 0.905 × 10 + 0.095 × 0 = 9.05
         assert!(
-            e.rate_per_tick > 8.5,
+            e.rate_per_tick() > 8.5,
             "rate fell too fast: {}",
-            e.rate_per_tick
+            e.rate_per_tick()
         );
-        assert!(e.rate_per_tick < 9.5);
+        assert!(e.rate_per_tick() < 9.5);
     }
 
     #[test]
     fn ewma_with_short_tau_responds_fast_to_change() {
-        // Short tau → large alpha decay → little memory.
         let mut e = EwmaEstimator::new(30);
         for _ in 0..10 {
-            e.observe(10);
+            ewma_tick(&mut e, 10);
         }
         // Switch to 0.
-        e.observe(0);
+        ewma_tick(&mut e, 0);
         // alpha = exp(-60/30) = exp(-2) ≈ 0.135. new ≈ 0.135 × 10 + 0.865 × 0 = 1.35
         assert!(
-            e.rate_per_tick < 2.0,
+            e.rate_per_tick() < 2.0,
             "rate fell too slow: {}",
-            e.rate_per_tick
+            e.rate_per_tick()
         );
     }
 
@@ -1029,13 +1086,43 @@ mod tests {
     fn ewma_reset_clears_state() {
         let mut e = EwmaEstimator::new(60);
         for _ in 0..5 {
-            e.observe(10);
+            ewma_tick(&mut e, 10);
         }
         e.on_fire(0.0, 0.0);
         assert_eq!(e.shares_count(), 0);
         // After reset, first observation again initializes directly.
-        e.observe(42);
-        assert!((e.rate_per_tick - 42.0).abs() < 1e-9);
+        ewma_tick(&mut e, 42);
+        assert!((e.rate_per_tick() - 42.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ewma_observe_accumulates_without_decay() {
+        // Multiple observe(1) calls within a tick should produce the
+        // same result as one observe(12) call.
+        let mut e1 = EwmaEstimator::new(120);
+        let mut e2 = EwmaEstimator::new(120);
+        // First tick: seed both
+        ewma_tick(&mut e1, 10);
+        ewma_tick(&mut e2, 10);
+        // Second tick: e1 gets bulk, e2 gets per-share
+        e1.observe(12);
+        for _ in 0..12 {
+            e2.observe(1);
+        }
+        let target = Target::MAX;
+        let ctx = EstimatorContext {
+            current_hashrate: 1.0e15,
+            current_target: &target,
+            shares_per_minute: 12.0,
+        };
+        let snap1 = e1.snapshot(60, &ctx);
+        let snap2 = e2.snapshot(60, &ctx);
+        assert!(
+            (snap1.realized_share_per_min - snap2.realized_share_per_min).abs() < 1e-9,
+            "bulk observe and per-share observe must produce identical results: {} vs {}",
+            snap1.realized_share_per_min,
+            snap2.realized_share_per_min,
+        );
     }
 
     // ---- U256 round-trip precision regression check ----
@@ -1214,10 +1301,12 @@ mod tests {
         let mut e = EwmaEstimator::new(60);
         // Feed 12 shares per tick for many ticks.
         for _ in 0..50 {
-            e.observe(12);
+            ewma_tick(&mut e, 12);
         }
         // rate_per_tick ≈ 12, tick_secs = 60.
         // shares_per_min = 12 * (60/60) = 12.
+        // Add one more tick's worth and snapshot to check.
+        e.observe(12);
         let target = Target::MAX;
         let ctx = EstimatorContext {
             current_hashrate: 1.0e15,
@@ -1239,9 +1328,9 @@ mod tests {
             e.observe(12);
         }
         assert!(
-            (e.rate_per_tick - 12.0).abs() < 1e-6,
+            (e.rate_per_tick() - 12.0).abs() < 1e-6,
             "rate_per_tick should converge to 12.0, got {}",
-            e.rate_per_tick
+            e.rate_per_tick()
         );
     }
 
@@ -1299,17 +1388,17 @@ mod tests {
             e.observe(30);
         }
         // rate_per_tick ≈ 30.0
-        let rate_before = e.rate_per_tick;
+        let rate_before = e.rate_per_tick();
 
         // Fire: new target is 2x harder (hashrate doubled).
         // Expected: rate_per_tick /= 2.0 (miner finds shares half as often).
         e.on_fire(2.0e15, 1.0e15);
         let expected = rate_before / 2.0;
         assert!(
-            (e.rate_per_tick - expected).abs() < 1e-9,
+            (e.rate_per_tick() - expected).abs() < 1e-9,
             "rate_per_tick should be {} after on_fire, got {}",
             expected,
-            e.rate_per_tick
+            e.rate_per_tick()
         );
         // n_observations preserved (not reset).
         assert!(e.n_observations > 0);
@@ -1323,7 +1412,7 @@ mod tests {
         }
         // Zero old_hashrate → full reset.
         e.on_fire(1.0e15, 0.0);
-        assert_eq!(e.rate_per_tick, 0.0);
+        assert_eq!(e.rate_per_tick(), 0.0);
         assert_eq!(e.n_observations, 0);
     }
 }
