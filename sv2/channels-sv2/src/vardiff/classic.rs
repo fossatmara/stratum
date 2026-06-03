@@ -9,13 +9,16 @@ use super::{error::VardiffError, Vardiff};
 
 /// Variable difficulty controller.
 ///
-/// Internally uses the AdaCUSUM algorithm: `EwmaEstimator(120s) +
-/// AdaptiveCusumBoundary(sensitivity=1.5, floor=0.05) + PartialRetarget(0.5)`.
-/// This composition dominates the legacy threshold-ladder algorithm on every
-/// operationally meaningful metric. See `sim/docs/FINDINGS.md`.
+/// Internally uses: `SpmRatioEstimator(120s) +
+/// AsymmetricCusumBoundary(s=1.5, floor=0.05, tighten=3.0) +
+/// AcceleratingPartialRetarget(base=0.2, max=0.6, acc=0.2)`.
 ///
-/// The public fields are maintained for backward compatibility but delegate
-/// to the internal composition.
+/// The AcceleratingPartialRetarget ramps η on consecutive same-direction
+/// fires (0.2 → 0.4 → 0.6), giving 22% faster convergence after step
+/// changes with zero jitter cost vs fixed η. SpmRatioEstimator bypasses
+/// U256 arithmetic for a simpler estimation path.
+///
+/// See `sim/docs/PID_INVESTIGATION.md` for the derivation and parameter sweep.
 #[derive(Debug)]
 pub struct VardiffState {
     inner: Box<dyn Vardiff>,
@@ -42,13 +45,13 @@ impl VardiffState {
         clock: Arc<dyn Clock>,
     ) -> Result<Self, VardiffError> {
         use crate::vardiff::composed::{
-            AsymmetricCusumBoundary, Composed, EwmaEstimator, PartialRetarget,
+            AcceleratingPartialRetarget, AsymmetricCusumBoundary, Composed, SpmRatioEstimator,
         };
         Ok(VardiffState {
             inner: Box::new(Composed::new(
-                EwmaEstimator::new(120),
+                SpmRatioEstimator::new(120),
                 AsymmetricCusumBoundary::new(1.5, 0.05, 3.0),
-                PartialRetarget::new(0.5),
+                AcceleratingPartialRetarget::new(0.2, 0.6, 0.2),
                 min_allowed_hashrate,
                 clock,
             )),

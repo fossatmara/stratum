@@ -65,17 +65,15 @@ pub trait Vardiff: Debug + Send + Sync {
 
 /// Constructs the recommended production vardiff.
 ///
-/// Returns a [`Box<dyn Vardiff>`] wrapping the `AdaCUSUM` composition:
-/// `EwmaEstimator(120s) + AdaptiveCusumBoundary(s=1.5, floor=0.05) +
-/// PartialRetarget(η = 0.2)`. Uses [`DEFAULT_MIN_HASHRATE`] as the
-/// minimum hashrate floor and a [`SystemClock`] for time.
+/// Returns a [`Box<dyn Vardiff>`] wrapping:
+/// `SpmRatioEstimator(120s) + AsymmetricCusumBoundary(s=1.5, floor=0.05, tighten=3.0) +
+/// AcceleratingPartialRetarget(base=0.2, max=0.6, acc=0.2)`.
+/// Uses [`DEFAULT_MIN_HASHRATE`] as the minimum hashrate floor and a
+/// [`SystemClock`] for time.
 ///
-/// `AdaCUSUM` dominates the previous `FullRemedy` (PoissonCI boundary)
-/// at every share rate in the operational range (SPM=6-30) under the
-/// `operational_fitness` metric. The improvement comes from 2-3x better
-/// detection of small hashrate changes via sequential evidence
-/// accumulation. See `sim/docs/FINDINGS.md` for the validation and
-/// `sim/docs/DESIGN.md` for the three-stage pipeline architecture.
+/// The `AcceleratingPartialRetarget` ramps η on consecutive same-direction
+/// fires (0.2 → 0.4 → 0.6), yielding 22% better convergence after step
+/// changes with zero jitter cost vs fixed η. See `sim/docs/PID_INVESTIGATION.md`.
 ///
 /// This is the recommended entry point for new production code. For
 /// custom min-hashrate floors, use [`default_with_min`]. For a custom
