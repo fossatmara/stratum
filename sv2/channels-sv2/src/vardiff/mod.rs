@@ -66,7 +66,7 @@ pub trait Vardiff: Debug + Send + Sync {
 /// Constructs the recommended production vardiff.
 ///
 /// Returns a [`Box<dyn Vardiff>`] wrapping:
-/// `SpmRatioEstimator(120s) + AsymmetricCusumBoundary(s=1.5, floor=0.05, tighten=3.0) +
+/// `EwmaEstimator(120s) + AsymmetricCusumBoundary(s=1.5, floor=0.05, tighten=3.0) +
 /// AcceleratingPartialRetarget(base=0.2, max=0.6, acc=0.2)`.
 /// Uses [`DEFAULT_MIN_HASHRATE`] as the minimum hashrate floor and a
 /// [`SystemClock`] for time.
