@@ -165,7 +165,8 @@ impl PidConfig {
 
 impl PidTunedVardiff {
     pub fn new(config: PidConfig, initial_hashrate: f32, clock: Arc<dyn Clock>) -> Self {
-        let initial_difficulty = Self::difficulty_from_hashrate(initial_hashrate, config.spm_target);
+        let initial_difficulty =
+            Self::difficulty_from_hashrate(initial_hashrate, config.spm_target);
         Self {
             config,
             current_difficulty: initial_difficulty,
@@ -285,10 +286,9 @@ impl Vardiff for PidTunedVardiff {
         // eventually break through via the integral)
         self.error_integral += normalized_error;
         // Hard clamp (anti-windup ceiling)
-        self.error_integral = self.error_integral.clamp(
-            -self.config.integral_clamp,
-            self.config.integral_clamp,
-        );
+        self.error_integral = self
+            .error_integral
+            .clamp(-self.config.integral_clamp, self.config.integral_clamp);
 
         // --- Derivative term ---
         // Rate of change of the error, using the previous realized_spm
@@ -340,7 +340,8 @@ impl Vardiff for PidTunedVardiff {
         }
 
         // Check if the change is meaningful (> 1% relative change)
-        let relative_change = ((new_difficulty - self.current_difficulty) / self.current_difficulty).abs();
+        let relative_change =
+            ((new_difficulty - self.current_difficulty) / self.current_difficulty).abs();
         if relative_change < 0.01 {
             return Ok(None);
         }

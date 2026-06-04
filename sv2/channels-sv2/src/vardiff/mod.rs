@@ -6,9 +6,9 @@ use std::sync::Arc;
 pub mod classic;
 pub mod clock;
 pub mod composed;
-pub mod pow2_pid;
 pub mod error;
 pub mod pid_tuned;
+pub mod pow2_pid;
 #[cfg(test)]
 pub mod test;
 

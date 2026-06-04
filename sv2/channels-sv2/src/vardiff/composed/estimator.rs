@@ -309,12 +309,15 @@ impl Estimator for EwmaEstimator {
     }
 
     fn shares_count(&self) -> u32 {
-        self.pending_shares.load(std::sync::atomic::Ordering::Relaxed)
+        self.pending_shares
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn snapshot(&self, dt_secs: u64, ctx: &EstimatorContext) -> EstimatorSnapshot {
         // Apply EWMA decay with the pending shares as this tick's observation.
-        let pending = self.pending_shares.load(std::sync::atomic::Ordering::Relaxed);
+        let pending = self
+            .pending_shares
+            .load(std::sync::atomic::Ordering::Relaxed);
         let n_ticks = self.n_ticks.load(std::sync::atomic::Ordering::Relaxed);
         let n = pending as f64;
 
@@ -462,7 +465,8 @@ impl Estimator for SpmRatioEstimator {
         let realized_share_per_min = self.rate_per_tick * (60.0 / self.tick_secs as f64);
 
         // Pure linear scaling — no U256 arithmetic.
-        let h_estimate = ctx.current_hashrate * realized_share_per_min as f32 / ctx.shares_per_minute;
+        let h_estimate =
+            ctx.current_hashrate * realized_share_per_min as f32 / ctx.shares_per_minute;
 
         EstimatorSnapshot {
             h_estimate,
@@ -1047,19 +1051,27 @@ impl CkpoolEstimator {
     }
 
     fn get_dsps_short(&self) -> f64 {
-        f64::from_bits(self.dsps_short_bits.load(std::sync::atomic::Ordering::Relaxed))
+        f64::from_bits(
+            self.dsps_short_bits
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     fn set_dsps_short(&self, v: f64) {
-        self.dsps_short_bits.store(v.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        self.dsps_short_bits
+            .store(v.to_bits(), std::sync::atomic::Ordering::Relaxed);
     }
 
     fn get_dsps_long(&self) -> f64 {
-        f64::from_bits(self.dsps_long_bits.load(std::sync::atomic::Ordering::Relaxed))
+        f64::from_bits(
+            self.dsps_long_bits
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     fn set_dsps_long(&self, v: f64) {
-        self.dsps_long_bits.store(v.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        self.dsps_long_bits
+            .store(v.to_bits(), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// ckpool's `decay_time()` — the core EMA update per share.
@@ -1088,7 +1100,8 @@ impl CkpoolEstimator {
 impl Estimator for CkpoolEstimator {
     fn observe(&mut self, n_shares: u32) {
         *self.pending_shares.get_mut() = self.pending_shares.get_mut().saturating_add(n_shares);
-        *self.shares_since_fire.get_mut() = self.shares_since_fire.get_mut().saturating_add(n_shares);
+        *self.shares_since_fire.get_mut() =
+            self.shares_since_fire.get_mut().saturating_add(n_shares);
     }
 
     fn on_fire(&mut self, new_hashrate: f32, old_hashrate: f32) {
@@ -1113,12 +1126,17 @@ impl Estimator for CkpoolEstimator {
     }
 
     fn shares_count(&self) -> u32 {
-        self.pending_shares.load(std::sync::atomic::Ordering::Relaxed)
+        self.pending_shares
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn snapshot(&self, dt_secs: u64, ctx: &EstimatorContext) -> EstimatorSnapshot {
-        let pending = self.pending_shares.load(std::sync::atomic::Ordering::Relaxed);
-        let shares_since_fire = self.shares_since_fire.load(std::sync::atomic::Ordering::Relaxed);
+        let pending = self
+            .pending_shares
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let shares_since_fire = self
+            .shares_since_fire
+            .load(std::sync::atomic::Ordering::Relaxed);
 
         // Simulate per-share decay_time() calls. Each share is treated
         // as arriving at uniform intervals within the tick: elapsed =
@@ -1147,7 +1165,8 @@ impl Estimator for CkpoolEstimator {
         // Advance state.
         self.set_dsps_short(dsps_s);
         self.set_dsps_long(dsps_l);
-        self.pending_shares.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.pending_shares
+            .store(0, std::sync::atomic::Ordering::Relaxed);
 
         // Select which EMA to use based on share flood detection.
         let total_shares = shares_since_fire.saturating_add(pending);
@@ -1228,7 +1247,8 @@ impl TimeBiasEwmaEstimator {
     }
 
     fn set_rate(&self, rate: f64) {
-        self.rate_bits.store(rate.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        self.rate_bits
+            .store(rate.to_bits(), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// ckpool's time_bias: `1 - e^(-elapsed/tau)`.
@@ -1276,11 +1296,14 @@ impl Estimator for TimeBiasEwmaEstimator {
     }
 
     fn shares_count(&self) -> u32 {
-        self.pending_shares.load(std::sync::atomic::Ordering::Relaxed)
+        self.pending_shares
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn snapshot(&self, dt_secs: u64, ctx: &EstimatorContext) -> EstimatorSnapshot {
-        let pending = self.pending_shares.load(std::sync::atomic::Ordering::Relaxed);
+        let pending = self
+            .pending_shares
+            .load(std::sync::atomic::Ordering::Relaxed);
         let n_ticks = self.n_ticks.load(std::sync::atomic::Ordering::Relaxed);
         let n = pending as f64;
 
@@ -1293,17 +1316,15 @@ impl Estimator for TimeBiasEwmaEstimator {
 
         // Advance state.
         self.set_rate(rate);
-        self.n_ticks.store(n_ticks + 1, std::sync::atomic::Ordering::Relaxed);
-        self.pending_shares.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.n_ticks
+            .store(n_ticks + 1, std::sync::atomic::Ordering::Relaxed);
+        self.pending_shares
+            .store(0, std::sync::atomic::Ordering::Relaxed);
 
         // Apply time-bias correction: divide by `1 - e^(-dt/tau)` to
         // compensate for EMA warmup suppression when counter is young.
         let bias = self.time_bias(dt_secs);
-        let corrected_rate = if bias > 0.01 {
-            rate / bias
-        } else {
-            rate
-        };
+        let corrected_rate = if bias > 0.01 { rate / bias } else { rate };
 
         let realized_share_per_min = corrected_rate * (60.0 / self.tick_secs as f64);
         let h_estimate = match hash_rate_from_target(

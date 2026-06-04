@@ -366,7 +366,10 @@ impl UpdateRule for AcceleratingPartialRetarget {
 
         let last = self.last_direction.load(Ordering::Relaxed);
         let consecutive = if direction == last {
-            let c = self.consecutive_same_direction.fetch_add(1, Ordering::Relaxed) + 1;
+            let c = self
+                .consecutive_same_direction
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
             c
         } else {
             self.last_direction.store(direction, Ordering::Relaxed);
@@ -374,9 +377,8 @@ impl UpdateRule for AcceleratingPartialRetarget {
             1
         };
 
-        let eta_effective = (self.eta_base
-            + self.acceleration * (consecutive - 1) as f32)
-            .min(self.eta_max);
+        let eta_effective =
+            (self.eta_base + self.acceleration * (consecutive - 1) as f32).min(self.eta_max);
 
         current_hashrate + eta_effective * (snap.h_estimate - current_hashrate)
     }

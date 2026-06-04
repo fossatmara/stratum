@@ -486,7 +486,10 @@ impl Debug for SignPersistenceCusumBoundary {
             .field("tick_secs", &self.tick_secs)
             .field("sign_persistence_discount", &self.sign_persistence_discount)
             .field("max_sign_discount", &self.max_sign_discount)
-            .field("consecutive_count", &self.consecutive_count.load(Ordering::Relaxed))
+            .field(
+                "consecutive_count",
+                &self.consecutive_count.load(Ordering::Relaxed),
+            )
             .field("last_sign", &self.last_sign.load(Ordering::Relaxed))
             .finish()
     }
@@ -533,8 +536,8 @@ impl Boundary for SignPersistenceCusumBoundary {
         };
 
         // Step 4: Compute discount from sign persistence.
-        let discount = (self.sign_persistence_discount * (consecutive - 1) as f64)
-            .min(self.max_sign_discount);
+        let discount =
+            (self.sign_persistence_discount * (consecutive - 1) as f64).min(self.max_sign_discount);
 
         // Step 5: Apply discount and convert to percentage points.
         asymmetric_threshold * (1.0 - discount) * 100.0
@@ -615,7 +618,12 @@ impl HysteresisGate {
     }
 
     /// Construct with custom parameters.
-    pub fn new(min_shares: u32, min_time_secs: u64, hysteresis_low: f64, hysteresis_high: f64) -> Self {
+    pub fn new(
+        min_shares: u32,
+        min_time_secs: u64,
+        hysteresis_low: f64,
+        hysteresis_high: f64,
+    ) -> Self {
         Self {
             min_shares,
             min_time_secs,
