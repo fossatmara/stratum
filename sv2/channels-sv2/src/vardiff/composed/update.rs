@@ -382,6 +382,80 @@ impl UpdateRule for AcceleratingPartialRetarget {
     }
 }
 
+/// ckpool-style full retarget: `optimal = dsps × target_period`.
+///
+/// ckpool computes the optimal difficulty as `dsps × 3.33` (shares per
+/// second × target period in seconds), then clamps to [mindiff, maxdiff].
+/// The result is a hashrate that would produce exactly one share per
+/// `target_period` seconds at the observed rate.
+///
+/// Additionally implements ckpool's **oscillation guard**: if the
+/// algorithm wants to *decrease* difficulty but this is the very first
+/// evaluation after a previous fire (shares_since_fire ≤ threshold),
+/// suppress the decrease. This prevents a scenario where a miner returns
+/// from idle, submits one batch of shares at the old rate, and
+/// immediately gets difficulty reduced.
+///
+/// In the three-stage framework, the oscillation guard is approximated
+/// by checking `snap.n_shares` against a threshold. When few shares have
+/// been observed and the direction is down, the update rule returns the
+/// current hashrate unchanged (the Composed adapter interprets `Some(current)`
+/// as a no-op since it equals the existing target).
+///
+/// ## Difference from FullRetargetNoClamp
+///
+/// `FullRetargetNoClamp` trusts `h_estimate` directly. `CkpoolRetarget`
+/// also trusts the estimator but adds the oscillation guard — a
+/// directional asymmetry where decreases require more evidence than
+/// increases.
+#[derive(Debug, Clone, Copy)]
+pub struct CkpoolRetarget {
+    /// Minimum shares required before allowing a difficulty decrease.
+    /// ckpool uses 1 (suppresses decrease on the very first share after
+    /// a change). In the tick-based framework, this is scaled to the
+    /// minimum tick's worth of data.
+    pub min_shares_for_decrease: u32,
+}
+
+impl CkpoolRetarget {
+    /// Construct with ckpool's default: suppress decrease when only 1
+    /// share (or tick's worth) has been observed since last fire.
+    pub fn ckpool_defaults() -> Self {
+        Self {
+            min_shares_for_decrease: 1,
+        }
+    }
+
+    /// Construct with custom minimum shares threshold.
+    pub fn new(min_shares_for_decrease: u32) -> Self {
+        Self {
+            min_shares_for_decrease,
+        }
+    }
+}
+
+impl UpdateRule for CkpoolRetarget {
+    fn next_hashrate(
+        &self,
+        snap: &EstimatorSnapshot,
+        current_hashrate: f32,
+        _delta: f64,
+        _threshold: f64,
+        _shares_per_minute: f32,
+    ) -> f32 {
+        let target = snap.h_estimate;
+
+        // Oscillation guard: suppress difficulty decrease when insufficient
+        // evidence has accumulated (ckpool's `if (optimal < client->diff &&
+        // client->ssdc == 1) return` logic).
+        if target < current_hashrate && snap.n_shares <= self.min_shares_for_decrease {
+            return current_hashrate;
+        }
+
+        target
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -42,12 +42,58 @@ Across all 50 cells (5 SPM × 10 scenarios), Pow2-PID:
 - Jitter: **0.000** — never fires at all
 - Effectively a fixed-difficulty system
 
+## Why PID Fails: Lack of Stage Separation
+
+A PID controller conflates all three pipeline stages into a single
+feedback loop, making it impossible to diagnose or fix individual
+failure modes:
+
+| PID Term | Conflated Stages | Problem |
+|----------|-----------------|---------|
+| P (proportional) | Estimator + Boundary | Gain (`Kp`) simultaneously controls how noisy the "belief" is AND how much deviation triggers action. Tuning Kp for low jitter (small gain) kills reaction rate. Tuning for fast reaction (large gain) causes noise-driven fires. |
+| I (integral) | Boundary (persistence) + Update (magnitude) | Accumulates sub-threshold error — a boundary concern (evidence strength) — but its output adds directly to the control signal — an update concern (move magnitude). Anti-windup limits are simultaneously clamping "how much evidence to accumulate" and "how far to move." |
+| D (derivative) | Estimator (smoothing) + Update (damping) | Acts as both a noise filter on the measurement AND a damping term on the actuator. Cannot tune measurement smoothing independently of move damping. |
+
+### The Dead Zone as a Stage Confusion
+
+The 41% dead zone from power-of-2 quantization is instructive. In our
+framework, this is clearly a *boundary* problem — the threshold for
+action is too high. But in the PID implementation, the dead zone arises
+from the interaction of:
+1. Gain magnitude (Kp = -0.01 × diff) — an estimator/boundary concern
+2. Quantization rounding — a post-update concern
+3. Output limit (10 × diff) — an update concern
+
+Because these aren't separated, the developer cannot identify "the boundary
+is too wide" as the root cause. They would instead try to increase Kp
+(breaking jitter), add integral (breaking stability), or reduce the
+quantization (breaking the power-of-2 invariant the system depends on).
+
+### The Well-Tuned PID (`pid_tuned.rs`)
+
+Our `PidTunedVardiff` implementation with all three terms active
+demonstrates the ceiling of the PID approach when carefully tuned:
+- Rate-aware gain scheduling (√SPM noise scaling)
+- Anti-windup with exponential decay + hard clamp
+- Dead zone to suppress noise-driven fires
+- Configurable presets (balanced, aggressive, conservative)
+
+Even with these improvements, it cannot escape the fundamental coupling:
+the dead zone (a boundary parameter) interacts with the integral
+accumulation (a persistence parameter) which interacts with the gain
+schedule (an estimator parameter). Tuning one axis shifts the others.
+The three-stage pipeline makes these interactions explicit and allows
+each to be optimized independently.
+
 ## What We Learned From PID
 
 Despite the broken quantization, the PID *concept* revealed gaps in our
-framework:
+framework. Crucially, decomposing each PID term into the three-stage
+pipeline let us evaluate each idea **in isolation** — something the
+conflated PID design fundamentally cannot do. Three candidates were
+extracted; only one survived rigorous re-evaluation.
 
-### 1. Integral Term → AcceleratingPartialRetarget
+### 1. Integral Term → AcceleratingPartialRetarget *(transferred)*
 
 PID's integral term accelerates correction when error persists in one
 direction. Our `PartialRetarget(η=0.2)` always moves exactly 20% of the
@@ -60,26 +106,52 @@ fires.
 - Convergence improved 9-40% across SPM=6-30
 - Jitter: zero cost (identical to baseline)
 
-### 2. Operating in SPM-Space → SpmRatioEstimator
+This idea transferred cleanly because it addresses a concern within a
+single stage (update-rule magnitude over time). No cross-stage calibration
+is involved.
+
+### 2. Operating in SPM-Space → SpmRatioEstimator *(discarded)*
 
 PID operates on `realized_spm` directly without converting through
-hashrate/target. Our `SpmRatioEstimator` does the same: EWMA smoothing
+hashrate/target. Our `SpmRatioEstimator` did the same: EWMA smoothing
 on the raw SPM signal, then `h_estimate = current_h × (realized/expected)`.
 
-**Result**: Behaviorally identical to `EwmaEstimator` (confirmed via paired
-simulation). The benefit is code simplification — no `hash_rate_from_target`
-U256 path in the estimator.
+**Initial result**: Behaviourally indistinguishable from `EwmaEstimator`
+on the head-to-head benchmark — the supposed benefit was code
+simplification.
 
-### 3. Sub-threshold Persistence → SignPersistenceCusumBoundary
+**Re-evaluation**: Further scenarios exposed regressions that the
+paired-simulation harness missed. The component is retained in the
+codebase as an experimental alternative but is **not** part of any
+production composition.
+
+### 3. Sub-threshold Persistence → SignPersistenceCusumBoundary *(discarded)*
 
 In PID, errors below the dead zone still accumulate in the integral. Our
-`SignPersistenceCusumBoundary` adapts this: when deviation sign persists
+`SignPersistenceCusumBoundary` adapted this: when deviation sign persists
 across ticks, the threshold decreases slightly.
 
-**Result**: +6% detection rate on ±10% steps, but +23% jitter on stable
-load. Marginal net benefit — needs further tuning to be production-viable.
+**Initial result**: +6% detection rate on ±10% steps at the cost of +23%
+jitter on stable load.
 
-## New Composition: "BestOfBest"
+**Re-evaluation**: The jitter penalty outweighed the detection gain across
+the full grid; tuning attempts could not move the Pareto frontier. The
+component is retained for reference but is **not** part of any production
+composition.
+
+### Meta-observation
+
+Decomposition into three stages is what *made the failure modes visible*.
+Two of three extracted ideas looked promising in narrow tests and were
+ultimately rejected only because each could be exercised on its own
+boundary, estimator, or update axis without confounding the others. The
+PID's monolithic structure offers no such diagnosis — its dead zone, gain
+schedule, and integral windup all interact, so a failing parameter sweep
+gives no actionable signal about which concern is broken.
+
+## Proposed Composition (not adopted)
+
+A speculative "BestOfBest" composition combined all three extracted ideas:
 
 ```rust
 Composed::new(
@@ -91,31 +163,31 @@ Composed::new(
 )
 ```
 
-### Head-to-Head vs Production (1000 trials, 8 SPM × 10 scenarios)
-
-| Metric | VardiffState (η=0.5) | BestOfBest (η=0.2→0.6) |
-|--------|---------------------|------------------------|
-| Step ±50% convergence | 0.943 | 0.933 |
-| Step ±50% reaction | 0.906 | 0.892 |
-| Stable jitter | 0.042 | 0.042 |
-| Settled accuracy (SPM≥15) | 0.077 | 0.032 |
-| Cold start p50 (SPM=12) | 4 min | 6 min |
-
-### Tradeoff
-
-BestOfBest trades ~2 minutes slower cold start for 2-3× better steady-state
-accuracy at high SPM. Cold starts happen once per connection; steady-state
-runs for hours/days.
+Head-to-head (1000 trials, 8 SPM × 10 scenarios) showed a tradeoff —
+~2 min slower cold start for 2-3× better steady-state accuracy — that
+initially looked favourable. However, once `SpmRatioEstimator` and
+`SignPersistenceCusumBoundary` were independently rejected (see above),
+this composition was abandoned. The production recommendation lives in
+[`CKPOOL_INVESTIGATION.md`](./CKPOOL_INVESTIGATION.md): `EwmaEstimator` +
+`PoissonCI` + `PartialRetarget(η=0.2)`. `AcceleratingPartialRetarget`
+remains available for ad-hoc composition where extra cold-start
+aggression is desired.
 
 ## Files Added
 
 ### Production components (`src/vardiff/`)
 
+- `composed/update.rs` — `AcceleratingPartialRetarget` (new UpdateRule) — the
+  single PID-derived idea that survived isolated re-evaluation
+
+### Experimental / reference components (`src/vardiff/`)
+
 - `pow2_pid.rs` — Reference Pow2-PID implementation for simulation
 - `pid_tuned.rs` — Well-tuned PID implementation (P+I+D active)
-- `composed/update.rs` — `AcceleratingPartialRetarget` (new UpdateRule)
-- `composed/estimator.rs` — `SpmRatioEstimator` (new Estimator)
-- `composed/boundary.rs` — `SignPersistenceCusumBoundary` (new Boundary)
+- `composed/estimator.rs` — `SpmRatioEstimator` — discarded after
+  re-evaluation; kept for reference
+- `composed/boundary.rs` — `SignPersistenceCusumBoundary` — discarded after
+  re-evaluation; kept for reference
 
 ### Simulation binaries (`sim/src/bin/`)
 

@@ -559,6 +559,97 @@ impl Boundary for CusumBoundary {
     }
 }
 
+/// Hysteresis-gate boundary inspired by ckpool's retarget decision logic.
+///
+/// ckpool does NOT use a continuous threshold; instead it applies two
+/// sequential gates:
+///
+/// 1. **Data gate**: suppress evaluation entirely until either enough
+///    shares have been observed OR enough time has elapsed. This prevents
+///    decisions on statistically meaningless data.
+///
+/// 2. **Hysteresis band**: once the data gate is satisfied, check whether
+///    the diff-rate-ratio (drr = realized_rate / current_diff) falls
+///    within a dead band around the target. If inside the band → no fire.
+///    If outside → fire.
+///
+/// In the three-stage framework, this maps to a boundary that returns
+/// `f64::MAX` (never fire) when either gate suppresses, and a threshold
+/// of 0.0 (always fire) when outside the hysteresis band. The binary
+/// fire/don't-fire semantics are preserved exactly.
+///
+/// ## Parameters
+///
+/// - `min_shares`: minimum shares since last fire before evaluating
+///   (ckpool: 72, derived from `window_secs / target_period`)
+/// - `min_time_secs`: minimum seconds since last fire before evaluating
+///   (ckpool: 240)
+/// - `hysteresis_low`: lower bound multiplier on target rate (ckpool: 0.5)
+///   — drr below `target × hysteresis_low` → fire (decrease difficulty)
+/// - `hysteresis_high`: upper bound multiplier on target rate (ckpool: 1.33)
+///   — drr above `target × hysteresis_high` → fire (increase difficulty)
+///
+/// The data gate uses OR semantics (fire if EITHER threshold is met),
+/// matching ckpool's `if (ssdc < 72 && tdiff < 240) return`.
+#[derive(Debug, Clone, Copy)]
+pub struct HysteresisGate {
+    /// Minimum shares before evaluating. ckpool default: 72.
+    pub min_shares: u32,
+    /// Minimum seconds before evaluating. ckpool default: 240.
+    pub min_time_secs: u64,
+    /// Lower hysteresis multiplier (fire below this). ckpool: 0.5.
+    pub hysteresis_low: f64,
+    /// Upper hysteresis multiplier (fire above this). ckpool: 1.33.
+    pub hysteresis_high: f64,
+}
+
+impl HysteresisGate {
+    /// Construct with ckpool's default parameters.
+    pub fn ckpool_defaults() -> Self {
+        Self {
+            min_shares: 72,
+            min_time_secs: 240,
+            hysteresis_low: 0.5,
+            hysteresis_high: 1.33,
+        }
+    }
+
+    /// Construct with custom parameters.
+    pub fn new(min_shares: u32, min_time_secs: u64, hysteresis_low: f64, hysteresis_high: f64) -> Self {
+        Self {
+            min_shares,
+            min_time_secs,
+            hysteresis_low,
+            hysteresis_high,
+        }
+    }
+}
+
+impl Boundary for HysteresisGate {
+    fn threshold(&self, dt_secs: u64, shares_per_minute: f32, snap: &EstimatorSnapshot) -> f64 {
+        // Gate 1: insufficient data — suppress fire.
+        // OR semantics: proceed if EITHER min_shares OR min_time is met.
+        let shares_met = snap.n_shares >= self.min_shares;
+        let time_met = dt_secs >= self.min_time_secs;
+        if !shares_met && !time_met {
+            return f64::MAX;
+        }
+
+        // Gate 2: hysteresis band check.
+        // Compute the rate ratio: realized_spm / target_spm.
+        // If within the dead band [low, high] around 1.0 → suppress.
+        if shares_per_minute > 0.0 {
+            let rate_ratio = snap.realized_share_per_min / shares_per_minute as f64;
+            if rate_ratio >= self.hysteresis_low && rate_ratio <= self.hysteresis_high {
+                return f64::MAX;
+            }
+        }
+
+        // Outside the hysteresis band with sufficient data → always fire.
+        0.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

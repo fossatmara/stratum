@@ -38,16 +38,17 @@ pub mod update;
 
 pub use boundary::{
     AdaptiveCusumBoundary, AsymmetricCusumBoundary, Boundary, CredibleIntervalBoundary,
-    CusumBoundary, PoissonCI, SignPersistenceCusumBoundary, StepFunction,
+    CusumBoundary, HysteresisGate, PoissonCI, SignPersistenceCusumBoundary, StepFunction,
 };
 pub use composed::{classic_composed, ClassicComposed, Composed};
 pub use decision::DecisionRecord;
 pub use estimator::Uncertainty;
 pub use estimator::{
-    BayesianEstimator, CumulativeCounter, Estimator, EstimatorContext, EstimatorSnapshot,
-    EwmaEstimator, KalmanEstimator, SlidingWindowEstimator, SpmRatioEstimator,
+    BayesianEstimator, CkpoolEstimator, CumulativeCounter, Estimator, EstimatorContext,
+    EstimatorSnapshot, EwmaEstimator, KalmanEstimator, SlidingWindowEstimator, SpmRatioEstimator,
+    TimeBiasEwmaEstimator,
 };
 pub use update::{
-    AcceleratingPartialRetarget, AdaptivePartialRetarget, FullRetargetNoClamp,
+    AcceleratingPartialRetarget, AdaptivePartialRetarget, CkpoolRetarget, FullRetargetNoClamp,
     FullRetargetWithClamp, PartialRetarget, UpdateRule,
 };

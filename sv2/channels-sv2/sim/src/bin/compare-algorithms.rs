@@ -77,8 +77,12 @@ use vardiff_sim::baseline::{
     fmt_duration, serialize_markdown, serialize_toml, CellResult, Scenario, DEFAULT_BASELINE_SEED,
     DEFAULT_TRIAL_COUNT,
 };
-use vardiff_sim::grid::{AlgorithmSpec, Grid};
+use vardiff_sim::grid::{AlgorithmSpec, Grid, VardiffBox};
 use vardiff_sim::metrics::{self, Direction, ScenarioFilter, SummaryFmt, SummarySpec};
+use vardiff_sim::{
+    AcceleratingPartialRetarget, AsymmetricCusumBoundary, CkpoolEstimator, Composed, PartialRetarget,
+    PoissonCI,
+};
 
 fn main() -> std::io::Result<()> {
     let trial_count = env_or("VARDIFF_COMPARE_TRIALS", DEFAULT_TRIAL_COUNT);
@@ -120,8 +124,65 @@ fn main() -> std::io::Result<()> {
             AlgorithmSpec::full_remedy(),
             AlgorithmSpec::ewma_adaptive_cusum(120, 1.5, 0.05, 0.2),
             AlgorithmSpec::ewma_adaptive_cusum(120, 1.5, 0.05, 0.5),
+            AlgorithmSpec::ckpool_remedy(),
+            AlgorithmSpec::ckpool_remedy_ft(12),
+            // --- Ckpool parameter sweep ---
+            // Axis 1: shorter tau_long (120s vs 300s default)
+            AlgorithmSpec::new("Ck-tl120-eta20", |clock| {
+                VardiffBox(Box::new(Composed::new(
+                    CkpoolEstimator::with_fast_threshold(60, 120, 12),
+                    PoissonCI::default_parametric(),
+                    PartialRetarget::new(0.2),
+                    1.0, clock,
+                )))
+            }),
+            // Axis 2: higher η (0.35) with shorter tau_long
+            AlgorithmSpec::new("Ck-tl120-eta35", |clock| {
+                VardiffBox(Box::new(Composed::new(
+                    CkpoolEstimator::with_fast_threshold(60, 120, 12),
+                    PoissonCI::default_parametric(),
+                    PartialRetarget::new(0.35),
+                    1.0, clock,
+                )))
+            }),
+            // Axis 3: CUSUM boundary instead of PoissonCI
+            AlgorithmSpec::new("Ck-cusum-eta20", |clock| {
+                VardiffBox(Box::new(Composed::new(
+                    CkpoolEstimator::with_fast_threshold(60, 300, 12),
+                    AsymmetricCusumBoundary::new(1.5, 0.05, 3.0),
+                    PartialRetarget::new(0.2),
+                    1.0, clock,
+                )))
+            }),
+            // Axis 4: CUSUM + shorter tau_long + moderate η
+            AlgorithmSpec::new("Ck-tl120-cusum-eta30", |clock| {
+                VardiffBox(Box::new(Composed::new(
+                    CkpoolEstimator::with_fast_threshold(60, 120, 12),
+                    AsymmetricCusumBoundary::new(1.5, 0.05, 3.0),
+                    PartialRetarget::new(0.3),
+                    1.0, clock,
+                )))
+            }),
+            // Axis 5: shorter tau_short (30s) for faster ramp-up
+            AlgorithmSpec::new("Ck-ts30-tl120-eta30", |clock| {
+                VardiffBox(Box::new(Composed::new(
+                    CkpoolEstimator::with_fast_threshold(30, 120, 8),
+                    PoissonCI::default_parametric(),
+                    PartialRetarget::new(0.3),
+                    1.0, clock,
+                )))
+            }),
+            // Axis 6: AcceleratingPartialRetarget (ramp η on consecutive fires)
+            AlgorithmSpec::new("Ck-tl120-accel", |clock| {
+                VardiffBox(Box::new(Composed::new(
+                    CkpoolEstimator::with_fast_threshold(60, 120, 12),
+                    PoissonCI::default_parametric(),
+                    AcceleratingPartialRetarget::new(0.2, 0.6, 0.2),
+                    1.0, clock,
+                )))
+            }),
         ],
-        share_rates: vec![6.0, 8.0, 10.0, 12.0, 15.0, 20.0, 25.0, 30.0],
+        share_rates: vec![4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 15.0, 20.0, 25.0, 30.0],
         scenarios,
         trial_count,
         base_seed,

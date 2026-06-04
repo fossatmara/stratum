@@ -88,11 +88,11 @@ pub use grid::{
 };
 
 pub use composed::{
-    classic_composed, AcceleratingPartialRetarget, Boundary, ClassicComposed, Composed,
-    CumulativeCounter, Estimator, EstimatorContext, EstimatorSnapshot, EwmaEstimator,
-    FullRetargetNoClamp, FullRetargetWithClamp, PartialRetarget, PoissonCI,
-    SignPersistenceCusumBoundary, SlidingWindowEstimator, SpmRatioEstimator, StepFunction,
-    UpdateRule,
+    classic_composed, AcceleratingPartialRetarget, AsymmetricCusumBoundary, Boundary,
+    CkpoolEstimator, ClassicComposed, Composed, CumulativeCounter, Estimator, EstimatorContext,
+    EstimatorSnapshot, EwmaEstimator, FullRetargetNoClamp, FullRetargetWithClamp, HysteresisGate,
+    PartialRetarget, PoissonCI, SignPersistenceCusumBoundary, SlidingWindowEstimator,
+    SpmRatioEstimator, StepFunction, TimeBiasEwmaEstimator, UpdateRule,
 };
 
 pub use metrics::{

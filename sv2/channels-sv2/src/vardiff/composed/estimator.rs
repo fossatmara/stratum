@@ -959,6 +959,371 @@ impl Estimator for KalmanEstimator {
     }
 }
 
+/// Dual-window EWMA estimator inspired by ckpool's `decay_time` function.
+///
+/// ckpool updates its EMA on every share submission using `decay_time()`:
+/// ```text
+/// fprop = 1 - e^(-elapsed / interval)
+/// f += (share_diff / elapsed) * fprop
+/// f /= (1 + fprop)
+/// ```
+///
+/// In the tick-based framework, we simulate this by running ckpool's
+/// exact `decay_time()` formula once per share within `snapshot()`,
+/// distributing shares uniformly across the tick interval. With N shares
+/// in a 60s tick, each gets `elapsed = 60/N` seconds — faithfully
+/// reproducing ckpool's per-share EMA accumulation.
+///
+/// This avoids the time-bias correction problem: the EMA warms up
+/// organically through simulated per-share updates rather than needing
+/// a post-hoc `1/bias` amplification.
+///
+/// Two EMAs are maintained in parallel (short=60s, long=300s). The short
+/// window is selected when total shares since last fire exceed the "fast"
+/// threshold (72), matching ckpool's adaptive window switching for rapid
+/// ramp-up of high-hashrate miners.
+#[derive(Debug)]
+pub struct CkpoolEstimator {
+    /// Short-window time constant (seconds). ckpool uses 60.
+    pub tau_short: u64,
+    /// Long-window time constant (seconds). ckpool uses 300.
+    pub tau_long: u64,
+    /// Tick interval in seconds (must match trial driver).
+    pub tick_secs: u64,
+    /// Override for the fast-threshold. When `Some(n)`, the short window
+    /// activates after `n` shares since last fire. When `None`, the
+    /// threshold is derived as `tau_long * 0.8 / target_period_secs`.
+    fast_threshold_override: Option<u32>,
+    /// Target share period in seconds (ckpool uses 3.33).
+    pub target_period_secs: f64,
+    /// Short-window EMA: difficulty-weighted shares per second.
+    dsps_short_bits: std::sync::atomic::AtomicU64,
+    /// Long-window EMA: difficulty-weighted shares per second.
+    dsps_long_bits: std::sync::atomic::AtomicU64,
+    /// Shares accumulated since last snapshot (pending).
+    pending_shares: std::sync::atomic::AtomicU32,
+    /// Total shares since last fire (for adaptive window switching).
+    shares_since_fire: std::sync::atomic::AtomicU32,
+}
+
+impl CkpoolEstimator {
+    /// Construct with ckpool's default parameters: τ_short=60s, τ_long=300s,
+    /// target period=3.33s (one share every 3.33 seconds → drr target 0.3).
+    pub fn new(tau_short: u64, tau_long: u64) -> Self {
+        use std::sync::atomic::{AtomicU32, AtomicU64};
+        Self {
+            tau_short,
+            tau_long,
+            tick_secs: 60,
+            fast_threshold_override: None,
+            target_period_secs: 3.33,
+            dsps_short_bits: AtomicU64::new(0.0f64.to_bits()),
+            dsps_long_bits: AtomicU64::new(0.0f64.to_bits()),
+            pending_shares: AtomicU32::new(0),
+            shares_since_fire: AtomicU32::new(0),
+        }
+    }
+
+    /// Construct with a custom fast-threshold override. When shares since
+    /// last fire reach this count, the estimator switches to the short
+    /// window for faster responsiveness.
+    pub fn with_fast_threshold(tau_short: u64, tau_long: u64, fast_threshold: u32) -> Self {
+        let mut e = Self::new(tau_short, tau_long);
+        e.fast_threshold_override = Some(fast_threshold);
+        e
+    }
+
+    /// ckpool defaults: 60s short, 300s long, 3.33s target period.
+    pub fn ckpool_defaults() -> Self {
+        Self::new(60, 300)
+    }
+
+    /// The "fast" threshold: number of shares since last fire required to
+    /// switch to the short-window EMA. ckpool uses 72 (= 240s / 3.33s).
+    pub fn fast_threshold(&self) -> u32 {
+        self.fast_threshold_override.unwrap_or_else(|| {
+            ((self.tau_long as f64 * 0.8) / self.target_period_secs).round() as u32
+        })
+    }
+
+    fn get_dsps_short(&self) -> f64 {
+        f64::from_bits(self.dsps_short_bits.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    fn set_dsps_short(&self, v: f64) {
+        self.dsps_short_bits.store(v.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn get_dsps_long(&self) -> f64 {
+        f64::from_bits(self.dsps_long_bits.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    fn set_dsps_long(&self, v: f64) {
+        self.dsps_long_bits.store(v.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// ckpool's `decay_time()` — the core EMA update per share.
+    ///
+    /// ```text
+    /// fprop = 1 - e^(-elapsed / interval)
+    /// f += (fadd / elapsed) * fprop
+    /// f /= (1 + fprop)
+    /// ```
+    ///
+    /// `f` is the running dsps (difficulty-shares per second).
+    /// `fadd` is the difficulty of the submitted share (1.0 in our model).
+    /// `elapsed` is seconds since the last share.
+    /// `interval` is the time constant (tau).
+    fn decay_time(f: f64, fadd: f64, elapsed: f64, interval: f64) -> f64 {
+        if elapsed <= 0.0 {
+            return f;
+        }
+        let dexp = (elapsed / interval).min(36.0);
+        let fprop = 1.0 - (-dexp).exp();
+        let ftotal = 1.0 + fprop;
+        (f + (fadd / elapsed) * fprop) / ftotal
+    }
+}
+
+impl Estimator for CkpoolEstimator {
+    fn observe(&mut self, n_shares: u32) {
+        *self.pending_shares.get_mut() = self.pending_shares.get_mut().saturating_add(n_shares);
+        *self.shares_since_fire.get_mut() = self.shares_since_fire.get_mut().saturating_add(n_shares);
+    }
+
+    fn on_fire(&mut self, new_hashrate: f32, old_hashrate: f32) {
+        if old_hashrate <= 0.0 || new_hashrate <= 0.0 {
+            self.set_dsps_short(0.0);
+            self.set_dsps_long(0.0);
+            *self.shares_since_fire.get_mut() = 0;
+            return;
+        }
+
+        // Rescale dsps: under new difficulty, same true hashrate produces
+        // shares at rate = old_rate × (old_h / new_h).
+        let ratio = new_hashrate as f64 / old_hashrate as f64;
+        if ratio > 0.0 && ratio.is_finite() {
+            self.set_dsps_short(self.get_dsps_short() / ratio);
+            self.set_dsps_long(self.get_dsps_long() / ratio);
+        } else {
+            self.set_dsps_short(0.0);
+            self.set_dsps_long(0.0);
+        }
+        *self.shares_since_fire.get_mut() = 0;
+    }
+
+    fn shares_count(&self) -> u32 {
+        self.pending_shares.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn snapshot(&self, dt_secs: u64, ctx: &EstimatorContext) -> EstimatorSnapshot {
+        let pending = self.pending_shares.load(std::sync::atomic::Ordering::Relaxed);
+        let shares_since_fire = self.shares_since_fire.load(std::sync::atomic::Ordering::Relaxed);
+
+        // Simulate per-share decay_time() calls. Each share is treated
+        // as arriving at uniform intervals within the tick: elapsed =
+        // tick_secs / n_shares per share submission.
+        let mut dsps_s = self.get_dsps_short();
+        let mut dsps_l = self.get_dsps_long();
+
+        if pending > 0 {
+            let inter_share_secs = self.tick_secs as f64 / pending as f64;
+            for _ in 0..pending {
+                dsps_s = Self::decay_time(dsps_s, 1.0, inter_share_secs, self.tau_short as f64);
+                dsps_l = Self::decay_time(dsps_l, 1.0, inter_share_secs, self.tau_long as f64);
+            }
+        } else {
+            // No shares this tick: decay with full tick interval, fadd=0.
+            // decay_time with fadd=0 simplifies to: f / (1 + fprop)
+            let dexp_s = (self.tick_secs as f64 / self.tau_short as f64).min(36.0);
+            let fprop_s = 1.0 - (-dexp_s).exp();
+            dsps_s /= 1.0 + fprop_s;
+
+            let dexp_l = (self.tick_secs as f64 / self.tau_long as f64).min(36.0);
+            let fprop_l = 1.0 - (-dexp_l).exp();
+            dsps_l /= 1.0 + fprop_l;
+        }
+
+        // Advance state.
+        self.set_dsps_short(dsps_s);
+        self.set_dsps_long(dsps_l);
+        self.pending_shares.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        // Select which EMA to use based on share flood detection.
+        let total_shares = shares_since_fire.saturating_add(pending);
+        let dsps = if total_shares >= self.fast_threshold() {
+            dsps_s
+        } else {
+            dsps_l
+        };
+
+        // Convert dsps (shares/sec) to shares/min, then to hashrate.
+        let realized_share_per_min = dsps * 60.0;
+
+        let h_estimate = match hash_rate_from_target(
+            ctx.current_target.to_le_bytes().into(),
+            realized_share_per_min,
+        ) {
+            Ok(h) => h as f32,
+            Err(_) => ctx.current_hashrate * realized_share_per_min as f32 / ctx.shares_per_minute,
+        };
+
+        EstimatorSnapshot {
+            h_estimate,
+            realized_share_per_min,
+            n_shares: total_shares,
+            dt_secs,
+            uncertainty: None,
+        }
+    }
+}
+
+/// EWMA estimator with ckpool's time-bias warmup correction.
+///
+/// Identical to [`EwmaEstimator`] except `snapshot()` divides the raw
+/// EWMA rate by `1 - e^(-dt_secs/tau_secs)` before converting to
+/// hashrate. This compensates for the EMA being naturally suppressed
+/// when the counter is young (few ticks since last fire), making the
+/// estimator more accurate immediately after retarget events.
+///
+/// The time-bias idea comes from ckpool's `time_bias()` function in
+/// `stratifier.c`. Empirically, ckpool's counter-age ratio advantage
+/// (reacting faster with a mature counter) traces to this correction.
+///
+/// Use in place of `EwmaEstimator` to test whether time-bias correction
+/// improves counter-age sensitivity and post-fire accuracy without
+/// sacrificing steady-state performance.
+#[derive(Debug)]
+pub struct TimeBiasEwmaEstimator {
+    /// Time constant in seconds.
+    pub tau_secs: u64,
+    /// Tick interval in seconds.
+    pub tick_secs: u64,
+    /// Current rate estimate (shares per tick), stored as bits.
+    rate_bits: std::sync::atomic::AtomicU64,
+    /// Pending shares since last snapshot.
+    pending_shares: std::sync::atomic::AtomicU32,
+    /// Ticks since last fire/reset.
+    n_ticks: std::sync::atomic::AtomicU32,
+}
+
+impl TimeBiasEwmaEstimator {
+    pub fn new(tau_secs: u64) -> Self {
+        use std::sync::atomic::{AtomicU32, AtomicU64};
+        Self {
+            tau_secs,
+            tick_secs: 60,
+            rate_bits: AtomicU64::new(0.0f64.to_bits()),
+            pending_shares: AtomicU32::new(0),
+            n_ticks: AtomicU32::new(0),
+        }
+    }
+
+    fn alpha(&self) -> f64 {
+        (-(self.tick_secs as f64) / (self.tau_secs as f64)).exp()
+    }
+
+    fn get_rate(&self) -> f64 {
+        f64::from_bits(self.rate_bits.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    fn set_rate(&self, rate: f64) {
+        self.rate_bits.store(rate.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// ckpool's time_bias: `1 - e^(-elapsed/tau)`.
+    fn time_bias(&self, dt_secs: u64) -> f64 {
+        let dexp = (dt_secs as f64 / self.tau_secs as f64).min(36.0);
+        1.0 - (-dexp).exp()
+    }
+}
+
+impl Estimator for TimeBiasEwmaEstimator {
+    fn observe(&mut self, n_shares: u32) {
+        *self.pending_shares.get_mut() = self.pending_shares.get_mut().saturating_add(n_shares);
+    }
+
+    fn on_fire(&mut self, new_hashrate: f32, old_hashrate: f32) {
+        let pending = *self.pending_shares.get_mut();
+        let n_ticks = *self.n_ticks.get_mut();
+
+        if pending > 0 {
+            let n = pending as f64;
+            let rate = if n_ticks == 0 {
+                n
+            } else {
+                let alpha = self.alpha();
+                alpha * self.get_rate() + (1.0 - alpha) * n
+            };
+            self.set_rate(rate);
+            *self.n_ticks.get_mut() = n_ticks + 1;
+            *self.pending_shares.get_mut() = 0;
+        }
+
+        if old_hashrate <= 0.0 || new_hashrate <= 0.0 {
+            self.set_rate(0.0);
+            *self.n_ticks.get_mut() = 0;
+            return;
+        }
+
+        let ratio = new_hashrate as f64 / old_hashrate as f64;
+        if ratio > 0.0 && ratio.is_finite() {
+            self.set_rate(self.get_rate() / ratio);
+        } else {
+            self.set_rate(0.0);
+            *self.n_ticks.get_mut() = 0;
+        }
+    }
+
+    fn shares_count(&self) -> u32 {
+        self.pending_shares.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn snapshot(&self, dt_secs: u64, ctx: &EstimatorContext) -> EstimatorSnapshot {
+        let pending = self.pending_shares.load(std::sync::atomic::Ordering::Relaxed);
+        let n_ticks = self.n_ticks.load(std::sync::atomic::Ordering::Relaxed);
+        let n = pending as f64;
+
+        let rate = if n_ticks == 0 {
+            n
+        } else {
+            let alpha = self.alpha();
+            alpha * self.get_rate() + (1.0 - alpha) * n
+        };
+
+        // Advance state.
+        self.set_rate(rate);
+        self.n_ticks.store(n_ticks + 1, std::sync::atomic::Ordering::Relaxed);
+        self.pending_shares.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        // Apply time-bias correction: divide by `1 - e^(-dt/tau)` to
+        // compensate for EMA warmup suppression when counter is young.
+        let bias = self.time_bias(dt_secs);
+        let corrected_rate = if bias > 0.01 {
+            rate / bias
+        } else {
+            rate
+        };
+
+        let realized_share_per_min = corrected_rate * (60.0 / self.tick_secs as f64);
+        let h_estimate = match hash_rate_from_target(
+            ctx.current_target.to_le_bytes().into(),
+            realized_share_per_min,
+        ) {
+            Ok(h) => h as f32,
+            Err(_) => ctx.current_hashrate * realized_share_per_min as f32 / ctx.shares_per_minute,
+        };
+
+        EstimatorSnapshot {
+            h_estimate,
+            realized_share_per_min,
+            n_shares: pending,
+            dt_secs,
+            uncertainty: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

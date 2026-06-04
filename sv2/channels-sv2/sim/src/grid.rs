@@ -888,6 +888,157 @@ impl AlgorithmSpec {
         })
     }
 
+    /// ckpool-inspired algorithm: dual-window EWMA estimator with adaptive
+    /// window switching, hysteresis-gate boundary, and full retarget with
+    /// oscillation guard.
+    ///
+    /// Reproduces the core logic of ckpool's `add_submit()` vardiff path
+    /// (stratifier.c) within the three-stage pipeline:
+    ///
+    /// - **Estimator**: `CkpoolEstimator(60, 300)` — dual EWMA (1min short,
+    ///   5min long) with automatic switch to the short window when shares
+    ///   flood in above the "fast" threshold (72 shares ≈ 240s / 3.33s).
+    ///   Includes time-bias correction (`1 - e^(-t/τ)`) for warmup.
+    ///
+    /// - **Boundary**: `HysteresisGate(72, 240, 0.5, 1.33)` — binary
+    ///   fire/no-fire with a data gate (72 shares OR 240s) and an asymmetric
+    ///   dead band [0.5×, 1.33×] around target rate ratio.
+    ///
+    /// - **UpdateRule**: `CkpoolRetarget(1)` — full retarget to the
+    ///   estimator's belief with oscillation guard (suppress decrease when
+    ///   ≤1 share's worth of data since last fire).
+    ///
+    /// Reference: <https://github.com/ckolivas/ckpool> (src/stratifier.c)
+    /// and <https://github.com/parasitepool/para/blob/master/src/vardiff.rs>
+    pub fn ckpool() -> Self {
+        Self::new("Ckpool", |clock| {
+            let inner = composed::Composed::new(
+                composed::CkpoolEstimator::new(60, 300),
+                composed::HysteresisGate::ckpool_defaults(),
+                composed::CkpoolRetarget::ckpool_defaults(),
+                1.0,
+                clock,
+            );
+            VardiffBox(Box::new(inner))
+        })
+    }
+
+    /// Hybrid: ckpool's dual-window adaptive estimator paired with
+    /// FullRemedy's proven boundary (PoissonCI) and update (PartialRetarget).
+    ///
+    /// Tests whether ckpool's adaptive window switching and time-bias
+    /// correction improve counter-age sensitivity and post-fire accuracy
+    /// without the overshoot/accuracy problems caused by ckpool's native
+    /// hysteresis gate and full retarget.
+    pub fn ckpool_remedy() -> Self {
+        Self::new("CkpoolRemedy", |clock| {
+            let inner = composed::Composed::new(
+                composed::CkpoolEstimator::new(60, 300),
+                composed::PoissonCI::default_parametric(),
+                composed::PartialRetarget::new(0.2),
+                1.0,
+                clock,
+            );
+            VardiffBox(Box::new(inner))
+        })
+    }
+
+    /// CkpoolRemedy with a lower fast-threshold for the short-window switch.
+    ///
+    /// The default threshold (72 shares) means the short window never
+    /// activates at low SPMs (4-6) within a typical 5-minute reaction
+    /// window. Lowering to `ft` shares enables the responsive short EMA
+    /// to kick in sooner, potentially improving reaction rate at low SPMs.
+    pub fn ckpool_remedy_ft(ft: u32) -> Self {
+        let name = format!("CkpoolRemedy-ft{}", ft);
+        Self::new(name, move |clock| {
+            let inner = composed::Composed::new(
+                composed::CkpoolEstimator::with_fast_threshold(60, 300, ft),
+                composed::PoissonCI::default_parametric(),
+                composed::PartialRetarget::new(0.2),
+                1.0,
+                clock,
+            );
+            VardiffBox(Box::new(inner))
+        })
+    }
+
+    /// Hybrid: ckpool estimator + narrowed hysteresis gate + damped update.
+    ///
+    /// The original ckpool hysteresis [0.5, 1.33] is too wide for 60s
+    /// ticks — the rate ratio wanders far from 1.0 while staying "inside"
+    /// the band. This variant tightens to [0.8, 1.2] (fire when >20%
+    /// off target) with a lower data gate (6 shares OR 60s) that matches
+    /// the tick-based evaluation cadence. Paired with PartialRetarget(0.3)
+    /// to limit overshoot.
+    pub fn ckpool_narrow_hyst() -> Self {
+        Self::new("CkpoolNarrowHyst", |clock| {
+            let inner = composed::Composed::new(
+                composed::CkpoolEstimator::new(60, 300),
+                composed::HysteresisGate::new(6, 60, 0.8, 1.2),
+                composed::PartialRetarget::new(0.3),
+                1.0,
+                clock,
+            );
+            VardiffBox(Box::new(inner))
+        })
+    }
+
+    /// Hybrid: standard EWMA estimator with ckpool's time-bias warmup
+    /// correction, paired with FullRemedy's boundary and update.
+    ///
+    /// Isolates the single idea of time-bias correction: does dividing
+    /// the EMA by `1 - e^(-dt/tau)` improve counter-age sensitivity and
+    /// post-fire accuracy? If this beats FullRemedy on counter-age metrics
+    /// without sacrificing anything else, the correction deserves
+    /// integration into the main EwmaEstimator.
+    pub fn time_bias_remedy() -> Self {
+        Self::new("TimeBiasRemedy", |clock| {
+            let inner = composed::Composed::new(
+                composed::TimeBiasEwmaEstimator::new(120),
+                composed::PoissonCI::default_parametric(),
+                composed::PartialRetarget::new(0.2),
+                1.0,
+                clock,
+            );
+            VardiffBox(Box::new(inner))
+        })
+    }
+
+    /// Parameterized ckpool variant for exploring the parameter space.
+    ///
+    /// - `tau_short`: short-window EMA time constant (ckpool: 60s)
+    /// - `tau_long`: long-window EMA time constant (ckpool: 300s)
+    /// - `hysteresis_low`: lower dead-band multiplier (ckpool: 0.5)
+    /// - `hysteresis_high`: upper dead-band multiplier (ckpool: 1.33)
+    pub fn ckpool_with(
+        tau_short: u64,
+        tau_long: u64,
+        hysteresis_low: f64,
+        hysteresis_high: f64,
+    ) -> Self {
+        let name = format!(
+            "Ckpool-ts{}-tl{}-lo{}-hi{}",
+            tau_short,
+            tau_long,
+            (hysteresis_low * 100.0).round() as u32,
+            (hysteresis_high * 100.0).round() as u32,
+        );
+        let min_shares =
+            ((tau_long as f64 * 0.8) / 3.33).round() as u32;
+        let min_time = (tau_long as f64 * 0.8).round() as u64;
+        Self::new(name, move |clock| {
+            let inner = composed::Composed::new(
+                composed::CkpoolEstimator::new(tau_short, tau_long),
+                composed::HysteresisGate::new(min_shares, min_time, hysteresis_low, hysteresis_high),
+                composed::CkpoolRetarget::ckpool_defaults(),
+                1.0,
+                clock,
+            );
+            VardiffBox(Box::new(inner))
+        })
+    }
+
     /// FullRemedy with AdaptivePartialRetarget: scales η by fire margin.
     /// `eta_base` is the damping at reference_margin; `reference_margin`
     /// is the "normal" margin in percentage points.
@@ -1898,6 +2049,57 @@ mod tests {
             any_differ,
             "Estimator+Boundary+Update axis swap (Classic → EWMA-60s) must produce \
              at least one metric change."
+        );
+    }
+
+    #[test]
+    fn ckpool_factory_constructs_and_runs() {
+        let clock = Arc::new(channels_sv2::vardiff::MockClock::new(0));
+        let vb = (AlgorithmSpec::ckpool().factory)(clock);
+        assert_eq!(vb.shares_since_last_update(), 0);
+    }
+
+    #[test]
+    fn ckpool_runs_through_grid() {
+        let grid = Grid {
+            algorithms: vec![AlgorithmSpec::ckpool()],
+            share_rates: vec![6.0, 60.0],
+            scenarios: vec![
+                Scenario::ColdStart,
+                Scenario::Stable,
+                Scenario::Step { delta_pct: -50 },
+            ],
+            trial_count: 2,
+            base_seed: 0xCAFE,
+        };
+        let results = grid.run();
+        assert!(results.contains_key("Ckpool"));
+        assert_eq!(results["Ckpool"].len(), 6);
+        // Ckpool is Composed, so introspection works.
+        let stable_highspm = results["Ckpool"]
+            .iter()
+            .find(|c| c.shares_per_minute == 60.0 && c.scenario == Scenario::Stable)
+            .expect("Stable@SPM=60 cell present");
+        assert!(stable_highspm.metrics.contains_key("bias"));
+        assert!(stable_highspm.metrics.contains_key("variance"));
+    }
+
+    #[test]
+    fn ckpool_with_parametric_constructs_and_runs() {
+        let grid = Grid {
+            algorithms: vec![AlgorithmSpec::ckpool_with(30, 180, 0.4, 1.5)],
+            share_rates: vec![12.0],
+            scenarios: vec![Scenario::Stable],
+            trial_count: 2,
+            base_seed: 0xBEEF,
+        };
+        let results = grid.run();
+        let name = "Ckpool-ts30-tl180-lo40-hi150";
+        assert!(
+            results.contains_key(name),
+            "Expected key '{}', got: {:?}",
+            name,
+            results.keys().collect::<Vec<_>>()
         );
     }
 }
