@@ -113,8 +113,6 @@ pub const ERROR_CODE_OPEN_MINING_CHANNEL_MAX_TARGET_OUT_OF_RANGE: &str = "max-ta
 pub const ERROR_CODE_OPEN_MINING_CHANNEL_UNSUPPORTED_MIN_EXTRANONCE_SIZE: &str =
     "unsupported-min-extranonce-size";
 pub const ERROR_CODE_OPEN_MINING_CHANNEL_UNKNOWN_USER: &str = "unknown-user";
-pub const ERROR_CODE_OPEN_MINING_CHANNEL_EXTENDED_CHANNELS_NOT_SUPPORTED_FOR_STANDARD_JOBS: &str =
-    "extended-channels-not-supported-for-standard-jobs";
 
 // Commonly used UpdateChannelError error_code values.
 pub const ERROR_CODE_UPDATE_CHANNEL_INVALID_NOMINAL_HASHRATE: &str = "invalid-nominal-hashrate";
