@@ -81,7 +81,7 @@ use vardiff_sim::grid::{AlgorithmSpec, Grid, VardiffBox};
 use vardiff_sim::metrics::{self, Direction, ScenarioFilter, SummaryFmt, SummarySpec};
 use vardiff_sim::{
     AcceleratingPartialRetarget, AdaptivePoissonCusum, AsymmetricCusumBoundary, CkpoolEstimator,
-    Composed, EwmaEstimator, PartialRetarget, PoissonCI,
+    Composed, EwmaEstimator, HysteresisGate, PartialRetarget, PoissonCI,
 };
 
 fn main() -> std::io::Result<()> {
@@ -199,6 +199,100 @@ fn main() -> std::io::Result<()> {
                     EwmaEstimator::new(120),
                     AdaptivePoissonCusum::new(10),
                     PartialRetarget::new(0.3),
+                    1.0, clock,
+                )))
+            }),
+            // --- Ckpool estimator + best boundary/update (equivalence check) ---
+            AlgorithmSpec::new("Ckpool-Adp10-max40", |clock| {
+                VardiffBox(Box::new(Composed::new(
+                    CkpoolEstimator::new(60, 300),
+                    AdaptivePoissonCusum::new(10),
+                    AcceleratingPartialRetarget::new(0.2, 0.4, 0.2),
+                    1.0, clock,
+                )))
+            }),
+            AlgorithmSpec::new("Ckpool120-Adp10-max40", |clock| {
+                VardiffBox(Box::new(Composed::new(
+                    CkpoolEstimator::new(60, 120),
+                    AdaptivePoissonCusum::new(10),
+                    AcceleratingPartialRetarget::new(0.2, 0.4, 0.2),
+                    1.0, clock,
+                )))
+            }),
+            // --- Hysteresis boundary sweep (tuned for 60s ticks) ---
+            // Native ckpool: too wide
+            AlgorithmSpec::new("Hyst-50-133-gate4", |clock| {
+                VardiffBox(Box::new(Composed::new(
+                    EwmaEstimator::new(120),
+                    HysteresisGate::new(4, 60, 0.5, 1.33),
+                    PartialRetarget::new(0.2),
+                    1.0, clock,
+                )))
+            }),
+            // Narrower bands for 60s ticks
+            AlgorithmSpec::new("Hyst-70-130-gate4", |clock| {
+                VardiffBox(Box::new(Composed::new(
+                    EwmaEstimator::new(120),
+                    HysteresisGate::new(4, 60, 0.7, 1.3),
+                    PartialRetarget::new(0.2),
+                    1.0, clock,
+                )))
+            }),
+            AlgorithmSpec::new("Hyst-80-120-gate4", |clock| {
+                VardiffBox(Box::new(Composed::new(
+                    EwmaEstimator::new(120),
+                    HysteresisGate::new(4, 60, 0.8, 1.2),
+                    PartialRetarget::new(0.2),
+                    1.0, clock,
+                )))
+            }),
+            AlgorithmSpec::new("Hyst-85-115-gate4", |clock| {
+                VardiffBox(Box::new(Composed::new(
+                    EwmaEstimator::new(120),
+                    HysteresisGate::new(4, 60, 0.85, 1.15),
+                    PartialRetarget::new(0.2),
+                    1.0, clock,
+                )))
+            }),
+            AlgorithmSpec::new("Hyst-90-110-gate4", |clock| {
+                VardiffBox(Box::new(Composed::new(
+                    EwmaEstimator::new(120),
+                    HysteresisGate::new(4, 60, 0.9, 1.1),
+                    PartialRetarget::new(0.2),
+                    1.0, clock,
+                )))
+            }),
+            // Best narrow band + AcceleratingPartialRetarget
+            AlgorithmSpec::new("Hyst-85-115-accel", |clock| {
+                VardiffBox(Box::new(Composed::new(
+                    EwmaEstimator::new(120),
+                    HysteresisGate::new(4, 60, 0.85, 1.15),
+                    AcceleratingPartialRetarget::new(0.2, 0.4, 0.2),
+                    1.0, clock,
+                )))
+            }),
+            AlgorithmSpec::new("Hyst-80-120-accel", |clock| {
+                VardiffBox(Box::new(Composed::new(
+                    EwmaEstimator::new(120),
+                    HysteresisGate::new(4, 60, 0.8, 1.2),
+                    AcceleratingPartialRetarget::new(0.2, 0.4, 0.2),
+                    1.0, clock,
+                )))
+            }),
+            // Vary data gate (lower = more responsive at low SPM)
+            AlgorithmSpec::new("Hyst-85-115-gate2", |clock| {
+                VardiffBox(Box::new(Composed::new(
+                    EwmaEstimator::new(120),
+                    HysteresisGate::new(2, 60, 0.85, 1.15),
+                    PartialRetarget::new(0.2),
+                    1.0, clock,
+                )))
+            }),
+            AlgorithmSpec::new("Hyst-85-115-gate6", |clock| {
+                VardiffBox(Box::new(Composed::new(
+                    EwmaEstimator::new(120),
+                    HysteresisGate::new(6, 60, 0.85, 1.15),
+                    PartialRetarget::new(0.2),
                     1.0, clock,
                 )))
             }),

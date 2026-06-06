@@ -210,23 +210,120 @@ With the per-share simulation working correctly, we swept the key axes:
 - **Share-count data gate (72 shares)** — meaningless in the tick framework
   where evaluation happens on a fixed schedule regardless of share arrival.
 
+## Hysteresis Boundary Sweep
+
+The original investigation only tested ckpool's native hysteresis [0.5, 1.33]
+and one narrowed variant [0.8, 1.2]. A proper parameter sweep was run across
+band widths from [0.5, 1.33] (native) through [0.9, 1.1] (very narrow), with
+data gates of 2/4/6 shares, paired with both PartialRetarget(0.2) and
+AcceleratingPartialRetarget(0.2, 0.4, 0.2).
+
+### Results (comprehensive fitness, SPM 4 / 10 / 20 / 30)
+
+| Boundary | SPM 4 | SPM 10 | SPM 20 | SPM 30 |
+|----------|:---:|:---:|:---:|:---:|
+| AdaptiveBoundary-spm10 (production) | 0.689 | 0.774 | 0.882 | 0.869 |
+| VardiffState (CUSUM) | 0.706 | 0.783 | 0.894 | 0.874 |
+| Hyst [0.7, 1.3] gate4 | 0.621 | 0.695 | 0.666 | 0.608 |
+| Hyst [0.8, 1.2] gate4 | 0.572 | 0.675 | 0.723 | 0.726 |
+| Hyst [0.85, 1.15] gate4 | 0.578 | 0.634 | 0.706 | 0.730 |
+| Hyst [0.9, 1.1] gate4 | 0.582 | 0.615 | 0.637 | 0.669 |
+| Hyst [0.8, 1.2] + AccelRetarget | 0.487 | 0.664 | 0.740 | 0.758 |
+| Hyst [0.5, 1.33] gate4 (native) | 0.630 | 0.542 | 0.508 | 0.504 |
+
+### Key Finding: Hysteresis trades reaction for jitter
+
+Narrowing the band improves reaction rate dramatically — `Hyst [0.8, 1.2]`
+achieves 96–100% reaction across all SPMs (better than any statistical
+boundary). But jitter explodes to 0.15–0.32 fires/min at mid-SPMs vs
+0.03/min for PoissonCI. The fundamental issue: hysteresis fires whenever
+the rate ratio crosses the band threshold, with no evidence accumulation.
+Statistical boundaries (PoissonCI, CUSUM) distinguish real changes from
+noise by requiring cumulative evidence before firing.
+
+No hysteresis parameterization achieved competitive comprehensive fitness.
+The best variant (`Hyst [0.7, 1.3]`) peaked at 0.706 at SPM 15 but
+averaged 0.644 across the range vs 0.798 for the adaptive boundary.
+
+## Estimator Equivalence Test (Revised)
+
+The initial investigation claimed "estimation quality is equivalent"
+between `CkpoolEstimator` (per-share `decay_time()` simulation) and
+`EwmaEstimator(120s)`. This was tested under PoissonCI + PartialRetarget,
+where the two estimators produce similar comprehensive fitness (~5% gap).
+
+A follow-up test paired `CkpoolEstimator` with the production-tuned
+boundary and update (`AdaptivePoissonCusum(10) + AcceleratingPartialRetarget
+(0.2, 0.4, 0.2)`) to confirm equivalence under the more demanding
+composition:
+
+### Results: Not equivalent under CUSUM
+
+| Composition | SPM 4 | SPM 8 | SPM 12 | SPM 20 | SPM 30 |
+|-------------|:---:|:---:|:---:|:---:|:---:|
+| EWMA(120s) + AdpBnd + AccelRet (production) | 0.689 | 0.768 | 0.787 | 0.882 | 0.869 |
+| CkpoolEstimator(60,300) + same bnd/update | 0.698 | 0.638 | 0.696 | 0.777 | 0.858 |
+| CkpoolEstimator(60,120) + same bnd/update | 0.598 | 0.688 | 0.764 | 0.805 | 0.858 |
+
+The ckpool estimator underperforms EWMA(120s) significantly at mid-SPMs
+(0.638–0.696 vs 0.768–0.787). Jitter is 2–3× higher (0.06–0.09/min vs
+0.03/min), and reaction rate at low SPM drops to 48–57% (vs 73–94%).
+
+### Root cause: per-share simulation is noisier per tick
+
+The per-share `decay_time()` simulation runs N separate EMA decay steps
+per tick (one per simulated share arrival). Each step introduces rounding
+and the uniform inter-share spacing assumption adds variance. A single
+batch EWMA update (`α × old + (1-α) × new`) produces a cleaner signal
+per tick because it avoids the N-step accumulation error.
+
+Under PoissonCI (which requires large deviations to fire), both estimators
+are "good enough" — the boundary's conservatism masks the noise difference.
+Under CUSUM (which fires on smaller accumulated deviations), the ckpool
+estimator's per-tick noise triggers more false fires → higher jitter →
+lower fitness.
+
+### Revised conclusion on evaluation cadence
+
+The original claim "the evaluation cadence is just scheduling, not
+information" was too strong. While the *information content* of N shares
+in T seconds is identical regardless of evaluation cadence, the
+*numerical stability* of the estimate depends on how that information is
+processed. A single batch update is numerically cleaner than N simulated
+updates, and this difference is operationally significant under aggressive
+boundaries.
+
 ## Conclusion
 
 ckpool's vardiff is well-optimized for its native per-share evaluation
-context but yields no Pareto improvement over FullRemedy in the tick-based
-SV2 framework. The per-share simulation technique is the correct way to
-port continuous-time EMAs and is preserved in the codebase as
-`CkpoolEstimator`. The production recommendation remains unchanged:
+context. When ported to the tick-based SV2 framework:
+
+1. **Estimator**: The per-share `decay_time()` simulation produces noisier
+   estimates than a batch EWMA(120s) under aggressive boundaries. The
+   simpler `EwmaEstimator(120s)` is preferred for production.
+
+2. **Boundary**: Hysteresis [0.5, 1.33] does not transfer — too wide for
+   60s ticks. Narrower bands trade reaction for jitter without achieving
+   competitive fitness. Statistical boundaries (PoissonCI, CUSUM) dominate.
+
+3. **Update rule**: ckpool's full retarget is equivalent to η=1.0 in the
+   partial retarget framework. The damped AcceleratingPartialRetarget
+   (η capped at 0.4) outperforms full retarget on overshoot and jitter.
+
+The production recommendation:
 
 ```rust
 Composed::new(
     EwmaEstimator::new(120),
-    PoissonCI::default_parametric(),
-    PartialRetarget::new(0.2),
+    AdaptivePoissonCusum::new(10),
+    AcceleratingPartialRetarget::new(0.2, 0.4, 0.2),
     min_allowed_hashrate,
     clock,
 )
 ```
+
+The `CkpoolEstimator` is preserved in the codebase for reference and as
+a benchmark contender in the simulation grid.
 
 ## Files Added
 
