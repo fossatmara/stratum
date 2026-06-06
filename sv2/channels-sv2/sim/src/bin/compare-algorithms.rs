@@ -80,8 +80,8 @@ use vardiff_sim::baseline::{
 use vardiff_sim::grid::{AlgorithmSpec, Grid, VardiffBox};
 use vardiff_sim::metrics::{self, Direction, ScenarioFilter, SummaryFmt, SummarySpec};
 use vardiff_sim::{
-    AcceleratingPartialRetarget, AsymmetricCusumBoundary, CkpoolEstimator, Composed, PartialRetarget,
-    PoissonCI,
+    AcceleratingPartialRetarget, AdaptivePoissonCusum, AsymmetricCusumBoundary, CkpoolEstimator,
+    Composed, EwmaEstimator, PartialRetarget, PoissonCI,
 };
 
 fn main() -> std::io::Result<()> {
@@ -122,6 +122,86 @@ fn main() -> std::io::Result<()> {
             AlgorithmSpec::ewma_60s(),
             AlgorithmSpec::sliding_window(10),
             AlgorithmSpec::full_remedy(),
+            AlgorithmSpec::poisson_accel(),
+            // --- Winner: AdaptiveBoundary-spm10 (PoissonCI < 10 SPM, CUSUM >= 10) ---
+            AlgorithmSpec::adaptive_boundary(10),
+            // --- Phase 2: Update rule sweep with AdaptiveBoundary-spm10 locked ---
+            // Vary eta_base
+            AlgorithmSpec::new("Adp10-eta15", |clock| {
+                VardiffBox(Box::new(Composed::new(
+                    EwmaEstimator::new(120),
+                    AdaptivePoissonCusum::new(10),
+                    AcceleratingPartialRetarget::new(0.15, 0.6, 0.2),
+                    1.0, clock,
+                )))
+            }),
+            AlgorithmSpec::new("Adp10-eta25", |clock| {
+                VardiffBox(Box::new(Composed::new(
+                    EwmaEstimator::new(120),
+                    AdaptivePoissonCusum::new(10),
+                    AcceleratingPartialRetarget::new(0.25, 0.6, 0.2),
+                    1.0, clock,
+                )))
+            }),
+            AlgorithmSpec::new("Adp10-eta30", |clock| {
+                VardiffBox(Box::new(Composed::new(
+                    EwmaEstimator::new(120),
+                    AdaptivePoissonCusum::new(10),
+                    AcceleratingPartialRetarget::new(0.3, 0.6, 0.2),
+                    1.0, clock,
+                )))
+            }),
+            // Vary eta_max
+            AlgorithmSpec::new("Adp10-max40", |clock| {
+                VardiffBox(Box::new(Composed::new(
+                    EwmaEstimator::new(120),
+                    AdaptivePoissonCusum::new(10),
+                    AcceleratingPartialRetarget::new(0.2, 0.4, 0.2),
+                    1.0, clock,
+                )))
+            }),
+            AlgorithmSpec::new("Adp10-max80", |clock| {
+                VardiffBox(Box::new(Composed::new(
+                    EwmaEstimator::new(120),
+                    AdaptivePoissonCusum::new(10),
+                    AcceleratingPartialRetarget::new(0.2, 0.8, 0.2),
+                    1.0, clock,
+                )))
+            }),
+            // Vary acceleration
+            AlgorithmSpec::new("Adp10-acc10", |clock| {
+                VardiffBox(Box::new(Composed::new(
+                    EwmaEstimator::new(120),
+                    AdaptivePoissonCusum::new(10),
+                    AcceleratingPartialRetarget::new(0.2, 0.6, 0.1),
+                    1.0, clock,
+                )))
+            }),
+            AlgorithmSpec::new("Adp10-acc30", |clock| {
+                VardiffBox(Box::new(Composed::new(
+                    EwmaEstimator::new(120),
+                    AdaptivePoissonCusum::new(10),
+                    AcceleratingPartialRetarget::new(0.2, 0.6, 0.3),
+                    1.0, clock,
+                )))
+            }),
+            // Fixed eta (no acceleration) for comparison
+            AlgorithmSpec::new("Adp10-fixed20", |clock| {
+                VardiffBox(Box::new(Composed::new(
+                    EwmaEstimator::new(120),
+                    AdaptivePoissonCusum::new(10),
+                    PartialRetarget::new(0.2),
+                    1.0, clock,
+                )))
+            }),
+            AlgorithmSpec::new("Adp10-fixed30", |clock| {
+                VardiffBox(Box::new(Composed::new(
+                    EwmaEstimator::new(120),
+                    AdaptivePoissonCusum::new(10),
+                    PartialRetarget::new(0.3),
+                    1.0, clock,
+                )))
+            }),
             AlgorithmSpec::ewma_adaptive_cusum(120, 1.5, 0.05, 0.2),
             AlgorithmSpec::ewma_adaptive_cusum(120, 1.5, 0.05, 0.5),
             AlgorithmSpec::ckpool_remedy(),

@@ -438,6 +438,64 @@ impl AlgorithmSpec {
         })
     }
 
+    /// PoissonCI boundary + AcceleratingPartialRetarget update.
+    ///
+    /// Hypothesis: PoissonCI gates fires with statistical rigor (prevents
+    /// overshoot at low SPM where data is sparse), while
+    /// AcceleratingPartialRetarget gives fast convergence at high SPM
+    /// (where PoissonCI fires often and the accelerating η can safely
+    /// ramp). Combines FullRemedy's low-SPM discipline with
+    /// VardiffState's high-SPM speed.
+    pub fn poisson_accel() -> Self {
+        Self::new("PoissonAccel", |clock| {
+            let inner = composed::Composed::new(
+                composed::EwmaEstimator::new(120),
+                composed::PoissonCI::default_parametric(),
+                composed::AcceleratingPartialRetarget::new(0.2, 0.6, 0.2),
+                1.0,
+                clock,
+            );
+            VardiffBox(Box::new(inner))
+        })
+    }
+
+    /// PoissonCI + GuardedAccelRetarget: only accelerates η after the
+    /// first direction reversal. During cold-start (all fires upward),
+    /// η stays at 0.2 — preventing overshoot. After the first reversal
+    /// proves we've crossed the target, acceleration kicks in for
+    /// subsequent step-changes.
+    pub fn poisson_guarded_accel() -> Self {
+        Self::new("PoissonGuardedAccel", |clock| {
+            let inner = composed::Composed::new(
+                composed::EwmaEstimator::new(120),
+                composed::PoissonCI::default_parametric(),
+                composed::GuardedAccelRetarget::new(0.2, 0.6, 0.2),
+                1.0,
+                clock,
+            );
+            VardiffBox(Box::new(inner))
+        })
+    }
+
+    /// Adaptive boundary: PoissonCI at low SPM, CUSUM at high SPM.
+    /// The `spm_threshold` determines the crossover point. Below it,
+    /// PoissonCI's conservatism prevents overshoot on sparse data.
+    /// At or above it, CUSUM's aggression leverages abundant data.
+    /// Paired with AcceleratingPartialRetarget for fast convergence.
+    pub fn adaptive_boundary(spm_threshold: u32) -> Self {
+        let name = format!("AdaptiveBoundary-spm{}", spm_threshold);
+        Self::new(name, move |clock| {
+            let inner = composed::Composed::new(
+                composed::EwmaEstimator::new(120),
+                composed::AdaptivePoissonCusum::new(spm_threshold),
+                composed::AcceleratingPartialRetarget::new(0.2, 0.6, 0.2),
+                1.0,
+                clock,
+            );
+            VardiffBox(Box::new(inner))
+        })
+    }
+
     /// Parameterized FullRemedy: same three-axis composition as
     /// [`full_remedy`](Self::full_remedy) but with the EWMA time
     /// constant, PartialRetarget η, and PoissonCI z-score exposed as

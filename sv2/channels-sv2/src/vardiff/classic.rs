@@ -10,14 +10,21 @@ use super::{error::VardiffError, Vardiff};
 /// Variable difficulty controller.
 ///
 /// Internally uses: `EwmaEstimator(120s) +
-/// AsymmetricCusumBoundary(s=1.5, floor=0.05, tighten=3.0) +
-/// AcceleratingPartialRetarget(base=0.2, max=0.6, acc=0.2)`.
+/// AdaptivePoissonCusum(spm_threshold=10) +
+/// AcceleratingPartialRetarget(base=0.2, max=0.4, acc=0.2)`.
+///
+/// The boundary adapts to the miner's share rate:
+/// - Below SPM 10 (low hashrate miners): PoissonCI provides statistical
+///   rigor, preventing overshoot on sparse data.
+/// - At SPM 10+ (higher hashrate): AsymmetricCUSUM enables aggressive
+///   reaction leveraging abundant statistical evidence.
 ///
 /// The AcceleratingPartialRetarget ramps η on consecutive same-direction
-/// fires (0.2 → 0.4 → 0.6), giving faster convergence after step
-/// changes with zero jitter cost vs fixed η.
+/// fires (0.2 → 0.4), capped at 0.4 to prevent cold-start overshoot
+/// while still accelerating convergence after step changes.
 ///
-/// See `sim/docs/PID_INVESTIGATION.md` for the derivation and parameter sweep.
+/// See `sim/docs/CKPOOL_INVESTIGATION.md` for the ckpool comparison and
+/// `sim/compare_out7/` for the parameter sweep that selected these values.
 #[derive(Debug)]
 pub struct VardiffState {
     inner: Box<dyn Vardiff>,
@@ -44,13 +51,13 @@ impl VardiffState {
         clock: Arc<dyn Clock>,
     ) -> Result<Self, VardiffError> {
         use crate::vardiff::composed::{
-            AcceleratingPartialRetarget, AsymmetricCusumBoundary, Composed, EwmaEstimator,
+            AcceleratingPartialRetarget, AdaptivePoissonCusum, Composed, EwmaEstimator,
         };
         Ok(VardiffState {
             inner: Box::new(Composed::new(
                 EwmaEstimator::new(120),
-                AsymmetricCusumBoundary::new(1.5, 0.05, 3.0),
-                AcceleratingPartialRetarget::new(0.2, 0.6, 0.2),
+                AdaptivePoissonCusum::new(10),
+                AcceleratingPartialRetarget::new(0.2, 0.4, 0.2),
                 min_allowed_hashrate,
                 clock,
             )),

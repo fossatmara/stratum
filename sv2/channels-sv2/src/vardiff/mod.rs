@@ -66,14 +66,15 @@ pub trait Vardiff: Debug + Send + Sync {
 /// Constructs the recommended production vardiff.
 ///
 /// Returns a [`Box<dyn Vardiff>`] wrapping:
-/// `EwmaEstimator(120s) + AsymmetricCusumBoundary(s=1.5, floor=0.05, tighten=3.0) +
-/// AcceleratingPartialRetarget(base=0.2, max=0.6, acc=0.2)`.
+/// `EwmaEstimator(120s) + AdaptivePoissonCusum(spm_threshold=10) +
+/// AcceleratingPartialRetarget(base=0.2, max=0.4, acc=0.2)`.
 /// Uses [`DEFAULT_MIN_HASHRATE`] as the minimum hashrate floor and a
 /// [`SystemClock`] for time.
 ///
-/// The `AcceleratingPartialRetarget` ramps η on consecutive same-direction
-/// fires (0.2 → 0.4 → 0.6), yielding 22% better convergence after step
-/// changes with zero jitter cost vs fixed η. See `sim/docs/PID_INVESTIGATION.md`.
+/// The adaptive boundary uses PoissonCI for miners below SPM 10 (preventing
+/// overshoot on sparse data) and AsymmetricCUSUM for miners at SPM 10+
+/// (enabling fast reaction with abundant evidence). The update rule caps
+/// η at 0.4 to balance convergence speed against cold-start overshoot.
 ///
 /// This is the recommended entry point for new production code. For
 /// custom min-hashrate floors, use [`default_with_min`]. For a custom

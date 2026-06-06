@@ -384,6 +384,93 @@ impl UpdateRule for AcceleratingPartialRetarget {
     }
 }
 
+/// Like [`AcceleratingPartialRetarget`] but only accelerates after the
+/// first direction reversal. During cold-start ramp (all fires in one
+/// direction, no reversal yet), η stays at `eta_base`. Once the algorithm
+/// has reversed direction at least once (proving it has crossed the target
+/// and is now tracking), acceleration kicks in normally.
+///
+/// This prevents cold-start overshoot: the initial ramp uses conservative
+/// η=0.2 even on consecutive same-direction fires, then after the first
+/// overshoot/reversal, subsequent step-changes get the acceleration benefit.
+pub struct GuardedAccelRetarget {
+    pub eta_base: f32,
+    pub eta_max: f32,
+    pub acceleration: f32,
+    consecutive_same_direction: AtomicU32,
+    last_direction: AtomicI8,
+    /// Set to true after the first direction reversal.
+    has_reversed: std::sync::atomic::AtomicBool,
+}
+
+impl Debug for GuardedAccelRetarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GuardedAccelRetarget")
+            .field("eta_base", &self.eta_base)
+            .field("eta_max", &self.eta_max)
+            .field("acceleration", &self.acceleration)
+            .field(
+                "consecutive_same_direction",
+                &self.consecutive_same_direction.load(Ordering::Relaxed),
+            )
+            .field(
+                "has_reversed",
+                &self.has_reversed.load(Ordering::Relaxed),
+            )
+            .finish()
+    }
+}
+
+impl GuardedAccelRetarget {
+    pub fn new(eta_base: f32, eta_max: f32, acceleration: f32) -> Self {
+        Self {
+            eta_base,
+            eta_max,
+            acceleration,
+            consecutive_same_direction: AtomicU32::new(0),
+            last_direction: AtomicI8::new(0),
+            has_reversed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+impl UpdateRule for GuardedAccelRetarget {
+    fn next_hashrate(
+        &self,
+        snap: &EstimatorSnapshot,
+        current_hashrate: f32,
+        _delta: f64,
+        _threshold: f64,
+        _shares_per_minute: f32,
+    ) -> f32 {
+        let direction: i8 = if snap.h_estimate > current_hashrate {
+            1
+        } else {
+            -1
+        };
+
+        let last = self.last_direction.load(Ordering::Relaxed);
+        let consecutive = if direction == last {
+            self.consecutive_same_direction.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            if last != 0 {
+                self.has_reversed.store(true, Ordering::Relaxed);
+            }
+            self.last_direction.store(direction, Ordering::Relaxed);
+            self.consecutive_same_direction.store(1, Ordering::Relaxed);
+            1
+        };
+
+        let eta_effective = if self.has_reversed.load(Ordering::Relaxed) {
+            (self.eta_base + self.acceleration * (consecutive - 1) as f32).min(self.eta_max)
+        } else {
+            self.eta_base
+        };
+
+        current_hashrate + eta_effective * (snap.h_estimate - current_hashrate)
+    }
+}
+
 /// ckpool-style full retarget: `optimal = dsps × target_period`.
 ///
 /// ckpool computes the optimal difficulty as `dsps × 3.33` (shares per

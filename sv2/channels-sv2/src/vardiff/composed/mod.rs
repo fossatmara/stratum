@@ -37,8 +37,9 @@ pub mod estimator;
 pub mod update;
 
 pub use boundary::{
-    AdaptiveCusumBoundary, AsymmetricCusumBoundary, Boundary, CredibleIntervalBoundary,
-    CusumBoundary, HysteresisGate, PoissonCI, SignPersistenceCusumBoundary, StepFunction,
+    AdaptiveCusumBoundary, AdaptivePoissonCusum, AsymmetricCusumBoundary, Boundary,
+    CredibleIntervalBoundary, CusumBoundary, HysteresisGate, PoissonCI,
+    SignPersistenceCusumBoundary, StepFunction,
 };
 pub use composed::{classic_composed, ClassicComposed, Composed};
 pub use decision::DecisionRecord;
@@ -50,5 +51,5 @@ pub use estimator::{
 };
 pub use update::{
     AcceleratingPartialRetarget, AdaptivePartialRetarget, CkpoolRetarget, FullRetargetNoClamp,
-    FullRetargetWithClamp, PartialRetarget, UpdateRule,
+    FullRetargetWithClamp, GuardedAccelRetarget, PartialRetarget, UpdateRule,
 };
