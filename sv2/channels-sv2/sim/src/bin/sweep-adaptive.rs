@@ -1,6 +1,6 @@
 //! Parameter sweep for the AdaptivePoissonCusum boundary composition.
 //!
-//! Sweeps: CUSUM sensitivity × tighten_multiplier × transition_shares
+//! Sweeps: CUSUM sensitivity × tighten_multiplier × spm_threshold
 //! with fixed EwmaEstimator(120s) + AcceleratingPartialRetarget(0.2, 0.6, 0.2).
 
 use std::collections::HashMap;

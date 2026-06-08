@@ -658,18 +658,14 @@ impl Boundary for HysteresisGate {
     }
 }
 
-/// Adaptive boundary that blends PoissonCI (conservative) with
-/// AsymmetricCusumBoundary (aggressive) based on share accumulation.
+/// Adaptive boundary that selects PoissonCI (conservative) or
+/// AsymmetricCusumBoundary (aggressive) based on the miner's configured
+/// shares-per-minute rate.
 ///
-/// At low share counts (cold-start, low SPM), PoissonCI dominates —
-/// its wide confidence interval prevents premature fires on sparse data.
-/// As shares accumulate past a transition threshold, the boundary
-/// smoothly shifts toward CUSUM's tighter threshold, enabling faster
-/// reaction at higher SPMs.
-///
-/// The blending uses `min(poisson_threshold, cusum_threshold)` after
-/// the transition point — whichever boundary wants to fire first, wins.
-/// Before the transition point, only PoissonCI is active.
+/// Below `spm_threshold`, PoissonCI's wide confidence interval prevents
+/// premature fires on sparse data (bitaxe / small miners). At or above
+/// the threshold, CUSUM's tighter sequential-testing boundary enables
+/// fast reaction with abundant evidence (large hashrate miners).
 ///
 /// This mimics ckpool's dual-window strategy but at the boundary layer:
 /// conservative when data is sparse, aggressive when data is abundant.
@@ -679,39 +675,36 @@ pub struct AdaptivePoissonCusum {
     pub poisson: PoissonCI,
     /// Aggressive boundary for data-rich regime.
     pub cusum: AsymmetricCusumBoundary,
-    /// Number of shares (cumulative in snap.n_shares) required before
-    /// CUSUM activates. Below this, only PoissonCI is used.
-    pub transition_shares: u32,
+    /// Configured SPM below which PoissonCI is used. At or above this,
+    /// CUSUM activates.
+    pub spm_threshold: u32,
 }
 
 impl AdaptivePoissonCusum {
-    pub fn new(transition_shares: u32) -> Self {
+    pub fn new(spm_threshold: u32) -> Self {
         Self {
             poisson: PoissonCI::default_parametric(),
             cusum: AsymmetricCusumBoundary::new(1.5, 0.05, 3.0),
-            transition_shares,
+            spm_threshold,
         }
     }
 
     pub fn with_params(
         poisson: PoissonCI,
         cusum: AsymmetricCusumBoundary,
-        transition_shares: u32,
+        spm_threshold: u32,
     ) -> Self {
         Self {
             poisson,
             cusum,
-            transition_shares,
+            spm_threshold,
         }
     }
 }
 
 impl Boundary for AdaptivePoissonCusum {
     fn threshold(&self, dt_secs: u64, shares_per_minute: f32, snap: &EstimatorSnapshot) -> f64 {
-        // Use SPM to decide regime: low SPM → PoissonCI (conservative),
-        // high SPM → CUSUM (aggressive). The transition_shares field is
-        // reinterpreted as an SPM threshold (e.g., 10 = switch at SPM 10).
-        if (shares_per_minute as u32) < self.transition_shares {
+        if (shares_per_minute as u32) < self.spm_threshold {
             self.poisson.threshold(dt_secs, shares_per_minute, snap)
         } else {
             self.cusum.threshold(dt_secs, shares_per_minute, snap)
