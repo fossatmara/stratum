@@ -658,6 +658,40 @@ impl Boundary for HysteresisGate {
     }
 }
 
+/// Asymmetric PoissonCI: applies a tighten multiplier when the miner is
+/// over-performing (would tighten difficulty), making it harder to
+/// increase difficulty than to decrease it.
+///
+/// Uses the same Poisson confidence interval formula as [`PoissonCI`] but
+/// multiplies the threshold by `tighten_multiplier` when the direction of
+/// the deviation would tighten difficulty (reject in-flight shares).
+#[derive(Debug, Clone, Copy)]
+pub struct AsymmetricPoissonCI {
+    pub poisson: PoissonCI,
+    pub tighten_multiplier: f64,
+}
+
+impl AsymmetricPoissonCI {
+    pub fn new(z: f64, margin: f64, tighten_multiplier: f64) -> Self {
+        Self {
+            poisson: PoissonCI::with_z(z, margin),
+            tighten_multiplier: tighten_multiplier.max(1.0),
+        }
+    }
+}
+
+impl Boundary for AsymmetricPoissonCI {
+    fn threshold(&self, dt_secs: u64, shares_per_minute: f32, snap: &EstimatorSnapshot) -> f64 {
+        let base = self.poisson.threshold(dt_secs, shares_per_minute, snap);
+        let would_tighten = snap.realized_share_per_min > shares_per_minute as f64;
+        if would_tighten {
+            base * self.tighten_multiplier
+        } else {
+            base
+        }
+    }
+}
+
 /// Adaptive boundary that selects PoissonCI (conservative) or
 /// AsymmetricCusumBoundary (aggressive) based on the miner's configured
 /// shares-per-minute rate.
