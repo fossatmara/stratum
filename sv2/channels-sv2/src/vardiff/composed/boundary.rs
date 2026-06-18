@@ -888,37 +888,90 @@ impl Boundary for VolatilityAdaptiveBoundary {
     }
 }
 
-/// Adaptive boundary that selects PoissonCI (conservative) or
-/// AsymmetricCusumBoundary (aggressive) based on the miner's configured
-/// shares-per-minute rate.
+/// Dual-mode boundary: PoissonCI (conservative) below `spm_threshold`, an
+/// arbitrary aggressive boundary `B` at or above it, switched on the miner's
+/// configured shares-per-minute rate.
 ///
 /// Below `spm_threshold`, PoissonCI's wide confidence interval prevents
-/// premature fires on sparse data (bitaxe / small miners). At or above
-/// the threshold, CUSUM's tighter sequential-testing boundary enables
-/// fast reaction with abundant evidence (large hashrate miners).
+/// premature fires on sparse data (bitaxe / small miners) — sparse windows
+/// produce noisy residual runs that destabilize sequential boundaries. At or
+/// above the threshold, the data-rich boundary `B` enables fast reaction with
+/// abundant evidence (large hashrate miners).
 ///
-/// This mimics ckpool's dual-window strategy but at the boundary layer:
-/// conservative when data is sparse, aggressive when data is abundant.
-#[derive(Debug, Clone)]
-pub struct AdaptivePoissonCusum {
-    /// Conservative boundary for sparse-data regime.
+/// This mimics ckpool's dual-window strategy at the boundary layer:
+/// conservative when data is sparse, aggressive when data is abundant. `B` is
+/// generic so the same low-SPM guard protects any high-SPM boundary —
+/// AsymmetricCusum (see [`AdaptivePoissonCusum`]) or SignPersistence (see
+/// [`AdaptiveSignPersist`]), both of which collapse at low SPM without it.
+#[derive(Debug)]
+pub struct AdaptiveBoundary<B: Boundary> {
+    /// Conservative boundary for the sparse-data regime.
     pub poisson: PoissonCI,
-    /// Aggressive boundary for data-rich regime.
-    pub cusum: AsymmetricCusumBoundary,
-    /// Configured SPM below which PoissonCI is used. At or above this,
-    /// CUSUM activates.
+    /// Aggressive boundary for the data-rich regime.
+    pub high: B,
+    /// Configured SPM below which PoissonCI is used. At or above this, `high`
+    /// activates.
     pub spm_threshold: u32,
 }
 
-impl AdaptivePoissonCusum {
+impl<B: Boundary> AdaptiveBoundary<B> {
+    /// Construct with an explicit PoissonCI floor and high-SPM boundary.
+    pub fn with_high(poisson: PoissonCI, high: B, spm_threshold: u32) -> Self {
+        Self {
+            poisson,
+            high,
+            spm_threshold,
+        }
+    }
+}
+
+impl<B: Boundary> Boundary for AdaptiveBoundary<B> {
+    fn threshold(&self, dt_secs: u64, shares_per_minute: f32, snap: &EstimatorSnapshot) -> f64 {
+        if (shares_per_minute as u32) < self.spm_threshold {
+            self.poisson.threshold(dt_secs, shares_per_minute, snap)
+        } else {
+            self.high.threshold(dt_secs, shares_per_minute, snap)
+        }
+    }
+
+    fn code(&self) -> String {
+        // Include the inner Poisson and high-boundary codes so two adaptive
+        // boundaries differing only in inner params get distinct names. Omit
+        // the Poisson code when it's the default, to keep the common case
+        // readable. The high boundary's own code() carries its identity, so
+        // CUSUM vs SignPersist is automatically distinguished here.
+        let default_poisson = PoissonCI::default_parametric();
+        let poisson_is_default =
+            self.poisson.z == default_poisson.z && self.poisson.margin == default_poisson.margin;
+        if poisson_is_default {
+            format!("Adapt-spm{}[{}]", self.spm_threshold, self.high.code())
+        } else {
+            format!(
+                "Adapt-spm{}[{}|{}]",
+                self.spm_threshold,
+                self.poisson.code(),
+                self.high.code()
+            )
+        }
+    }
+}
+
+/// Back-compat alias: the original PoissonCI ⇄ AsymmetricCusum dual-mode
+/// boundary, now a specialization of [`AdaptiveBoundary`]. Existing callers
+/// keep using `AdaptivePoissonCusum::new` / `::with_params`.
+pub type AdaptivePoissonCusum = AdaptiveBoundary<AsymmetricCusumBoundary>;
+
+impl AdaptiveBoundary<AsymmetricCusumBoundary> {
+    /// Default CUSUM dual-mode boundary (sensitivity=1.5, tighten=3.0).
     pub fn new(spm_threshold: u32) -> Self {
         Self {
             poisson: PoissonCI::default_parametric(),
-            cusum: AsymmetricCusumBoundary::new(1.5, 0.05, 3.0),
+            high: AsymmetricCusumBoundary::new(1.5, 0.05, 3.0),
             spm_threshold,
         }
     }
 
+    /// Construct with explicit PoissonCI floor and CUSUM boundary.
     pub fn with_params(
         poisson: PoissonCI,
         cusum: AsymmetricCusumBoundary,
@@ -926,42 +979,28 @@ impl AdaptivePoissonCusum {
     ) -> Self {
         Self {
             poisson,
-            cusum,
+            high: cusum,
             spm_threshold,
         }
     }
 }
 
-impl Boundary for AdaptivePoissonCusum {
-    fn threshold(&self, dt_secs: u64, shares_per_minute: f32, snap: &EstimatorSnapshot) -> f64 {
-        if (shares_per_minute as u32) < self.spm_threshold {
-            self.poisson.threshold(dt_secs, shares_per_minute, snap)
-        } else {
-            self.cusum.threshold(dt_secs, shares_per_minute, snap)
-        }
-    }
+/// Dual-mode boundary pairing PoissonCI (low SPM) with
+/// [`SignPersistenceCusumBoundary`] (high SPM). The sign-persistence boundary
+/// is excellent at high SPM but collapses at low SPM (it discounts its
+/// threshold on same-sign residual runs, which sparse-data Poisson noise
+/// produces spuriously). This alias gives it the same low-SPM guard the CUSUM
+/// dual-mode uses.
+pub type AdaptiveSignPersist = AdaptiveBoundary<SignPersistenceCusumBoundary>;
 
-    fn code(&self) -> String {
-        // Include the inner Poisson and CUSUM codes so two AdaptPC boundaries
-        // that differ only in sensitivity/tighten/z get distinct names. Omit
-        // the inner names only when they are the defaults, to keep the common
-        // case readable.
-        let default_poisson = PoissonCI::default_parametric();
-        let default_cusum = AsymmetricCusumBoundary::new(1.5, 0.05, 3.0);
-        let poisson_is_default =
-            self.poisson.z == default_poisson.z && self.poisson.margin == default_poisson.margin;
-        let cusum_is_default = self.cusum.base_sensitivity == default_cusum.base_sensitivity
-            && self.cusum.floor == default_cusum.floor
-            && self.cusum.tighten_multiplier == default_cusum.tighten_multiplier;
-        if poisson_is_default && cusum_is_default {
-            format!("AdaptPC-spm{}", self.spm_threshold)
-        } else {
-            format!(
-                "AdaptPC-spm{}[{}|{}]",
-                self.spm_threshold,
-                self.poisson.code(),
-                self.cusum.code()
-            )
+impl AdaptiveBoundary<SignPersistenceCusumBoundary> {
+    /// Construct with the default PoissonCI floor and an explicit
+    /// sign-persistence boundary for the high-SPM regime.
+    pub fn sign_persist(high: SignPersistenceCusumBoundary, spm_threshold: u32) -> Self {
+        Self {
+            poisson: PoissonCI::default_parametric(),
+            high,
+            spm_threshold,
         }
     }
 }
@@ -978,6 +1017,35 @@ mod tests {
             dt_secs: 60,
             uncertainty: None,
         }
+    }
+
+    #[test]
+    fn adaptive_boundary_switches_on_spm_threshold() {
+        // Below the threshold it must return the PoissonCI floor; at/above it
+        // must defer to the wrapped high-SPM boundary. Use a SignPersist high
+        // boundary so we exercise the generic over a non-CUSUM type.
+        let b = AdaptiveSignPersist::sign_persist(
+            SignPersistenceCusumBoundary::new(1.5, 0.05, 3.0, 0.15, 0.4),
+            8,
+        );
+        let poisson = PoissonCI::default_parametric();
+
+        // Below threshold (4 SPM) → PoissonCI floor exactly.
+        let low = b.threshold(60, 4.0, &snap_with_realized(4.0));
+        let expected_low = poisson.threshold(60, 4.0, &snap_with_realized(4.0));
+        assert!(
+            (low - expected_low).abs() < 1e-9,
+            "below spm_threshold must use PoissonCI: got {low}, want {expected_low}"
+        );
+
+        // At/above threshold (20 SPM) → NOT the PoissonCI value (defers to the
+        // sign-persistence boundary, which differs from the Poisson floor).
+        let high = b.threshold(60, 20.0, &snap_with_realized(25.0));
+        let poisson_high = poisson.threshold(60, 20.0, &snap_with_realized(25.0));
+        assert!(
+            (high - poisson_high).abs() > 1e-9,
+            "at/above spm_threshold must use the high boundary, not PoissonCI"
+        );
     }
 
     fn snap_with_realized(realized_spm: f64) -> EstimatorSnapshot {

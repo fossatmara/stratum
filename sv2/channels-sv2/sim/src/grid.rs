@@ -589,28 +589,39 @@ impl AlgorithmSpec {
         })
     }
 
-    /// **React-priority Pareto optimum** (react−10% 0.696, the best
-    /// small-drop reaction of any *balanced-ish* algorithm). `EwmaEstimator(90s)`
-    /// + `SignPersistenceCusumBoundary(sensitivity=1.5, floor=0.05,
-    /// tighten=3.0, discount=0.15, max_discount=0.4)` +
+    /// **React-priority Pareto optimum** (best small-drop reaction of any
+    /// balanced-ish algorithm). `EwmaEstimator(90s)` +
+    /// `AdaptiveSignPersist(spm=8)` — PoissonCI below 8 SPM, and
+    /// `SignPersistenceCusumBoundary(sensitivity=1.5, floor=0.05, tighten=3.0,
+    /// discount=0.15, max_discount=0.4)` at/above — +
     /// `AcceleratingPartialRetarget(0.3, 0.6, 0.2)`.
     ///
-    /// Found by `sweep-signpersist`. The sign-persistence boundary ratchets
-    /// its threshold down as a deviation persists in one direction, so a
-    /// sustained 10% hashrate drop (failing/throttling ASIC) is detected far
-    /// faster than any fixed boundary — at the cost of slower cold-start
-    /// convergence (the two draw on the same "agility budget"). Use when fast
-    /// detection of gradual hashrate loss is the operational priority.
+    /// The sign-persistence boundary ratchets its threshold down as a
+    /// deviation persists in one direction, so a sustained 10% hashrate drop
+    /// (failing/throttling ASIC) is detected far faster than any fixed
+    /// boundary — at the cost of slower cold-start convergence (the two draw
+    /// on the same "agility budget"). Per-SPM analysis showed the bare
+    /// SignPersist boundary collapses at low SPM (jitter/step/convergence all
+    /// near zero at 4 SPM) because sparse-data Poisson noise spuriously trips
+    /// the same-sign discount; wrapping it in the PoissonCI low-SPM guard
+    /// (`AdaptiveSignPersist`) fixes that. Use when fast detection of gradual
+    /// hashrate loss is the operational priority.
     pub fn react_priority() -> Self {
+        let make_boundary = || {
+            composed::AdaptiveSignPersist::sign_persist(
+                composed::SignPersistenceCusumBoundary::new(1.5, 0.05, 3.0, 0.15, 0.4),
+                8,
+            )
+        };
         let name = crate::naming::triple_name(
             &composed::EwmaEstimator::new(90),
-            &composed::SignPersistenceCusumBoundary::new(1.5, 0.05, 3.0, 0.15, 0.4),
+            &make_boundary(),
             &composed::AcceleratingPartialRetarget::new(0.3, 0.6, 0.2),
         );
         Self::new(name, move |clock| {
             let inner = composed::Composed::new(
                 composed::EwmaEstimator::new(90),
-                composed::SignPersistenceCusumBoundary::new(1.5, 0.05, 3.0, 0.15, 0.4),
+                make_boundary(),
                 composed::AcceleratingPartialRetarget::new(0.3, 0.6, 0.2),
                 1.0,
                 clock,
