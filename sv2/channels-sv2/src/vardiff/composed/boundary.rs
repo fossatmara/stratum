@@ -11,7 +11,7 @@
 //! their threshold based on estimator confidence.
 
 use std::fmt::Debug;
-use std::sync::atomic::{AtomicI8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI8, AtomicU32, AtomicU64, Ordering};
 
 use super::estimator::EstimatorSnapshot;
 
@@ -24,6 +24,10 @@ use super::estimator::EstimatorSnapshot;
 /// [`CusumBoundary`] (sequential-testing).
 pub trait Boundary: Debug + Send + Sync {
     fn threshold(&self, dt_secs: u64, shares_per_minute: f32, snap: &EstimatorSnapshot) -> f64;
+
+    /// A short, drift-proof code derived from the boundary's actual
+    /// parameters. See [`super::Estimator::code`] for the rationale.
+    fn code(&self) -> String;
 }
 
 /// A piecewise-constant threshold over `dt_secs`. Share-rate-blind.
@@ -79,6 +83,10 @@ impl Boundary for StepFunction {
         // Unreachable when the table includes the required u64::MAX entry,
         // but defensive fallback rather than panic.
         self.table.last().map(|(_, v)| *v).unwrap_or(100.0)
+    }
+
+    fn code(&self) -> String {
+        "Step".to_string()
     }
 }
 
@@ -162,6 +170,10 @@ impl Boundary for PoissonCI {
         // convert the fractional bound to match.
         bound_fraction * 100.0
     }
+
+    fn code(&self) -> String {
+        format!("Poisson-z{:.2}", self.z)
+    }
 }
 
 /// Credible-interval boundary: fires when the estimator's posterior
@@ -236,6 +248,10 @@ impl Boundary for CredibleIntervalBoundary {
                 self.fallback.threshold(dt_secs, shares_per_minute, snap)
             }
         }
+    }
+
+    fn code(&self) -> String {
+        format!("CredInt-z{:.2}", self.z)
     }
 }
 
@@ -337,6 +353,10 @@ impl Boundary for AdaptiveCusumBoundary {
         let threshold_fraction = (sensitivity / n_ticks) + effective_floor;
         threshold_fraction * 100.0
     }
+
+    fn code(&self) -> String {
+        format!("AdaptCusum-s{}-f{}", self.base_sensitivity, self.floor)
+    }
 }
 
 /// Asymmetric rate-adaptive CUSUM: uses different thresholds for
@@ -408,6 +428,13 @@ impl Boundary for AsymmetricCusumBoundary {
         };
 
         threshold_fraction * 100.0
+    }
+
+    fn code(&self) -> String {
+        format!(
+            "AsymCusum-s{}-f{}-t{}",
+            self.base_sensitivity, self.floor, self.tighten_multiplier
+        )
     }
 }
 
@@ -542,6 +569,18 @@ impl Boundary for SignPersistenceCusumBoundary {
         // Step 5: Apply discount and convert to percentage points.
         asymmetric_threshold * (1.0 - discount) * 100.0
     }
+
+    fn code(&self) -> String {
+        // Include params so sweep variants get distinct (drift-proof) names.
+        format!(
+            "SignPersist-s{}-f{}-t{}-d{}-dm{}",
+            self.base_sensitivity,
+            self.floor,
+            self.tighten_multiplier,
+            self.sign_persistence_discount,
+            self.max_sign_discount
+        )
+    }
 }
 
 impl Boundary for CusumBoundary {
@@ -559,6 +598,10 @@ impl Boundary for CusumBoundary {
 
         // Convert to percentage points (matching deviation convention)
         threshold_fraction * 100.0
+    }
+
+    fn code(&self) -> String {
+        format!("Cusum-s{}-f{}", self.sensitivity, self.floor)
     }
 }
 
@@ -656,6 +699,13 @@ impl Boundary for HysteresisGate {
         // Outside the hysteresis band with sufficient data → always fire.
         0.0
     }
+
+    fn code(&self) -> String {
+        format!(
+            "Hyst-{}-{}-g{}",
+            self.hysteresis_low, self.hysteresis_high, self.min_shares
+        )
+    }
 }
 
 /// Asymmetric PoissonCI: applies a tighten multiplier when the miner is
@@ -689,6 +739,152 @@ impl Boundary for AsymmetricPoissonCI {
         } else {
             base
         }
+    }
+
+    fn code(&self) -> String {
+        format!(
+            "AsymPoisson-z{:.2}-t{}",
+            self.poisson.z, self.tighten_multiplier
+        )
+    }
+}
+
+/// Volatility-adaptive boundary: a PoissonCI floor scaled by *recently
+/// observed* share-rate volatility relative to the Poisson expectation.
+///
+/// Motivation: the sweeps showed react−10% is bounded by a hard tradeoff —
+/// a fixed boundary must choose between tight (good react−10%, bad jitter)
+/// and loose (good jitter, bad react−10%). This boundary breaks the tradeoff
+/// by adapting *per miner over time*: when the share stream is behaving like
+/// clean Poisson noise (calm), it tightens toward the PoissonCI floor so a
+/// genuine 10% drop is detected fast; when the stream is genuinely volatile
+/// (the miner's rate is wandering), it loosens to avoid firing on noise.
+///
+/// ## State (interior mutability)
+///
+/// Two EWMAs over the per-tick realized rate, updated on every `threshold`
+/// call (one call per tick):
+/// - `mean_bits`: EWMA of realized shares-per-minute → the smoothed rate μ.
+/// - `var_bits`: EWMA of the squared residual `(realized − μ)²` → observed
+///   variance σ²_obs.
+///
+/// The *expected* per-tick Poisson variance of the share count, expressed in
+/// the same (shares-per-minute)² units, is `λ̄ · (60/dt)²` where
+/// `λ̄ = SPM·dt/60` is the expected count. The **excess-volatility factor**
+///
+/// ```text
+/// vf = clamp( σ²_obs / σ²_poisson , 1.0 , vf_max )
+/// ```
+///
+/// is ≈1 when the stream is pure Poisson and grows when the rate is
+/// genuinely moving. The threshold is the PoissonCI floor times `vf`:
+///
+/// ```text
+/// θ = poisson_ci(dt, SPM) · vf
+/// ```
+///
+/// `alpha` is the EWMA smoothing in (0,1] (lower = longer memory); `vf_max`
+/// caps how far volatility can loosen the boundary.
+#[derive(Debug)]
+pub struct VolatilityAdaptiveBoundary {
+    /// Underlying rate-aware floor.
+    pub poisson: PoissonCI,
+    /// EWMA smoothing factor for the mean/variance trackers, in (0, 1].
+    pub alpha: f64,
+    /// Maximum volatility loosening multiplier (≥ 1.0).
+    pub vf_max: f64,
+    /// Tick interval in seconds (matches the trial driver cadence).
+    pub tick_secs: u64,
+    /// EWMA of realized shares-per-minute (μ), as f64 bits. NaN = uninit.
+    mean_bits: AtomicU64,
+    /// EWMA of squared residual (σ²_obs), as f64 bits. NaN = uninit.
+    var_bits: AtomicU64,
+}
+
+impl Clone for VolatilityAdaptiveBoundary {
+    fn clone(&self) -> Self {
+        Self {
+            poisson: self.poisson,
+            alpha: self.alpha,
+            vf_max: self.vf_max,
+            tick_secs: self.tick_secs,
+            mean_bits: AtomicU64::new(self.mean_bits.load(Ordering::Relaxed)),
+            var_bits: AtomicU64::new(self.var_bits.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+impl VolatilityAdaptiveBoundary {
+    /// Construct with the default PoissonCI floor (z=2.576, margin=0.05).
+    /// `alpha` is the EWMA smoothing (e.g. 0.2 ≈ 5-tick memory); `vf_max`
+    /// caps the loosening (e.g. 4.0).
+    pub fn new(alpha: f64, vf_max: f64) -> Self {
+        Self {
+            poisson: PoissonCI::default_parametric(),
+            alpha: alpha.clamp(1e-3, 1.0),
+            vf_max: vf_max.max(1.0),
+            tick_secs: 60,
+            mean_bits: AtomicU64::new(f64::NAN.to_bits()),
+            var_bits: AtomicU64::new(f64::NAN.to_bits()),
+        }
+    }
+
+    pub fn with_poisson(poisson: PoissonCI, alpha: f64, vf_max: f64) -> Self {
+        let mut b = Self::new(alpha, vf_max);
+        b.poisson = poisson;
+        b
+    }
+
+    /// Update the EWMA mean/variance trackers with this tick's realized rate
+    /// and return the current excess-volatility factor in [1, vf_max].
+    fn update_volatility_factor(&self, realized_spm: f64, expected_var_spm2: f64) -> f64 {
+        let prev_mean = f64::from_bits(self.mean_bits.load(Ordering::Relaxed));
+        let prev_var = f64::from_bits(self.var_bits.load(Ordering::Relaxed));
+
+        // First observation: seed mean to the realized rate, variance to the
+        // Poisson expectation (factor starts neutral at ~1.0).
+        let (mean, var) = if prev_mean.is_nan() {
+            (realized_spm, expected_var_spm2.max(1e-9))
+        } else {
+            let residual = realized_spm - prev_mean;
+            let mean = prev_mean + self.alpha * residual;
+            let var = (1.0 - self.alpha) * prev_var + self.alpha * residual * residual;
+            (mean, var)
+        };
+        self.mean_bits.store(mean.to_bits(), Ordering::Relaxed);
+        self.var_bits.store(var.to_bits(), Ordering::Relaxed);
+
+        if expected_var_spm2 <= 0.0 {
+            return 1.0;
+        }
+        (var / expected_var_spm2).clamp(1.0, self.vf_max)
+    }
+}
+
+impl Boundary for VolatilityAdaptiveBoundary {
+    fn threshold(&self, dt_secs: u64, shares_per_minute: f32, snap: &EstimatorSnapshot) -> f64 {
+        let base = self.poisson.threshold(dt_secs, shares_per_minute, snap);
+
+        // Expected count and its Poisson variance, converted to (SPM)² units.
+        // count ~ Poisson(λ̄), Var[count] = λ̄. realized_spm = count·60/dt, so
+        // Var[realized_spm] = λ̄·(60/dt)².
+        let dt = dt_secs.max(1) as f64;
+        let lambda_bar = (shares_per_minute as f64 / 60.0) * dt;
+        if lambda_bar <= 0.0 {
+            return base;
+        }
+        let scale = 60.0 / dt;
+        let expected_var_spm2 = lambda_bar * scale * scale;
+
+        let vf = self.update_volatility_factor(snap.realized_share_per_min, expected_var_spm2);
+        base * vf
+    }
+
+    fn code(&self) -> String {
+        format!(
+            "VolAdapt-z{:.2}-a{}-vf{}",
+            self.poisson.z, self.alpha, self.vf_max
+        )
     }
 }
 
@@ -744,6 +940,30 @@ impl Boundary for AdaptivePoissonCusum {
             self.cusum.threshold(dt_secs, shares_per_minute, snap)
         }
     }
+
+    fn code(&self) -> String {
+        // Include the inner Poisson and CUSUM codes so two AdaptPC boundaries
+        // that differ only in sensitivity/tighten/z get distinct names. Omit
+        // the inner names only when they are the defaults, to keep the common
+        // case readable.
+        let default_poisson = PoissonCI::default_parametric();
+        let default_cusum = AsymmetricCusumBoundary::new(1.5, 0.05, 3.0);
+        let poisson_is_default =
+            self.poisson.z == default_poisson.z && self.poisson.margin == default_poisson.margin;
+        let cusum_is_default = self.cusum.base_sensitivity == default_cusum.base_sensitivity
+            && self.cusum.floor == default_cusum.floor
+            && self.cusum.tighten_multiplier == default_cusum.tighten_multiplier;
+        if poisson_is_default && cusum_is_default {
+            format!("AdaptPC-spm{}", self.spm_threshold)
+        } else {
+            format!(
+                "AdaptPC-spm{}[{}|{}]",
+                self.spm_threshold,
+                self.poisson.code(),
+                self.cusum.code()
+            )
+        }
+    }
 }
 
 #[cfg(test)]
@@ -758,6 +978,51 @@ mod tests {
             dt_secs: 60,
             uncertainty: None,
         }
+    }
+
+    fn snap_with_realized(realized_spm: f64) -> EstimatorSnapshot {
+        EstimatorSnapshot {
+            h_estimate: 1.0e15,
+            realized_share_per_min: realized_spm,
+            n_shares: realized_spm.round() as u32,
+            dt_secs: 60,
+            uncertainty: None,
+        }
+    }
+
+    #[test]
+    fn voladapt_loosens_under_volatility_and_tightens_when_calm() {
+        let spm = 12.0f32;
+
+        // Calm stream: realized rate stays at the configured rate every tick.
+        // The volatility factor should converge to ~1.0, so the threshold
+        // matches the bare PoissonCI floor.
+        let calm = VolatilityAdaptiveBoundary::new(0.3, 8.0);
+        let poisson = PoissonCI::default_parametric();
+        let base = poisson.threshold(60, spm, &dummy_snap());
+        let mut calm_th = 0.0;
+        for _ in 0..40 {
+            calm_th = calm.threshold(60, spm, &snap_with_realized(12.0));
+        }
+        // Calm → factor clamps to its 1.0 floor → threshold ≈ PoissonCI floor.
+        assert!(
+            (calm_th - base).abs() < 1e-6,
+            "calm threshold {calm_th} should equal PoissonCI floor {base}"
+        );
+
+        // Volatile stream: realized rate swings wildly tick to tick. Observed
+        // variance >> Poisson expectation → factor > 1 → threshold loosens
+        // above the bare floor.
+        let volatile = VolatilityAdaptiveBoundary::new(0.3, 8.0);
+        let mut vol_th = 0.0;
+        for i in 0..40 {
+            let realized = if i % 2 == 0 { 2.0 } else { 40.0 };
+            vol_th = volatile.threshold(60, spm, &snap_with_realized(realized));
+        }
+        assert!(
+            vol_th > base * 1.5,
+            "volatile threshold {vol_th} should be well above the floor {base}"
+        );
     }
 
     #[test]

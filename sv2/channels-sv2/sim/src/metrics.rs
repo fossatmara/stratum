@@ -2238,6 +2238,7 @@ pub trait DerivedMetric: Send + Sync + Debug {
 pub fn derived_registry() -> Vec<Box<dyn DerivedMetric>> {
     vec![
         Box::new(OperationalFitness),
+        Box::new(EqualWeightFitness),
         Box::new(CounterAgeSensitivity),
         Box::new(ComprehensiveFitness),
         Box::new(DecouplingScore),
@@ -2590,6 +2591,181 @@ impl DerivedMetric for OperationalFitness {
                 s("step_safety_component"),
                 s("convergence_component"),
                 s("overshoot_component"),
+            ));
+        }
+        w.push('\n');
+    }
+}
+
+// ---- EqualWeightFitness -----------------------------------------------------
+
+/// Same sub-metrics as OperationalFitness but with uniform 1/6 weighting.
+///
+/// Removes the structural advantage that harm-avoidance-dominant algorithms
+/// get from the 60/25/15 cluster weighting. Useful for seeing the "unbiased"
+/// ranking where no metric cluster is privileged.
+///
+/// ```text
+/// fitness = (1/6) × reaction_rate(Step −10%)
+///         + (1/6) × reaction_rate(Step −50%)
+///         + (1/6) × clamp(1 − jitter_mean / 0.30, 0, 1)
+///         + (1/6) × clamp(1 − (step_magnitude_p95 − 1.0) / 0.5, 0, 1)
+///         + (1/6) × convergence_rate × clamp(1 − conv_p50 / 600s, 0, 1)
+///         + (1/6) × clamp(1 − overshoot_p99, 0, 1)
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct EqualWeightFitness;
+
+impl DerivedMetric for EqualWeightFitness {
+    fn id(&self) -> &'static str {
+        "equal_weight_fitness"
+    }
+
+    fn class(&self) -> MetricClass {
+        MetricClass::ShouldHave
+    }
+
+    fn compute(&self, results: &[crate::baseline::CellResult]) -> Vec<(f32, MetricValues)> {
+        #[derive(Default, Clone)]
+        struct Inputs {
+            reaction_10: Option<f64>,
+            reaction_50: Option<f64>,
+            jitter_mean: Option<f64>,
+            step_magnitude_p95: Option<f64>,
+            convergence_rate: Option<f64>,
+            convergence_p50_secs: Option<f64>,
+            overshoot_p99: Option<f64>,
+        }
+        let mut by_spm: HashMap<u32, Inputs> = HashMap::new();
+        for r in results {
+            let spm_key = r.shares_per_minute as u32;
+            let entry = by_spm.entry(spm_key).or_default();
+            match r.scenario {
+                Scenario::Stable => {
+                    if let Some(j) = r.get("jitter_mean_per_min") {
+                        entry.jitter_mean = Some(j);
+                    }
+                    if let Some(s) = r.get("upward_step_magnitude_p95") {
+                        entry.step_magnitude_p95 = Some(s);
+                    }
+                }
+                Scenario::Step { delta_pct: -10 } => {
+                    if let Some(rate) = r.get("reaction_rate") {
+                        entry.reaction_10 = Some(rate);
+                    }
+                }
+                Scenario::Step { delta_pct: -50 } => {
+                    if let Some(rate) = r.get("reaction_rate") {
+                        entry.reaction_50 = Some(rate);
+                    }
+                }
+                Scenario::ColdStart => {
+                    if let Some(rate) = r.get("convergence_rate") {
+                        entry.convergence_rate = Some(rate);
+                    }
+                    if let Some(t) = r.get("convergence_p50_secs") {
+                        entry.convergence_p50_secs = Some(t);
+                    }
+                    if let Some(ov) = r.get("ramp_target_overshoot_p99") {
+                        entry.overshoot_p99 = Some(ov);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut entries: Vec<_> = by_spm.into_iter().collect();
+        entries.sort_by_key(|&(spm, _)| spm);
+
+        const CONV_CEILING_SECS: f64 = 600.0;
+        const W: f64 = 1.0 / 6.0;
+
+        entries
+            .into_iter()
+            .filter_map(|(spm, inp)| {
+                let r10 = inp.reaction_10.unwrap_or(0.0);
+                let r50 = inp.reaction_50.unwrap_or(0.0);
+                let jitter = inp.jitter_mean.unwrap_or(1.0);
+                let step_mag = inp.step_magnitude_p95.unwrap_or(1.5);
+                let conv_rate = inp.convergence_rate.unwrap_or(0.0);
+                let conv_secs = inp.convergence_p50_secs.unwrap_or(CONV_CEILING_SECS);
+                let overshoot = inp.overshoot_p99.unwrap_or(1.0);
+
+                let jitter_factor = (1.0 - jitter / 0.30).clamp(0.0, 1.0);
+                let overshoot_factor = (1.0 - overshoot).clamp(0.0, 1.0);
+                let step_safety = (1.0 - (step_mag - 1.0) / 0.5).clamp(0.0, 1.0);
+                let speed_factor = (1.0 - conv_secs / CONV_CEILING_SECS).clamp(0.0, 1.0);
+                let convergence_factor = conv_rate * speed_factor;
+
+                let score = W * r10
+                    + W * r50
+                    + W * jitter_factor
+                    + W * step_safety
+                    + W * convergence_factor
+                    + W * overshoot_factor;
+
+                let mut mv = MetricValues::new();
+                mv.set("score", Some(score));
+                mv.set("reaction_10", Some(r10));
+                mv.set("reaction_50", Some(r50));
+                mv.set("jitter", Some(jitter_factor));
+                mv.set("step_safety", Some(step_safety));
+                mv.set("convergence", Some(convergence_factor));
+                mv.set("overshoot", Some(overshoot_factor));
+                Some((spm as f32, mv))
+            })
+            .collect()
+    }
+
+    fn tolerance_checks(&self, _spm: f32) -> Vec<ToleranceCheck> {
+        vec![ToleranceCheck {
+            key: "score",
+            tolerance: Tolerance::WithinCi {
+                direction: Direction::HigherIsBetter,
+                extra_abs: 0.05,
+                extra_mul: None,
+            },
+        }]
+    }
+
+    fn summary_specs(&self) -> Vec<SummarySpec> {
+        vec![SummarySpec {
+            label: "equal-weight fitness",
+            key: "score",
+            direction: Direction::HigherIsBetter,
+            scenario_filter: ScenarioFilter::Any,
+            fmt: SummaryFmt::Float3,
+        }]
+    }
+
+    fn render_markdown(&self, results: &[crate::baseline::CellResult], w: &mut String) {
+        let scores = self.compute(results);
+        if scores.is_empty() {
+            return;
+        }
+        w.push_str("## Equal-weight fitness (per share rate)\n\n");
+        w.push_str(
+            "Each sub-metric weighted 1/6. No cluster bias. Higher is better.\n\n",
+        );
+        w.push_str(
+            "| share/min | fitness | react-10% | react-50% | jitter | step-safe | conv | overshoot |\n",
+        );
+        w.push_str("| --- | --- | --- | --- | --- | --- | --- | --- |\n");
+        for (spm, mv) in scores {
+            let s = |k: &str| match mv.get(k) {
+                Some(v) => format!("{:.3}", v),
+                None => "—".to_string(),
+            };
+            w.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                spm as u32,
+                s("score"),
+                s("reaction_10"),
+                s("reaction_50"),
+                s("jitter"),
+                s("step_safety"),
+                s("convergence"),
+                s("overshoot"),
             ));
         }
         w.push('\n');
@@ -3528,6 +3704,7 @@ mod tests {
             ids,
             vec![
                 "operational_fitness",
+                "equal_weight_fitness",
                 "counter_age_sensitivity",
                 "comprehensive_fitness",
                 "decoupling_score",

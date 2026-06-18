@@ -106,6 +106,14 @@ pub trait Estimator: Debug + Send + Sync {
     /// trait method. Estimators that don't carry an integer count (e.g.,
     /// EWMA) may return a derived value such as `ceil(weighted_sum)`.
     fn shares_count(&self) -> u32;
+
+    /// A short, drift-proof code derived from the estimator's actual
+    /// parameters. Used (with the [`Boundary`](super::Boundary) and
+    /// [`UpdateRule`](super::UpdateRule) codes) to build the composed
+    /// algorithm's display name and filename. Because each `code()` is
+    /// built from the concrete type's live fields, the name can never
+    /// drift away from what the algorithm actually does.
+    fn code(&self) -> String;
 }
 
 /// The classic estimator: a saturating cumulative share counter, with
@@ -136,6 +144,10 @@ impl Estimator for CumulativeCounter {
 
     fn shares_count(&self) -> u32 {
         self.shares
+    }
+
+    fn code(&self) -> String {
+        "Cumul".to_string()
     }
 
     fn snapshot(&self, dt_secs: u64, ctx: &EstimatorContext) -> EstimatorSnapshot {
@@ -313,6 +325,10 @@ impl Estimator for EwmaEstimator {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    fn code(&self) -> String {
+        format!("Ewma{}s", self.tau_secs)
+    }
+
     fn snapshot(&self, dt_secs: u64, ctx: &EstimatorContext) -> EstimatorSnapshot {
         // Apply EWMA decay with the pending shares as this tick's observation.
         let pending = self
@@ -461,6 +477,10 @@ impl Estimator for SpmRatioEstimator {
         self.rate_per_tick.round().max(0.0) as u32
     }
 
+    fn code(&self) -> String {
+        "SpmRatio".to_string()
+    }
+
     fn snapshot(&self, dt_secs: u64, ctx: &EstimatorContext) -> EstimatorSnapshot {
         let realized_share_per_min = self.rate_per_tick * (60.0 / self.tick_secs as f64);
 
@@ -552,6 +572,10 @@ impl Estimator for SlidingWindowEstimator {
         self.buffer
             .iter()
             .fold(0u32, |acc, &n| acc.saturating_add(n))
+    }
+
+    fn code(&self) -> String {
+        format!("Slide{}t", self.n_ticks)
     }
 
     fn snapshot(&self, dt_secs: u64, ctx: &EstimatorContext) -> EstimatorSnapshot {
@@ -731,6 +755,10 @@ impl Estimator for BayesianEstimator {
         self.shares_since_reset
     }
 
+    fn code(&self) -> String {
+        format!("Bayes-d{}-p{}", self.discount, self.prior_shares)
+    }
+
     fn snapshot(&self, dt_secs: u64, ctx: &EstimatorContext) -> EstimatorSnapshot {
         // Compute the posterior after incorporating ALL ticks since last reset.
         // Each tick contributes (observed_shares_that_tick, expected_shares_per_tick)
@@ -888,6 +916,10 @@ impl Estimator for KalmanEstimator {
 
     fn shares_count(&self) -> u32 {
         self.shares_since_fire
+    }
+
+    fn code(&self) -> String {
+        format!("Kalman-q{}", self.q)
     }
 
     fn snapshot(&self, dt_secs: u64, ctx: &EstimatorContext) -> EstimatorSnapshot {
@@ -1130,6 +1162,10 @@ impl Estimator for CkpoolEstimator {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    fn code(&self) -> String {
+        format!("Ckpool{}-{}s", self.tau_short, self.tau_long)
+    }
+
     fn snapshot(&self, dt_secs: u64, ctx: &EstimatorContext) -> EstimatorSnapshot {
         let pending = self
             .pending_shares
@@ -1298,6 +1334,10 @@ impl Estimator for TimeBiasEwmaEstimator {
     fn shares_count(&self) -> u32 {
         self.pending_shares
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn code(&self) -> String {
+        format!("TimeBiasEwma{}s", self.tau_secs)
     }
 
     fn snapshot(&self, dt_secs: u64, ctx: &EstimatorContext) -> EstimatorSnapshot {

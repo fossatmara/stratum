@@ -36,6 +36,10 @@ pub trait UpdateRule: Debug + Send + Sync {
         threshold: f64,
         shares_per_minute: f32,
     ) -> f32;
+
+    /// A short, drift-proof code derived from the update rule's actual
+    /// parameters. See [`super::Estimator::code`] for the rationale.
+    fn code(&self) -> String;
 }
 
 /// Full retarget toward the Estimator's belief `h_estimate`, with two
@@ -119,6 +123,10 @@ impl UpdateRule for FullRetargetWithClamp {
         // Branch 3: trust the estimator.
         snap.h_estimate
     }
+
+    fn code(&self) -> String {
+        "FullClamp".to_string()
+    }
 }
 
 /// Partial retarget: `new_target = current + η × (h_estimate − current)`.
@@ -167,6 +175,10 @@ impl UpdateRule for PartialRetarget {
     ) -> f32 {
         current_hashrate + self.eta * (snap.h_estimate - current_hashrate)
     }
+
+    fn code(&self) -> String {
+        format!("Partial-e{}", self.eta)
+    }
 }
 
 /// Full retarget without clamping: `new_hashrate = h_estimate`. The
@@ -202,6 +214,10 @@ impl UpdateRule for FullRetargetNoClamp {
         // is applied at the Composed-adapter level, so we don't clamp
         // here even when h_estimate is below it.
         snap.h_estimate.max(0.0)
+    }
+
+    fn code(&self) -> String {
+        "FullNoClamp".to_string()
     }
 }
 
@@ -277,6 +293,10 @@ impl UpdateRule for AdaptivePartialRetarget {
         let scale = scale.clamp(self.min_scale, self.max_scale);
         let eta = (self.eta_base * scale).min(1.0);
         current_hashrate + eta * (snap.h_estimate - current_hashrate)
+    }
+
+    fn code(&self) -> String {
+        format!("AdaptPartial-e{}-m{}", self.eta_base, self.reference_margin)
     }
 }
 
@@ -382,6 +402,13 @@ impl UpdateRule for AcceleratingPartialRetarget {
 
         current_hashrate + eta_effective * (snap.h_estimate - current_hashrate)
     }
+
+    fn code(&self) -> String {
+        format!(
+            "Accel-{}-{}-{}",
+            self.eta_base, self.eta_max, self.acceleration
+        )
+    }
 }
 
 /// Like [`AcceleratingPartialRetarget`] but only accelerates after the
@@ -469,6 +496,13 @@ impl UpdateRule for GuardedAccelRetarget {
 
         current_hashrate + eta_effective * (snap.h_estimate - current_hashrate)
     }
+
+    fn code(&self) -> String {
+        format!(
+            "GuardAccel-{}-{}-{}",
+            self.eta_base, self.eta_max, self.acceleration
+        )
+    }
 }
 
 /// ckpool-style full retarget: `optimal = dsps × target_period`.
@@ -542,6 +576,10 @@ impl UpdateRule for CkpoolRetarget {
         }
 
         target
+    }
+
+    fn code(&self) -> String {
+        format!("CkpoolRetgt-m{}", self.min_shares_for_decrease)
     }
 }
 

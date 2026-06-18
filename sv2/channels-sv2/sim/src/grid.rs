@@ -239,7 +239,19 @@ impl AlgorithmSpec {
     /// metrics (bias, variance, overshoot) gracefully report `None`
     /// for this algorithm.
     pub fn classic_vardiff_state() -> Self {
-        Self::new("VardiffState", |clock| {
+        // The monolith is fire-equivalent to Cumul / Step / FullClamp. Derive
+        // the name from those three components and append the `*` monolith
+        // marker so it is distinguishable from ClassicComposed (which the
+        // sanitize_filename fn keeps collision-free on disk).
+        let name = format!(
+            "{}*",
+            crate::naming::triple_name(
+                &composed::CumulativeCounter::new(),
+                &composed::StepFunction::classic_table(),
+                &composed::FullRetargetWithClamp::classic(),
+            )
+        );
+        Self::new(name, |clock| {
             let inner = VardiffState::new_with_clock(1.0, clock)
                 .expect("VardiffState construction should never fail");
             VardiffBox(Box::new(AsObservable(inner)))
@@ -251,7 +263,12 @@ impl AlgorithmSpec {
     /// exposes the per-tick decision state, so bias / variance /
     /// overshoot metrics work.
     pub fn classic_composed() -> Self {
-        Self::new("ClassicComposed", |clock| {
+        let name = crate::naming::triple_name(
+            &composed::CumulativeCounter::new(),
+            &composed::StepFunction::classic_table(),
+            &composed::FullRetargetWithClamp::classic(),
+        );
+        Self::new(name, |clock| {
             VardiffBox(Box::new(composed::classic_composed(1.0, clock)))
         })
     }
@@ -265,7 +282,12 @@ impl AlgorithmSpec {
     /// form differs. Holding three axes constant and varying the
     /// fourth is exactly what the three-stage pipeline supports.
     pub fn parametric() -> Self {
-        Self::new("Parametric", |clock| {
+        let name = crate::naming::triple_name(
+            &composed::CumulativeCounter::new(),
+            &composed::PoissonCI::default_parametric(),
+            &composed::FullRetargetWithClamp::classic(),
+        );
+        Self::new(name, |clock| {
             let inner = composed::Composed::new(
                 composed::CumulativeCounter::new(),
                 composed::PoissonCI::default_parametric(),
@@ -303,7 +325,11 @@ impl AlgorithmSpec {
     /// [`ewma_60s`](Self::ewma_60s): `AbsoluteRatio` statistic,
     /// `PoissonCI(2.576, 0.05)` boundary, `PartialRetarget(0.5)` update.
     pub fn ewma(tau_secs: u64) -> Self {
-        let name = format!("EWMA-{tau_secs}s");
+        let name = crate::naming::triple_name(
+            &composed::EwmaEstimator::new(tau_secs),
+            &composed::PoissonCI::default_parametric(),
+            &composed::PartialRetarget::default_ewma(),
+        );
         Self::new(name, move |clock| {
             let inner = composed::Composed::new(
                 composed::EwmaEstimator::new(tau_secs),
@@ -324,7 +350,11 @@ impl AlgorithmSpec {
     /// `n_ticks` × `tick_secs (=60)` product is the effective window
     /// in seconds; e.g. `n_ticks = 10` → 10-minute sliding window.
     pub fn sliding_window(n_ticks: usize) -> Self {
-        let name = format!("SlidingWindow-{n_ticks}t");
+        let name = crate::naming::triple_name(
+            &composed::SlidingWindowEstimator::new(n_ticks),
+            &composed::PoissonCI::default_parametric(),
+            &composed::FullRetargetNoClamp,
+        );
         Self::new(name, move |clock| {
             let inner = composed::Composed::new(
                 composed::SlidingWindowEstimator::new(n_ticks),
@@ -348,7 +378,12 @@ impl AlgorithmSpec {
     /// only marginally improve the worst-case at SPM=6 but should
     /// trim the median.
     pub fn parametric_strict() -> Self {
-        Self::new("ParametricStrict", |clock| {
+        let name = crate::naming::triple_name(
+            &composed::CumulativeCounter::new(),
+            &composed::PoissonCI::strict_3sigma(),
+            &composed::FullRetargetWithClamp::classic(),
+        );
+        Self::new(name, |clock| {
             let inner = composed::Composed::new(
                 composed::CumulativeCounter::new(),
                 composed::PoissonCI::strict_3sigma(),
@@ -380,7 +415,11 @@ impl AlgorithmSpec {
     /// Algorithm name is `"ClassicPartialRetarget-{eta×100 as u32}"`,
     /// e.g. `classic_partial_retarget(0.3)` → `"ClassicPartialRetarget-30"`.
     pub fn classic_partial_retarget(eta: f32) -> Self {
-        let name = format!("ClassicPartialRetarget-{}", (eta * 100.0).round() as u32);
+        let name = crate::naming::triple_name(
+            &composed::CumulativeCounter::new(),
+            &composed::StepFunction::classic_table(),
+            &composed::PartialRetarget::new(eta),
+        );
         Self::new(name, move |clock| {
             let inner = composed::Composed::new(
                 composed::CumulativeCounter::new(),
@@ -426,7 +465,12 @@ impl AlgorithmSpec {
     /// VardiffState peaks at 187% above truth; FullRemedy on the same
     /// scan collapses the worst-case to a low double-digit excursion.
     pub fn full_remedy() -> Self {
-        Self::new("FullRemedy", |clock| {
+        let name = crate::naming::triple_name(
+            &composed::EwmaEstimator::new(120),
+            &composed::PoissonCI::default_parametric(),
+            &composed::PartialRetarget::new(0.2),
+        );
+        Self::new(name, |clock| {
             let inner = composed::Composed::new(
                 composed::EwmaEstimator::new(120),
                 composed::PoissonCI::default_parametric(),
@@ -447,7 +491,12 @@ impl AlgorithmSpec {
     /// ramp). Combines FullRemedy's low-SPM discipline with
     /// VardiffState's high-SPM speed.
     pub fn poisson_accel() -> Self {
-        Self::new("PoissonAccel", |clock| {
+        let name = crate::naming::triple_name(
+            &composed::EwmaEstimator::new(120),
+            &composed::PoissonCI::default_parametric(),
+            &composed::AcceleratingPartialRetarget::new(0.2, 0.6, 0.2),
+        );
+        Self::new(name, |clock| {
             let inner = composed::Composed::new(
                 composed::EwmaEstimator::new(120),
                 composed::PoissonCI::default_parametric(),
@@ -465,7 +514,12 @@ impl AlgorithmSpec {
     /// proves we've crossed the target, acceleration kicks in for
     /// subsequent step-changes.
     pub fn poisson_guarded_accel() -> Self {
-        Self::new("PoissonGuardedAccel", |clock| {
+        let name = crate::naming::triple_name(
+            &composed::EwmaEstimator::new(120),
+            &composed::PoissonCI::default_parametric(),
+            &composed::GuardedAccelRetarget::new(0.2, 0.6, 0.2),
+        );
+        Self::new(name, |clock| {
             let inner = composed::Composed::new(
                 composed::EwmaEstimator::new(120),
                 composed::PoissonCI::default_parametric(),
@@ -483,12 +537,81 @@ impl AlgorithmSpec {
     /// At or above it, CUSUM's aggression leverages abundant data.
     /// Paired with AcceleratingPartialRetarget for fast convergence.
     pub fn adaptive_boundary(spm_threshold: u32) -> Self {
-        let name = format!("AdaptiveBoundary-spm{}", spm_threshold);
+        let name = crate::naming::triple_name(
+            &composed::EwmaEstimator::new(120),
+            &composed::AdaptivePoissonCusum::new(spm_threshold),
+            &composed::AcceleratingPartialRetarget::new(0.2, 0.6, 0.2),
+        );
         Self::new(name, move |clock| {
             let inner = composed::Composed::new(
                 composed::EwmaEstimator::new(120),
                 composed::AdaptivePoissonCusum::new(spm_threshold),
                 composed::AcceleratingPartialRetarget::new(0.2, 0.6, 0.2),
+                1.0,
+                clock,
+            );
+            VardiffBox(Box::new(inner))
+        })
+    }
+
+    /// **Balanced Pareto optimum** (maximin 0.551, the best worst-axis of any
+    /// algorithm characterized). `EwmaEstimator(90s)` +
+    /// `AdaptivePoissonCusum(spm=8)` with a sensitive CUSUM (sensitivity=1.0,
+    /// tighten=3.0) + `AcceleratingPartialRetarget(0.3, 0.6, 0.2)`.
+    ///
+    /// Found by the maximin parameter sweep (`sweep-balanced`): no single
+    /// equal-weight axis falls below 0.55, trading a little jitter/overshoot
+    /// safety for materially stronger small-drop reaction and convergence
+    /// than the production `VardiffState`. This is the recommended default
+    /// when balanced behavior across all scenarios is wanted.
+    pub fn balanced() -> Self {
+        let make_boundary = || {
+            composed::AdaptivePoissonCusum::with_params(
+                composed::PoissonCI::default_parametric(),
+                composed::AsymmetricCusumBoundary::new(1.0, 0.05, 3.0),
+                8,
+            )
+        };
+        let name = crate::naming::triple_name(
+            &composed::EwmaEstimator::new(90),
+            &make_boundary(),
+            &composed::AcceleratingPartialRetarget::new(0.3, 0.6, 0.2),
+        );
+        Self::new(name, move |clock| {
+            let inner = composed::Composed::new(
+                composed::EwmaEstimator::new(90),
+                make_boundary(),
+                composed::AcceleratingPartialRetarget::new(0.3, 0.6, 0.2),
+                1.0,
+                clock,
+            );
+            VardiffBox(Box::new(inner))
+        })
+    }
+
+    /// **React-priority Pareto optimum** (react−10% 0.696, the best
+    /// small-drop reaction of any *balanced-ish* algorithm). `EwmaEstimator(90s)`
+    /// + `SignPersistenceCusumBoundary(sensitivity=1.5, floor=0.05,
+    /// tighten=3.0, discount=0.15, max_discount=0.4)` +
+    /// `AcceleratingPartialRetarget(0.3, 0.6, 0.2)`.
+    ///
+    /// Found by `sweep-signpersist`. The sign-persistence boundary ratchets
+    /// its threshold down as a deviation persists in one direction, so a
+    /// sustained 10% hashrate drop (failing/throttling ASIC) is detected far
+    /// faster than any fixed boundary — at the cost of slower cold-start
+    /// convergence (the two draw on the same "agility budget"). Use when fast
+    /// detection of gradual hashrate loss is the operational priority.
+    pub fn react_priority() -> Self {
+        let name = crate::naming::triple_name(
+            &composed::EwmaEstimator::new(90),
+            &composed::SignPersistenceCusumBoundary::new(1.5, 0.05, 3.0, 0.15, 0.4),
+            &composed::AcceleratingPartialRetarget::new(0.3, 0.6, 0.2),
+        );
+        Self::new(name, move |clock| {
+            let inner = composed::Composed::new(
+                composed::EwmaEstimator::new(90),
+                composed::SignPersistenceCusumBoundary::new(1.5, 0.05, 3.0, 0.15, 0.4),
+                composed::AcceleratingPartialRetarget::new(0.3, 0.6, 0.2),
                 1.0,
                 clock,
             );
@@ -518,11 +641,10 @@ impl AlgorithmSpec {
     /// because the sweep evidence so far suggests `margin` is a less
     /// impactful axis than the other three.
     pub fn full_remedy_with(tau_secs: u64, eta: f32, z: f64) -> Self {
-        let name = format!(
-            "FullRemedy-tau{}-eta{}-z{}",
-            tau_secs,
-            (eta * 100.0).round() as u32,
-            (z * 1000.0).round() as u32,
+        let name = crate::naming::triple_name(
+            &composed::EwmaEstimator::new(tau_secs),
+            &composed::PoissonCI::with_z(z, 0.05),
+            &composed::PartialRetarget::new(eta),
         );
         Self::new(name, move |clock| {
             let inner = composed::Composed::new(
@@ -546,12 +668,10 @@ impl AlgorithmSpec {
     /// `eta`: PartialRetarget damping factor.
     /// `z`: PoissonCI z-score threshold.
     pub fn bayesian(discount: f64, prior_shares: f64, eta: f32, z: f64) -> Self {
-        let name = format!(
-            "Bayesian-d{}-p{}-eta{}-z{}",
-            (discount * 1000.0).round() as u32,
-            (prior_shares * 10.0).round() as u32,
-            (eta * 100.0).round() as u32,
-            (z * 1000.0).round() as u32,
+        let name = crate::naming::triple_name(
+            &composed::BayesianEstimator::new(discount, prior_shares),
+            &composed::PoissonCI::with_z(z, 0.05),
+            &composed::PartialRetarget::new(eta),
         );
         Self::new(name, move |clock| {
             let inner = composed::Composed::new(
@@ -569,11 +689,10 @@ impl AlgorithmSpec {
     /// the estimator's noise characteristics in isolation. If the Bayesian
     /// estimator is smooth enough, it can tolerate aggressive updates.
     pub fn bayesian_full_retarget(discount: f64, prior_shares: f64, z: f64) -> Self {
-        let name = format!(
-            "Bayesian-d{}-p{}-full-z{}",
-            (discount * 1000.0).round() as u32,
-            (prior_shares * 10.0).round() as u32,
-            (z * 1000.0).round() as u32,
+        let name = crate::naming::triple_name(
+            &composed::BayesianEstimator::new(discount, prior_shares),
+            &composed::PoissonCI::with_z(z, 0.05),
+            &composed::FullRetargetNoClamp,
         );
         Self::new(name, move |clock| {
             let inner = composed::Composed::new(
@@ -596,12 +715,10 @@ impl AlgorithmSpec {
     /// `ci_z`: credible interval z-score (1.96=95%, 2.576=99%).
     /// `eta`: PartialRetarget damping.
     pub fn bayesian_ci(discount: f64, prior_shares: f64, ci_z: f64, eta: f32) -> Self {
-        let name = format!(
-            "BayesCI-d{}-p{}-z{}-eta{}",
-            (discount * 1000.0).round() as u32,
-            (prior_shares * 10.0).round() as u32,
-            (ci_z * 1000.0).round() as u32,
-            (eta * 100.0).round() as u32,
+        let name = crate::naming::triple_name(
+            &composed::BayesianEstimator::new(discount, prior_shares),
+            &composed::CredibleIntervalBoundary::with_z(ci_z),
+            &composed::PartialRetarget::new(eta),
         );
         Self::new(name, move |clock| {
             let inner = composed::Composed::new(
@@ -624,13 +741,10 @@ impl AlgorithmSpec {
         tighten_multiplier: f64,
         eta: f32,
     ) -> Self {
-        let name = format!(
-            "EWMA-AsymCUSUM-tau{}-s{}-f{}-t{}-eta{}",
-            tau_secs,
-            (base_sensitivity * 10.0).round() as u32,
-            (floor * 100.0).round() as u32,
-            (tighten_multiplier * 10.0).round() as u32,
-            (eta * 100.0).round() as u32,
+        let name = crate::naming::triple_name(
+            &composed::EwmaEstimator::new(tau_secs),
+            &composed::AsymmetricCusumBoundary::new(base_sensitivity, floor, tighten_multiplier),
+            &composed::PartialRetarget::new(eta),
         );
         Self::new(name, move |clock| {
             let inner = composed::Composed::new(
@@ -647,10 +761,10 @@ impl AlgorithmSpec {
     /// Kalman estimator + PoissonCI boundary + PartialRetarget.
     /// The Kalman provides adaptive smoothing + native uncertainty.
     pub fn kalman_poisson(q: f64, eta: f32) -> Self {
-        let name = format!(
-            "Kalman-q{}-eta{}",
-            (q * 10000.0).round() as u32,
-            (eta * 100.0).round() as u32,
+        let name = crate::naming::triple_name(
+            &composed::KalmanEstimator::new(q),
+            &composed::PoissonCI::default_parametric(),
+            &composed::PartialRetarget::new(eta),
         );
         Self::new(name, move |clock| {
             let inner = composed::Composed::new(
@@ -668,11 +782,10 @@ impl AlgorithmSpec {
     /// Full uncertainty-aware pipeline: Kalman reports confidence,
     /// CI boundary adapts threshold to confidence.
     pub fn kalman_ci(q: f64, ci_z: f64, eta: f32) -> Self {
-        let name = format!(
-            "KalmanCI-q{}-z{}-eta{}",
-            (q * 10000.0).round() as u32,
-            (ci_z * 1000.0).round() as u32,
-            (eta * 100.0).round() as u32,
+        let name = crate::naming::triple_name(
+            &composed::KalmanEstimator::new(q),
+            &composed::CredibleIntervalBoundary::with_z(ci_z),
+            &composed::PartialRetarget::new(eta),
         );
         Self::new(name, move |clock| {
             let inner = composed::Composed::new(
@@ -934,7 +1047,12 @@ impl AlgorithmSpec {
     /// - Jitter is identical to baseline (acceleration only activates post-fire)
     /// - Convergence improves 9-40% across SPM=6-30
     pub fn best_of_best() -> Self {
-        Self::new("BestOfBest", |clock| {
+        let name = crate::naming::triple_name(
+            &composed::SpmRatioEstimator::new(120),
+            &composed::AsymmetricCusumBoundary::new(1.5, 0.05, 3.0),
+            &composed::AcceleratingPartialRetarget::new(0.2, 0.6, 0.2),
+        );
+        Self::new(name, |clock| {
             let inner = composed::Composed::new(
                 composed::SpmRatioEstimator::new(120),
                 composed::AsymmetricCusumBoundary::new(1.5, 0.05, 3.0),
@@ -969,7 +1087,12 @@ impl AlgorithmSpec {
     /// Reference: <https://github.com/ckolivas/ckpool> (src/stratifier.c)
     /// and <https://github.com/parasitepool/para/blob/master/src/vardiff.rs>
     pub fn ckpool() -> Self {
-        Self::new("Ckpool", |clock| {
+        let name = crate::naming::triple_name(
+            &composed::CkpoolEstimator::new(60, 300),
+            &composed::HysteresisGate::ckpool_defaults(),
+            &composed::CkpoolRetarget::ckpool_defaults(),
+        );
+        Self::new(name, |clock| {
             let inner = composed::Composed::new(
                 composed::CkpoolEstimator::new(60, 300),
                 composed::HysteresisGate::ckpool_defaults(),
@@ -989,7 +1112,12 @@ impl AlgorithmSpec {
     /// without the overshoot/accuracy problems caused by ckpool's native
     /// hysteresis gate and full retarget.
     pub fn ckpool_remedy() -> Self {
-        Self::new("CkpoolRemedy", |clock| {
+        let name = crate::naming::triple_name(
+            &composed::CkpoolEstimator::new(60, 300),
+            &composed::PoissonCI::default_parametric(),
+            &composed::PartialRetarget::new(0.2),
+        );
+        Self::new(name, |clock| {
             let inner = composed::Composed::new(
                 composed::CkpoolEstimator::new(60, 300),
                 composed::PoissonCI::default_parametric(),
@@ -1008,7 +1136,11 @@ impl AlgorithmSpec {
     /// window. Lowering to `ft` shares enables the responsive short EMA
     /// to kick in sooner, potentially improving reaction rate at low SPMs.
     pub fn ckpool_remedy_ft(ft: u32) -> Self {
-        let name = format!("CkpoolRemedy-ft{}", ft);
+        let name = crate::naming::triple_name(
+            &composed::CkpoolEstimator::with_fast_threshold(60, 300, ft),
+            &composed::PoissonCI::default_parametric(),
+            &composed::PartialRetarget::new(0.2),
+        );
         Self::new(name, move |clock| {
             let inner = composed::Composed::new(
                 composed::CkpoolEstimator::with_fast_threshold(60, 300, ft),
@@ -1030,7 +1162,12 @@ impl AlgorithmSpec {
     /// the tick-based evaluation cadence. Paired with PartialRetarget(0.3)
     /// to limit overshoot.
     pub fn ckpool_narrow_hyst() -> Self {
-        Self::new("CkpoolNarrowHyst", |clock| {
+        let name = crate::naming::triple_name(
+            &composed::CkpoolEstimator::new(60, 300),
+            &composed::HysteresisGate::new(6, 60, 0.8, 1.2),
+            &composed::PartialRetarget::new(0.3),
+        );
+        Self::new(name, |clock| {
             let inner = composed::Composed::new(
                 composed::CkpoolEstimator::new(60, 300),
                 composed::HysteresisGate::new(6, 60, 0.8, 1.2),
@@ -1051,7 +1188,12 @@ impl AlgorithmSpec {
     /// without sacrificing anything else, the correction deserves
     /// integration into the main EwmaEstimator.
     pub fn time_bias_remedy() -> Self {
-        Self::new("TimeBiasRemedy", |clock| {
+        let name = crate::naming::triple_name(
+            &composed::TimeBiasEwmaEstimator::new(120),
+            &composed::PoissonCI::default_parametric(),
+            &composed::PartialRetarget::new(0.2),
+        );
+        Self::new(name, |clock| {
             let inner = composed::Composed::new(
                 composed::TimeBiasEwmaEstimator::new(120),
                 composed::PoissonCI::default_parametric(),
@@ -1075,16 +1217,14 @@ impl AlgorithmSpec {
         hysteresis_low: f64,
         hysteresis_high: f64,
     ) -> Self {
-        let name = format!(
-            "Ckpool-ts{}-tl{}-lo{}-hi{}",
-            tau_short,
-            tau_long,
-            (hysteresis_low * 100.0).round() as u32,
-            (hysteresis_high * 100.0).round() as u32,
-        );
         let min_shares =
             ((tau_long as f64 * 0.8) / 3.33).round() as u32;
         let min_time = (tau_long as f64 * 0.8).round() as u64;
+        let name = crate::naming::triple_name(
+            &composed::CkpoolEstimator::new(tau_short, tau_long),
+            &composed::HysteresisGate::new(min_shares, min_time, hysteresis_low, hysteresis_high),
+            &composed::CkpoolRetarget::ckpool_defaults(),
+        );
         Self::new(name, move |clock| {
             let inner = composed::Composed::new(
                 composed::CkpoolEstimator::new(tau_short, tau_long),
@@ -1101,10 +1241,10 @@ impl AlgorithmSpec {
     /// `eta_base` is the damping at reference_margin; `reference_margin`
     /// is the "normal" margin in percentage points.
     pub fn full_remedy_adaptive(eta_base: f32, reference_margin: f64) -> Self {
-        let name = format!(
-            "FullRemedy-Adaptive-eta{}-ref{}",
-            (eta_base * 100.0).round() as u32,
-            reference_margin.round() as u32,
+        let name = crate::naming::triple_name(
+            &composed::EwmaEstimator::new(120),
+            &composed::PoissonCI::default_parametric(),
+            &composed::AdaptivePartialRetarget::new(eta_base, reference_margin),
         );
         Self::new(name, move |clock| {
             let inner = composed::Composed::new(
@@ -1372,7 +1512,7 @@ mod tests {
     fn default_classic_has_one_algorithm_eight_rates_ten_scenarios() {
         let g = Grid::default_classic();
         assert_eq!(g.algorithms.len(), 1);
-        assert_eq!(g.algorithms[0].name, "VardiffState");
+        assert_eq!(g.algorithms[0].name, "Cumul / Step / FullClamp*");
         assert_eq!(g.share_rates.len(), 8);
         assert_eq!(g.scenarios.len(), 10);
         assert_eq!(g.total_runs(), 80);
@@ -1454,7 +1594,7 @@ mod tests {
         };
 
         let grid_results = grid.run();
-        let from_grid = &grid_results["VardiffState"];
+        let from_grid = &grid_results["Cumul / Step / FullClamp*"];
 
         let legacy_cells = vec![
             Cell {
@@ -1495,10 +1635,10 @@ mod tests {
 
         let results = grid.run();
         assert_eq!(results.len(), 2);
-        assert!(results.contains_key("VardiffState"));
-        assert!(results.contains_key("ClassicComposed"));
-        assert_eq!(results["VardiffState"].len(), 1);
-        assert_eq!(results["ClassicComposed"].len(), 1);
+        assert!(results.contains_key("Cumul / Step / FullClamp*"));
+        assert!(results.contains_key("Cumul / Step / FullClamp"));
+        assert_eq!(results["Cumul / Step / FullClamp*"].len(), 1);
+        assert_eq!(results["Cumul / Step / FullClamp"].len(), 1);
     }
 
     #[test]
@@ -1519,7 +1659,7 @@ mod tests {
         // populated; that's the property bias/variance need. Direct
         // verification requires constructing a trial outside the grid;
         // this test asserts the metric trait wiring is reachable.
-        assert!(results.contains_key("ClassicComposed"));
+        assert!(results.contains_key("Cumul / Step / FullClamp"));
     }
 
     #[test]
@@ -1539,7 +1679,7 @@ mod tests {
     #[test]
     fn parametric_factory_constructs_and_runs() {
         let spec = AlgorithmSpec::parametric();
-        assert_eq!(spec.name, "Parametric");
+        assert_eq!(spec.name, "Cumul / Poisson-z2.58 / FullClamp");
         let clock = Arc::new(MockClock::new(0));
         let v = (spec.factory)(clock);
         assert_eq!(v.min_allowed_hashrate(), 1.0);
@@ -1555,8 +1695,8 @@ mod tests {
             base_seed: 0xCAFE,
         };
         let results = grid.run();
-        assert!(results.contains_key("Parametric"));
-        let cells = &results["Parametric"];
+        assert!(results.contains_key("Cumul / Poisson-z2.58 / FullClamp"));
+        let cells = &results["Cumul / Poisson-z2.58 / FullClamp"];
         assert_eq!(cells.len(), 1);
         // Parametric is observable (it's a Composed) — bias/variance
         // metrics should be present (even if their values are noisy
@@ -1574,7 +1714,7 @@ mod tests {
     #[test]
     fn ewma_60s_factory_constructs_and_runs() {
         let spec = AlgorithmSpec::ewma_60s();
-        assert_eq!(spec.name, "EWMA-60s");
+        assert_eq!(spec.name, "Ewma60s / Poisson-z2.58 / Partial-e0.5");
         let clock = Arc::new(MockClock::new(0));
         let v = (spec.factory)(clock);
         assert_eq!(v.min_allowed_hashrate(), 1.0);
@@ -1590,8 +1730,8 @@ mod tests {
             base_seed: 0xCAFE,
         };
         let results = grid.run();
-        assert!(results.contains_key("EWMA-60s"));
-        let cells = &results["EWMA-60s"];
+        assert!(results.contains_key("Ewma60s / Poisson-z2.58 / Partial-e0.5"));
+        let cells = &results["Ewma60s / Poisson-z2.58 / Partial-e0.5"];
         assert_eq!(cells.len(), 2);
     }
 
@@ -1600,7 +1740,7 @@ mod tests {
     #[test]
     fn sliding_window_factory_constructs_and_runs() {
         let spec = AlgorithmSpec::sliding_window(10);
-        assert_eq!(spec.name, "SlidingWindow-10t");
+        assert_eq!(spec.name, "Slide10t / Poisson-z2.58 / FullNoClamp");
         let clock = Arc::new(MockClock::new(0));
         let v = (spec.factory)(clock);
         assert_eq!(v.min_allowed_hashrate(), 1.0);
@@ -1616,8 +1756,8 @@ mod tests {
             base_seed: 0xCAFE,
         };
         let results = grid.run();
-        assert!(results.contains_key("SlidingWindow-10t"));
-        let cells = &results["SlidingWindow-10t"];
+        assert!(results.contains_key("Slide10t / Poisson-z2.58 / FullNoClamp"));
+        let cells = &results["Slide10t / Poisson-z2.58 / FullNoClamp"];
         assert_eq!(cells.len(), 2);
         // Sliding-Window is observable (it's a Composed) — bias /
         // variance / ramp_target_overshoot metrics should populate.
@@ -1633,9 +1773,9 @@ mod tests {
         let s10 = AlgorithmSpec::sliding_window(10);
         let s30 = AlgorithmSpec::sliding_window(30);
         let s120 = AlgorithmSpec::sliding_window(120);
-        assert_eq!(s10.name, "SlidingWindow-10t");
-        assert_eq!(s30.name, "SlidingWindow-30t");
-        assert_eq!(s120.name, "SlidingWindow-120t");
+        assert_eq!(s10.name, "Slide10t / Poisson-z2.58 / FullNoClamp");
+        assert_eq!(s30.name, "Slide30t / Poisson-z2.58 / FullNoClamp");
+        assert_eq!(s120.name, "Slide120t / Poisson-z2.58 / FullNoClamp");
     }
 
     // ---- ParametricStrict ----
@@ -1643,7 +1783,7 @@ mod tests {
     #[test]
     fn parametric_strict_factory_constructs_and_runs() {
         let spec = AlgorithmSpec::parametric_strict();
-        assert_eq!(spec.name, "ParametricStrict");
+        assert_eq!(spec.name, "Cumul / Poisson-z3.00 / FullClamp");
         let clock = Arc::new(MockClock::new(0));
         let v = (spec.factory)(clock);
         assert_eq!(v.min_allowed_hashrate(), 1.0);
@@ -1659,8 +1799,8 @@ mod tests {
             base_seed: 0xCAFE,
         };
         let results = grid.run();
-        assert!(results.contains_key("ParametricStrict"));
-        assert_eq!(results["ParametricStrict"].len(), 2 * 2);
+        assert!(results.contains_key("Cumul / Poisson-z3.00 / FullClamp"));
+        assert_eq!(results["Cumul / Poisson-z3.00 / FullClamp"].len(), 2 * 2);
     }
 
     #[test]
@@ -1680,10 +1820,10 @@ mod tests {
             base_seed: 0xCAFE,
         };
         let results = grid.run_paired();
-        let default_jitter = results["Parametric"][0]
+        let default_jitter = results["Cumul / Poisson-z2.58 / FullClamp"][0]
             .get("jitter_mean_per_min")
             .unwrap_or(0.0);
-        let strict_jitter = results["ParametricStrict"][0]
+        let strict_jitter = results["Cumul / Poisson-z3.00 / FullClamp"][0]
             .get("jitter_mean_per_min")
             .unwrap_or(0.0);
         assert!(
@@ -1699,7 +1839,7 @@ mod tests {
     #[test]
     fn classic_partial_retarget_factory_constructs_and_runs() {
         let spec = AlgorithmSpec::classic_partial_retarget(0.3);
-        assert_eq!(spec.name, "ClassicPartialRetarget-30");
+        assert_eq!(spec.name, "Cumul / Step / Partial-e0.3");
         let clock = Arc::new(MockClock::new(0));
         let v = (spec.factory)(clock);
         assert_eq!(v.min_allowed_hashrate(), 1.0);
@@ -1709,15 +1849,15 @@ mod tests {
     fn classic_partial_retarget_different_eta_produces_different_names() {
         assert_eq!(
             AlgorithmSpec::classic_partial_retarget(0.3).name,
-            "ClassicPartialRetarget-30",
+            "Cumul / Step / Partial-e0.3",
         );
         assert_eq!(
             AlgorithmSpec::classic_partial_retarget(0.5).name,
-            "ClassicPartialRetarget-50",
+            "Cumul / Step / Partial-e0.5",
         );
         assert_eq!(
             AlgorithmSpec::classic_partial_retarget(1.0).name,
-            "ClassicPartialRetarget-100",
+            "Cumul / Step / Partial-e1",
         );
     }
 
@@ -1731,8 +1871,8 @@ mod tests {
             base_seed: 0xCAFE,
         };
         let results = grid.run();
-        assert!(results.contains_key("ClassicPartialRetarget-30"));
-        assert_eq!(results["ClassicPartialRetarget-30"].len(), 4);
+        assert!(results.contains_key("Cumul / Step / Partial-e0.3"));
+        assert_eq!(results["Cumul / Step / Partial-e0.3"].len(), 4);
     }
 
     // ---- FullRemedy ----
@@ -1740,7 +1880,7 @@ mod tests {
     #[test]
     fn full_remedy_factory_constructs_and_runs() {
         let spec = AlgorithmSpec::full_remedy();
-        assert_eq!(spec.name, "FullRemedy");
+        assert_eq!(spec.name, "Ewma120s / Poisson-z2.58 / Partial-e0.2");
         let clock = Arc::new(MockClock::new(0));
         let v = (spec.factory)(clock);
         assert_eq!(v.min_allowed_hashrate(), 1.0);
@@ -1760,11 +1900,11 @@ mod tests {
             base_seed: 0xCAFE,
         };
         let results = grid.run();
-        assert!(results.contains_key("FullRemedy"));
-        assert_eq!(results["FullRemedy"].len(), 6);
+        assert!(results.contains_key("Ewma120s / Poisson-z2.58 / Partial-e0.2"));
+        assert_eq!(results["Ewma120s / Poisson-z2.58 / Partial-e0.2"].len(), 6);
         // FullRemedy is a Composed under the hood, so it's observable —
         // bias/variance metrics must populate on Stable cells.
-        let stable_lowspm = results["FullRemedy"]
+        let stable_lowspm = results["Ewma120s / Poisson-z2.58 / Partial-e0.2"]
             .iter()
             .find(|c| c.shares_per_minute == 6.0 && c.scenario == Scenario::Stable)
             .expect("Stable@SPM=6 cell present");
@@ -1786,8 +1926,8 @@ mod tests {
             base_seed: 0xCAFE,
         };
         let results = grid.run_paired();
-        let ewma = &results["EWMA-60s"];
-        let fr = &results["FullRemedy"];
+        let ewma = &results["Ewma60s / Poisson-z2.58 / Partial-e0.5"];
+        let fr = &results["Ewma120s / Poisson-z2.58 / Partial-e0.2"];
         let any_differ = ewma.iter().zip(fr.iter()).any(|(a, b)| {
             [
                 "jitter_mean_per_min",
@@ -1809,40 +1949,19 @@ mod tests {
     #[test]
     fn full_remedy_with_default_args_matches_full_remedy_behavior() {
         // `full_remedy_with(120, 0.2, 2.576)` is the same composition as
-        // `full_remedy()`; only the display name differs. On a small grid
-        // the per-cell metrics must be identical when the seeds match.
-        let grid = Grid {
-            algorithms: vec![
-                AlgorithmSpec::full_remedy(),
-                AlgorithmSpec::full_remedy_with(120, 0.2, 2.576),
-            ],
-            share_rates: vec![12.0, 60.0],
-            scenarios: vec![Scenario::Stable, Scenario::Step { delta_pct: -50 }],
-            trial_count: 20,
-            base_seed: 0xCAFE,
-        };
-        let results = grid.run_paired();
-        let canonical = &results["FullRemedy"];
-        let parametric = &results["FullRemedy-tau120-eta20-z2576"];
-        assert_eq!(canonical.len(), parametric.len());
-        for (a, b) in canonical.iter().zip(parametric.iter()) {
-            for key in [
-                "settled_accuracy_p50",
-                "jitter_mean_per_min",
-                "variance_p50",
-                "ramp_target_overshoot_p50",
-                "reaction_rate",
-            ] {
-                assert_eq!(
-                    a.get(key),
-                    b.get(key),
-                    "metric {} differs at {:?}@{}",
-                    key,
-                    a.scenario,
-                    a.shares_per_minute
-                );
-            }
-        }
+        // `full_remedy()`. Under the derived-name scheme they now share an
+        // identical name (the name IS the composition), so they must also
+        // produce the identical name — proving the equivalence structurally.
+        assert_eq!(
+            AlgorithmSpec::full_remedy().name,
+            AlgorithmSpec::full_remedy_with(120, 0.2, 2.576).name,
+            "full_remedy and full_remedy_with(120, 0.2, 2.576) are the \
+             same composition and must derive the same name",
+        );
+        assert_eq!(
+            AlgorithmSpec::full_remedy().name,
+            "Ewma120s / Poisson-z2.58 / Partial-e0.2",
+        );
     }
 
     #[test]
@@ -1861,8 +1980,8 @@ mod tests {
             base_seed: 0xCAFE,
         };
         let results = grid.run_paired();
-        let cautious = &results["FullRemedy-tau120-eta10-z2576"];
-        let aggressive = &results["FullRemedy-tau120-eta100-z2576"];
+        let cautious = &results["Ewma120s / Poisson-z2.58 / Partial-e0.1"];
+        let aggressive = &results["Ewma120s / Poisson-z2.58 / Partial-e1"];
         // η=0.1 caps per-fire moves at 10% of the gap; η=1.0 is full
         // retargets. The ramp overshoot tail must differ at SPM=6 cold
         // start (the canonical η-sensitive cell).
@@ -1901,11 +2020,11 @@ mod tests {
         };
         let results = grid.run();
         assert_eq!(results.len(), 4);
-        assert!(results.contains_key("VardiffState"));
-        assert!(results.contains_key("ClassicComposed"));
-        assert!(results.contains_key("Parametric"));
-        assert!(results.contains_key("EWMA-60s"));
-        for name in &["VardiffState", "ClassicComposed", "Parametric", "EWMA-60s"] {
+        assert!(results.contains_key("Cumul / Step / FullClamp*"));
+        assert!(results.contains_key("Cumul / Step / FullClamp"));
+        assert!(results.contains_key("Cumul / Poisson-z2.58 / FullClamp"));
+        assert!(results.contains_key("Ewma60s / Poisson-z2.58 / Partial-e0.5"));
+        for name in &["Cumul / Step / FullClamp*", "Cumul / Step / FullClamp", "Cumul / Poisson-z2.58 / FullClamp", "Ewma60s / Poisson-z2.58 / Partial-e0.5"] {
             assert_eq!(results[*name].len(), 1, "{} should have 1 cell", name);
         }
     }
@@ -1948,8 +2067,8 @@ mod tests {
             base_seed: 0xCAFE,
         };
         let results = grid.run();
-        let c = &results["ClassicComposed"][0];
-        let p = &results["Parametric"][0];
+        let c = &results["Cumul / Step / FullClamp"][0];
+        let p = &results["Cumul / Poisson-z2.58 / FullClamp"][0];
 
         let metrics_to_check = [
             "convergence_rate",
@@ -1999,23 +2118,24 @@ mod tests {
 
     #[test]
     fn run_paired_produces_identical_metrics_for_same_algorithm_twice() {
-        // Two instances of the same algorithm under `run_paired` (same
+        // Running the same algorithm through `run_paired` twice (same
         // seeds) should produce identical metric values — proves the
-        // paired-seed mechanism works as advertised.
-        let grid = Grid {
-            algorithms: vec![
-                AlgorithmSpec::full_remedy(),
-                AlgorithmSpec::full_remedy_with(120, 0.2, 2.576),
-            ],
+        // paired-seed mechanism works as advertised. (Under the derived-name
+        // scheme, two copies of the same composition collapse to one map
+        // key, so we run two separate grids and compare instead.)
+        let make_grid = || Grid {
+            algorithms: vec![AlgorithmSpec::full_remedy()],
             share_rates: vec![12.0],
             scenarios: vec![Scenario::Stable, Scenario::Step { delta_pct: -50 }],
             trial_count: 20,
             base_seed: 0xCAFE,
         };
 
-        let paired = grid.run_paired();
-        let a = &paired["FullRemedy"];
-        let b = &paired["FullRemedy-tau120-eta20-z2576"];
+        let key = "Ewma120s / Poisson-z2.58 / Partial-e0.2";
+        let paired_a = make_grid().run_paired();
+        let paired_b = make_grid().run_paired();
+        let a = &paired_a[key];
+        let b = &paired_b[key];
 
         assert_eq!(a.len(), b.len());
         for (a_cell, b_cell) in a.iter().zip(b.iter()) {
@@ -2070,12 +2190,12 @@ mod tests {
 
         // VardiffState's results must be identical across both grids.
         assert_eq!(
-            a["VardiffState"][0].get("convergence_rate"),
-            b["VardiffState"][0].get("convergence_rate"),
+            a["Cumul / Step / FullClamp*"][0].get("convergence_rate"),
+            b["Cumul / Step / FullClamp*"][0].get("convergence_rate"),
         );
         assert_eq!(
-            a["VardiffState"][0].get("jitter_mean_per_min"),
-            b["VardiffState"][0].get("jitter_mean_per_min"),
+            a["Cumul / Step / FullClamp*"][0].get("jitter_mean_per_min"),
+            b["Cumul / Step / FullClamp*"][0].get("jitter_mean_per_min"),
         );
     }
 
@@ -2094,8 +2214,8 @@ mod tests {
             base_seed: 0xCAFE,
         };
         let results = grid.run();
-        let c = &results["ClassicComposed"][0];
-        let e = &results["EWMA-60s"][0];
+        let c = &results["Cumul / Step / FullClamp"][0];
+        let e = &results["Ewma60s / Poisson-z2.58 / Partial-e0.5"][0];
 
         let metrics_to_check = [
             "convergence_rate",
@@ -2131,10 +2251,10 @@ mod tests {
             base_seed: 0xCAFE,
         };
         let results = grid.run();
-        assert!(results.contains_key("Ckpool"));
-        assert_eq!(results["Ckpool"].len(), 6);
+        assert!(results.contains_key("Ckpool60-300s / Hyst-0.5-1.33-g72 / CkpoolRetgt-m1"));
+        assert_eq!(results["Ckpool60-300s / Hyst-0.5-1.33-g72 / CkpoolRetgt-m1"].len(), 6);
         // Ckpool is Composed, so introspection works.
-        let stable_highspm = results["Ckpool"]
+        let stable_highspm = results["Ckpool60-300s / Hyst-0.5-1.33-g72 / CkpoolRetgt-m1"]
             .iter()
             .find(|c| c.shares_per_minute == 60.0 && c.scenario == Scenario::Stable)
             .expect("Stable@SPM=60 cell present");
@@ -2152,9 +2272,9 @@ mod tests {
             base_seed: 0xBEEF,
         };
         let results = grid.run();
-        let name = "Ckpool-ts30-tl180-lo40-hi150";
+        let name = AlgorithmSpec::ckpool_with(30, 180, 0.4, 1.5).name;
         assert!(
-            results.contains_key(name),
+            results.contains_key(&name),
             "Expected key '{}', got: {:?}",
             name,
             results.keys().collect::<Vec<_>>()

@@ -75,6 +75,7 @@ pub mod baseline;
 pub mod composed;
 pub mod grid;
 pub mod metrics;
+pub mod naming;
 pub mod regression;
 pub mod rng;
 pub mod schedule;
@@ -102,8 +103,9 @@ pub use metrics::{
     reaction_time_distribution, reaction_time_for_trial, registry, registry_by_id,
     settled_accuracy_distribution, settled_accuracy_for_trial, BaselineValue, Bias,
     ComprehensiveFitness, ConvergenceTime, CounterAgeSensitivity, DecouplingScore, DerivedMetric,
-    Direction, Distribution, Jitter, Metric, MetricCategory, MetricClass, MetricValues,
-    OperationalFitness, RampTargetOvershoot, ReactionAsymmetry, ReactionTime, ScenarioFilter,
+    Direction, Distribution, EqualWeightFitness, Jitter, Metric, MetricCategory, MetricClass,
+    MetricValues, OperationalFitness, RampTargetOvershoot, ReactionAsymmetry, ReactionTime,
+    ScenarioFilter,
     SettledAccuracy, SettledReactionTime, SummaryFmt, SummarySpec, Tolerance, ToleranceCheck,
     Variance, CI_SEED, DEFAULT_CI_RESAMPLES, DEFAULT_JITTER_CEILING_PER_MIN,
 };

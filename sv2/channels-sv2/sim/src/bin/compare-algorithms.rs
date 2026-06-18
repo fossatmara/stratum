@@ -397,8 +397,11 @@ fn main() -> std::io::Result<()> {
 
     for name in &algo_names {
         let cells = &results[*name];
-        let toml_path = out_dir.join(format!("baseline_{}.toml", name));
-        let md_path = out_dir.join(format!("baseline_{}.md", name));
+        // The display name carries " / " separators and the monolith "*"
+        // marker; sanitize to a filesystem-safe stem for the on-disk files.
+        let file_stem = vardiff_sim::naming::sanitize_filename(name);
+        let toml_path = out_dir.join(format!("baseline_{}.toml", file_stem));
+        let md_path = out_dir.join(format!("baseline_{}.md", file_stem));
         fs::write(
             &toml_path,
             serialize_toml(cells, name, trial_count, base_seed),
@@ -426,27 +429,28 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-/// Canonical algorithm display order for the Pareto report:
-/// 1. VardiffState — production reference at the top
-/// 2. ClassicComposed — four-axis representation of (1)
-/// 3. Parametric, ParametricStrict — boundary-axis swaps
-/// 4. ClassicPartialRetarget-30 — update-axis swap
-/// 5. EWMA-60s — multi-axis swap
-/// 6. SlidingWindow-10t — alt estimator
-/// 7. FullRemedy — recommendation at the right edge
+/// Canonical algorithm display order for the Pareto report. Names are the
+/// derived "Estimator / Boundary / Update" triples:
+/// 1. Cumul / Step / FullClamp*    — production monolith (VardiffState)
+/// 2. Cumul / Step / FullClamp     — composed equivalent (ClassicComposed)
+/// 3. Cumul / Poisson-z2.58 / FullClamp, Cumul / Poisson-z3.00 / FullClamp — boundary swaps
+/// 4. Cumul / Step / Partial-e0.3  — update-axis swap
+/// 5. Ewma60s / Poisson-z2.58 / Partial-e0.5  — multi-axis swap
+/// 6. Slide10t / Poisson-z2.58 / FullNoClamp  — alt estimator
+/// 7. Ewma120s / Poisson-z2.58 / Partial-e0.2 — recommendation at the right edge
 ///
 /// Falls back to alphabetical for any algorithm not in this list,
-/// appended at the end (before FullRemedy if present).
+/// appended at the end.
 fn canonical_algorithm_order(algo_names: &[&String]) -> Vec<String> {
     let preferred: &[&str] = &[
-        "VardiffState",
-        "ClassicComposed",
-        "Parametric",
-        "ParametricStrict",
-        "ClassicPartialRetarget-30",
-        "EWMA-60s",
-        "SlidingWindow-10t",
-        "FullRemedy",
+        "Cumul / Step / FullClamp*",
+        "Cumul / Step / FullClamp",
+        "Cumul / Poisson-z2.58 / FullClamp",
+        "Cumul / Poisson-z3.00 / FullClamp",
+        "Cumul / Step / Partial-e0.3",
+        "Ewma60s / Poisson-z2.58 / Partial-e0.5",
+        "Slide10t / Poisson-z2.58 / FullNoClamp",
+        "Ewma120s / Poisson-z2.58 / Partial-e0.2",
     ];
     let mut order: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();

@@ -14,6 +14,13 @@
 # need to track. The checked-in baselines are explicitly named.
 /trace-*.txt
 /scratch-*
+# Sweep/comparison reports and radar charts (regenerate via the sweep/
+# radar bins; the analysis lives in commit messages / docs, not the raw
+# output files).
+/*_sweep.md
+/radar*.svg
+/compare_out*/
+/sweep_out/
 
 # Optional: cargo-semver-checks scratch directory
 .semver-checks/

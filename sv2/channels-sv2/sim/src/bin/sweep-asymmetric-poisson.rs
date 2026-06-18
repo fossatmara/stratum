@@ -34,6 +34,15 @@ impl Boundary for AdaptiveAsymPoissonCusum {
             self.cusum.threshold(dt_secs, shares_per_minute, snap)
         }
     }
+
+    fn code(&self) -> String {
+        format!(
+            "AdaptAsymPC-spm{}[{}|{}]",
+            self.spm_threshold,
+            self.poisson.code(),
+            self.cusum.code()
+        )
+    }
 }
 
 fn main() -> std::io::Result<()> {
