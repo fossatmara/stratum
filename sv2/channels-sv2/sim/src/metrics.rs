@@ -575,6 +575,7 @@ pub fn registry() -> Vec<Box<dyn Metric>> {
         }),
         Box::new(RampTargetOvershoot),
         Box::new(UpwardStepMagnitude),
+        Box::new(LogErrorRegret),
         Box::new(FireDecisiveness {
             settle_after_secs: 0,
         }),
@@ -2010,6 +2011,170 @@ impl Metric for UpwardStepMagnitude {
 }
 
 // ============================================================================
+// Log-error regret + control effort
+// ============================================================================
+
+/// Linear log-error regret and directional control effort — the
+/// decomposition derived in `docs/THEORY.md` (§10). Computed from the
+/// universal trajectory `(H_est, H_true, fires)`, so it works for every
+/// algorithm including the non-introspectable monolith.
+///
+/// In the natural error coordinate `e = ln(H_est / H_true)`:
+///
+/// - **regret** is the time-average of `|e|` (LINEAR, not `e²` — §9.4:
+///   a quadratic loss is structurally blind to small persistent
+///   degradation, the failing-ASIC case). Split by sign:
+///   - `regret_over`  — mean `|e|` while `e > 0` (over-difficulty; the
+///     costly, self-starving death-spiral side, §5.2).
+///   - `regret_under` — mean `|e|` while `e < 0` (under-difficulty; the
+///     cheap side — old work stays valid).
+/// - **effort** is `Σ (Δ ln D)²` over fires, where `Δ ln D =
+///   ln(new_hashrate / old_hashrate)`. Split by direction:
+///   - `effort_up`   — tightening fires (raise difficulty; reject
+///     in-flight shares — costly).
+///   - `effort_down` — easing fires (lower difficulty; ~free).
+///
+/// `H_true(t)` is reconstructed from the cell's scenario schedule,
+/// sampled at each tick-interval midpoint (matching how `run_trial`
+/// samples load). All four values are time-averaged within the trial
+/// and then averaged across trials.
+///
+/// `ReportOnly` for now: this metric is being introduced alongside the
+/// existing fitness metrics, not yet asserted in regression.
+#[derive(Debug, Clone, Default)]
+pub struct LogErrorRegret;
+
+impl LogErrorRegret {
+    /// Per-trial `(regret_over, regret_under, effort_up, effort_down)`,
+    /// regret terms time-averaged over the trial's covered duration.
+    fn per_trial(trial: &Trial, schedule: &crate::schedule::HashrateSchedule) -> [f64; 4] {
+        let mut reg_over = 0.0f64;
+        let mut reg_under = 0.0f64;
+        let mut eff_up = 0.0f64;
+        let mut eff_down = 0.0f64;
+        let mut covered = 0.0f64;
+        let mut last_t = 0u64;
+        for tick in &trial.ticks {
+            let dt = (tick.t_secs - last_t) as f64;
+            let mid = (last_t + tick.t_secs) / 2;
+            last_t = tick.t_secs;
+            let h_true = schedule.at(mid) as f64;
+            let h_est = tick.current_hashrate_before as f64;
+            if dt > 0.0 && h_true > 0.0 && h_est > 0.0 {
+                let e = (h_est / h_true).ln();
+                let c = dt * e.abs();
+                if e >= 0.0 {
+                    reg_over += c;
+                } else {
+                    reg_under += c;
+                }
+                covered += dt;
+            }
+            if tick.fired {
+                if let Some(nh) = tick.new_hashrate {
+                    let old = tick.current_hashrate_before as f64;
+                    if old > 0.0 && nh as f64 > 0.0 {
+                        let dlog = (nh as f64 / old).ln();
+                        let c = dlog * dlog;
+                        if dlog >= 0.0 {
+                            eff_up += c;
+                        } else {
+                            eff_down += c;
+                        }
+                    }
+                }
+            }
+        }
+        if covered > 0.0 {
+            reg_over /= covered;
+            reg_under /= covered;
+        }
+        [reg_over, reg_under, eff_up, eff_down]
+    }
+}
+
+impl Metric for LogErrorRegret {
+    fn id(&self) -> &'static str {
+        "log_error_regret"
+    }
+    fn category(&self) -> MetricCategory {
+        MetricCategory::Behavioral
+    }
+    fn class(&self) -> MetricClass {
+        MetricClass::ReportOnly
+    }
+    fn compute(&self, trials: &[Trial], cell: &Cell) -> MetricValues {
+        let (_, schedule) = cell.scenario.build(cell.shares_per_minute);
+        let mut acc = [0.0f64; 4];
+        for t in trials {
+            let p = Self::per_trial(t, &schedule);
+            for i in 0..4 {
+                acc[i] += p[i];
+            }
+        }
+        let n = trials.len().max(1) as f64;
+        let mut v = MetricValues::new();
+        v.set("regret_over", Some(acc[0] / n));
+        v.set("regret_under", Some(acc[1] / n));
+        v.set("regret_lin", Some((acc[0] + acc[1]) / n));
+        v.set("effort_up", Some(acc[2] / n));
+        v.set("effort_down", Some(acc[3] / n));
+        v.set("effort", Some((acc[2] + acc[3]) / n));
+        v
+    }
+    fn render_markdown(&self, results: &[crate::baseline::CellResult], w: &mut String) {
+        use crate::baseline::unique_rates;
+        let has_any = results.iter().any(|r| r.get("regret_lin").is_some());
+        if !has_any {
+            return;
+        }
+        w.push_str("## Log-error regret & control effort\n\n");
+        w.push_str(
+            "Linear log-error regret `⟨|e|⟩`, `e = ln(H_est/H_true)`, split by \
+             sign; control effort `Σ(Δln D)²` split by fire direction. Lower is \
+             better on every column. See `docs/THEORY.md` §10. Per scenario class.\n\n",
+        );
+        for (label, key) in &[
+            ("stable load", "stable_1ph"),
+            ("cold start", "cold_start_10gh_to_1ph"),
+            ("−50% step", "step_minus_50_at_15min"),
+            ("+50% step", "step_plus_50_at_15min"),
+        ] {
+            let rows: Vec<&crate::baseline::CellResult> = results
+                .iter()
+                .filter(|r| r.scenario_key() == *key && r.get("regret_lin").is_some())
+                .collect();
+            if rows.is_empty() {
+                continue;
+            }
+            w.push_str(&format!("### {}\n\n", label));
+            w.push_str(
+                "| share/min | regret | reg_over | reg_under | effort | eff_up | eff_down |\n",
+            );
+            w.push_str("| --- | --- | --- | --- | --- | --- | --- |\n");
+            let mut spms = unique_rates(results);
+            spms.sort_unstable();
+            for spm in spms {
+                if let Some(r) = rows.iter().find(|r| r.shares_per_minute as u32 == spm) {
+                    let g = |k: &str| r.get(k).map(|v| format!("{:.4}", v)).unwrap_or_else(|| "—".into());
+                    w.push_str(&format!(
+                        "| {} | {} | {} | {} | {} | {} | {} |\n",
+                        spm,
+                        g("regret_lin"),
+                        g("regret_over"),
+                        g("regret_under"),
+                        g("effort"),
+                        g("effort_up"),
+                        g("effort_down"),
+                    ));
+                }
+            }
+            w.push('\n');
+        }
+    }
+}
+
+// ============================================================================
 // Bootstrap CI helper
 // ============================================================================
 
@@ -2599,6 +2764,16 @@ impl DerivedMetric for OperationalFitness {
 
 // ---- EqualWeightFitness -----------------------------------------------------
 
+/// **DEPRECATED — superseded by [`LogErrorRegret`] + the regret/effort
+/// radar (`bin/regret-radar`).** See `docs/THEORY.md` §10: the six
+/// equal-weighted axes are correlated projections of one trade-off, the
+/// `/0.30`-style ceilings are arbitrary, and equal weighting rewards the
+/// midpoint of a trade-off curve rather than the frontier. Retained only
+/// because the maximin parameter-sweep bins (`sweep-balanced`,
+/// `sweep-estimators`, `sweep-signpersist*`, `sweep-voladapt`) still
+/// score against it; those will migrate to regret/effort scoring during
+/// the retune, at which point this is removed.
+///
 /// Same sub-metrics as OperationalFitness but with uniform 1/6 weighting.
 ///
 /// Removes the structural advantage that harm-avoidance-dominant algorithms
@@ -3690,10 +3865,56 @@ mod tests {
                 "variance",
                 "ramp_target_overshoot",
                 "upward_step_magnitude",
+                "log_error_regret",
                 "fire_decisiveness",
                 "step_correction",
             ]
         );
+    }
+
+    #[test]
+    fn log_error_regret_splits_over_and_under_by_sign() {
+        use crate::baseline::TRUE_HASHRATE;
+        use crate::grid::AlgorithmSpec;
+        use crate::trial::run_trial_observed;
+        use channels_sv2::vardiff::MockClock;
+        use std::sync::Arc;
+
+        // Cold start: H_est begins far BELOW truth, so e<0 throughout the
+        // ramp → all regret must land in regret_under, none in regret_over.
+        let cell = Cell {
+            shares_per_minute: 12.0,
+            scenario: Scenario::ColdStart,
+        };
+        let (config, schedule) = cell.scenario.build(cell.shares_per_minute);
+        let algo = AlgorithmSpec::balanced();
+        let trials: Vec<_> = (0..50)
+            .map(|i| {
+                let clock = Arc::new(MockClock::new(0));
+                run_trial_observed((algo.factory)(clock.clone()), clock, config.clone(), &schedule, i)
+            })
+            .collect();
+
+        let mv = LogErrorRegret.compute(&trials, &cell);
+        let over = mv.get("regret_over").unwrap();
+        let under = mv.get("regret_under").unwrap();
+        let total = mv.get("regret_lin").unwrap();
+        // Cold start under-shoots truth, so under-difficulty dominates.
+        assert!(under > over, "under {under} should exceed over {over} on cold start");
+        assert!((over + under - total).abs() < 1e-9, "regret_lin must equal over+under");
+        assert!(total > 0.0, "a real ramp must accrue some regret");
+        // Sanity: a stable trial starting AT truth accrues far less regret.
+        let stable_cell = Cell { shares_per_minute: 12.0, scenario: Scenario::Stable };
+        let (sc, ss) = stable_cell.scenario.build(12.0);
+        let _ = TRUE_HASHRATE; // documents the start-at-truth assumption
+        let stable_trials: Vec<_> = (0..50)
+            .map(|i| {
+                let clock = Arc::new(MockClock::new(0));
+                run_trial_observed((algo.factory)(clock.clone()), clock, sc.clone(), &ss, i)
+            })
+            .collect();
+        let stable_total = LogErrorRegret.compute(&stable_trials, &stable_cell).get("regret_lin").unwrap();
+        assert!(stable_total < total, "stable regret {stable_total} should be below cold-start {total}");
     }
 
     #[test]
