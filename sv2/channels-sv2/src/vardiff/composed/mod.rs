@@ -40,6 +40,7 @@ pub use boundary::{
     AdaptiveBoundary, AdaptiveCusumBoundary, AdaptivePoissonCusum, AdaptiveSignPersist,
     AsymmetricCusumBoundary, AsymmetricPoissonCI, Boundary, CredibleIntervalBoundary, CusumBoundary,
     HysteresisGate, PoissonCI, SignPersistenceCusumBoundary, StepFunction, VolatilityAdaptiveBoundary,
+    WarmupBoundary,
 };
 pub use composed::{classic_composed, ClassicComposed, Composed};
 pub use decision::DecisionRecord;

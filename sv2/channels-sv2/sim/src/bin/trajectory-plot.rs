@@ -269,10 +269,24 @@ fn main() -> std::io::Result<()> {
             label, ramp, det.0, det.1, settle(med)
         );
     }
+    // Oracle ramp-up: the estimator's OWN cold-start floor (no policy). If
+    // a contender's ramp ≈ this, the remaining slowness is the τ=150
+    // estimator, not the control policy — so a policy-only fix (warm-up
+    // mode) can't help; you'd have to shorten τ during cold start.
+    let oracle_ramp = oracle_line
+        .iter()
+        .position(|&h| (h - TRUE_HASHRATE as f64).abs() <= 0.10 * TRUE_HASHRATE as f64)
+        .map(|ti| format!("{} min", (ti as u64 + 1) * TICK / 60))
+        .unwrap_or_else(|| "never".into());
     println!(
         "\nOracle settle gap (irreducible noise floor at τ=150): {:+.1}%. \
          A contender's gap minus this is its policy-induced bias.",
         oracle_gap
+    );
+    println!(
+        "Oracle ramp-up to ±10% (estimator-only floor at τ=150): {}. \
+         A contender's ramp near this is estimator-limited, not policy-limited.",
+        oracle_ramp
     );
     Ok(())
 }

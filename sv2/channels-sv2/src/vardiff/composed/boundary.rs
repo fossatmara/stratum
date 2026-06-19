@@ -11,7 +11,7 @@
 //! their threshold based on estimator confidence.
 
 use std::fmt::Debug;
-use std::sync::atomic::{AtomicI8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, AtomicU64, Ordering};
 
 use super::estimator::EstimatorSnapshot;
 
@@ -888,6 +888,99 @@ impl Boundary for VolatilityAdaptiveBoundary {
     }
 }
 
+/// Cold-start warm-up wrapper for any inner boundary `B`.
+///
+/// Until the algorithm first converges, this returns threshold `0` — fire
+/// on any deviation — so cold start retargets aggressively (paired with a
+/// full/accelerating update rule it reaches truth in a couple of fires).
+/// Once the realized share rate first lands within `converge_band` of the
+/// configured target (i.e. `|realized/target − 1| ≤ converge_band`), the
+/// wrapper latches "warmed up" PERMANENTLY and from then on delegates
+/// entirely to the inner boundary `B`.
+///
+/// Rationale: the cautious, tighten-reluctant steady-state policy exists to
+/// avoid the death spiral — raising difficulty into a genuinely failing
+/// miner and starving it of valid work. On a FRESH connection there is no
+/// in-flight work worth protecting and no established baseline to spiral
+/// away from, so that caution only costs ramp-up time. The simulation's
+/// oracle (the τ-matched estimator with no policy) converges in ~2 min,
+/// while the cautious champion takes ~15 min — i.e. ~13 min of the ramp is
+/// policy-imposed, not estimator-imposed, and recoverable here. After the
+/// one-time warm-up the full steady-state safety is in force.
+///
+/// The latch is one-way (cold start happens once per connection); a later
+/// genuine drop is handled by the inner boundary, not by re-entering
+/// warm-up.
+pub struct WarmupBoundary<B: Boundary> {
+    /// The steady-state boundary, active after warm-up completes.
+    pub inner: B,
+    /// Convergence band (fractional): warm-up ends the first time
+    /// `|realized/target − 1| ≤ converge_band`. E.g. 0.15 = within 15%.
+    pub converge_band: f64,
+    /// One-way latch: false during warm-up, true once converged.
+    warmed: AtomicBool,
+}
+
+impl<B: Boundary> WarmupBoundary<B> {
+    /// Wrap `inner` with a cold-start warm-up that ends once the realized
+    /// rate first lands within `converge_band` of target.
+    pub fn new(inner: B, converge_band: f64) -> Self {
+        Self {
+            inner,
+            converge_band: converge_band.max(0.0),
+            warmed: AtomicBool::new(false),
+        }
+    }
+}
+
+impl<B: Boundary + Clone> Clone for WarmupBoundary<B> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            converge_band: self.converge_band,
+            warmed: AtomicBool::new(self.warmed.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+impl<B: Boundary> Debug for WarmupBoundary<B> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WarmupBoundary")
+            .field("inner", &self.inner)
+            .field("converge_band", &self.converge_band)
+            .field("warmed", &self.warmed.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+impl<B: Boundary> Boundary for WarmupBoundary<B> {
+    fn threshold(&self, dt_secs: u64, shares_per_minute: f32, snap: &EstimatorSnapshot) -> f64 {
+        if self.warmed.load(Ordering::Relaxed) {
+            return self.inner.threshold(dt_secs, shares_per_minute, snap);
+        }
+        // Still warming. Check whether we've converged yet: realized rate
+        // within converge_band of target. Use realized (not h_estimate) so
+        // the test reflects observed performance, matching how the boundary
+        // sees deviation.
+        let target = shares_per_minute as f64;
+        if target > 0.0 {
+            let dev = (snap.realized_share_per_min / target - 1.0).abs();
+            if dev <= self.converge_band {
+                // Latch warmed; from the NEXT tick on we delegate. This tick
+                // still fires aggressively (threshold 0) to land the final
+                // convergence step.
+                self.warmed.store(true, Ordering::Relaxed);
+            }
+        }
+        // Fire on any deviation during warm-up.
+        0.0
+    }
+
+    fn code(&self) -> String {
+        format!("Warmup-b{}[{}]", self.converge_band, self.inner.code())
+    }
+}
+
 /// Dual-mode boundary: PoissonCI (conservative) below `spm_threshold`, an
 /// arbitrary aggressive boundary `B` at or above it, switched on the miner's
 /// configured shares-per-minute rate.
@@ -1056,6 +1149,40 @@ mod tests {
             dt_secs: 60,
             uncertainty: None,
         }
+    }
+
+    #[test]
+    fn warmup_fires_until_converged_then_latches_to_inner() {
+        // Inner boundary with an easily-distinguished, non-zero threshold.
+        let inner = AsymmetricCusumBoundary::new(1.0, 0.05, 3.0);
+        let target = 12.0f32;
+        let inner_theta = inner.threshold(60, target, &snap_with_realized(target as f64));
+        assert!(inner_theta > 1e-9, "inner threshold should be non-zero for the test");
+
+        let w = WarmupBoundary::new(AsymmetricCusumBoundary::new(1.0, 0.05, 3.0), 0.15);
+
+        // While far from target (realized 50% high), warm-up returns 0 (fire
+        // on any deviation) and does NOT latch.
+        for _ in 0..3 {
+            let t = w.threshold(60, target, &snap_with_realized(18.0));
+            assert_eq!(t, 0.0, "warm-up must return 0 until converged");
+        }
+
+        // A tick within the 15% band latches warmed; this tick still returns
+        // 0 (fires the final convergence step).
+        let at_converge = w.threshold(60, target, &snap_with_realized(12.5)); // ~4% off
+        assert_eq!(at_converge, 0.0, "the converging tick still fires at 0");
+
+        // From now on it must delegate to the inner boundary — even though
+        // the realized rate is once again far off (a later disturbance must
+        // NOT re-enter warm-up; the latch is one-way).
+        let after = w.threshold(60, target, &snap_with_realized(18.0));
+        let expect = inner.threshold(60, target, &snap_with_realized(18.0));
+        assert!(
+            (after - expect).abs() < 1e-9,
+            "after warm-up must delegate to inner: got {after}, want {expect}"
+        );
+        assert!(after > 1e-9, "delegated threshold should be the non-zero inner value");
     }
 
     #[test]
