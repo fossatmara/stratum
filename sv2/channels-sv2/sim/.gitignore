@@ -14,11 +14,14 @@
 # need to track. The checked-in baselines are explicitly named.
 /trace-*.txt
 /scratch-*
-# Sweep/comparison reports and radar charts (regenerate via the sweep/
-# radar bins; the analysis lives in commit messages / docs, not the raw
-# output files).
+# Sweep/comparison reports and charts (regenerate via the sweep / radar
+# / trajectory bins; the analysis lives in commit messages / docs, not
+# the raw output files).
 /*_sweep.md
-/radar*.svg
+/*_sweep_big.md
+/confirm_champions.md
+/champion_weights.md
+/*.svg
 /compare_out*/
 /sweep_out/
 
