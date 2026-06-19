@@ -48,10 +48,13 @@ const END: u64 = 145 * 60; // 60 min to observe (or miss) the drop
 const TICK: u64 = 60;
 const DROP_FRAC: f32 = 0.90; // −10% sag
 
-const COLORS: &[&str] = &["#777777", "#377eb8", "#4daf4a", "#e41a1c"];
+const COLORS: &[&str] = &["#777777", "#377eb8", "#4daf4a", "#e41a1c", "#ff7f00", "#984ea3"];
 
-fn champion() -> AlgorithmSpec {
-    AlgorithmSpec::new("champion (Ewma150/AsymCusum-s0.2-t6/Accel-.2-.8-.05)", |clock| {
+/// The interim AsymCusum champion (pre-SignPersist) — kept as a plotted
+/// comparison so the trajectory shows what the sign-persistence discount
+/// bought over the AsymCusum-only config (faster ramp, tighter settle).
+fn champion_asymcusum() -> AlgorithmSpec {
+    AlgorithmSpec::new("interim (AsymCusum)", |clock| {
         VardiffBox(Box::new(Composed::new(
             EwmaEstimator::new(150),
             AdaptivePoissonCusum::with_params(
@@ -149,12 +152,14 @@ fn main() -> std::io::Result<()> {
         tick_interval_secs: TICK,
     };
 
-    // The four contenders get a median line AND a fire-raster lane.
+    // classic (real vardiff) as the baseline, the interim AsymCusum
+    // champion, and the final SignPersist champion — so the plot shows the
+    // ramp/settle/detection gains at each step. Each gets a median line AND
+    // a fire-raster lane.
     let algos = vec![
         ("classic (real vardiff)", AlgorithmSpec::classic_composed()),
-        ("balanced", AlgorithmSpec::balanced()),
-        ("react_priority", AlgorithmSpec::react_priority()),
-        ("champion", champion()),
+        ("interim (AsymCusum)", champion_asymcusum()),
+        ("champion (SignPersist)", AlgorithmSpec::champion()),
     ];
 
     let n_ticks = (END / TICK) as usize;

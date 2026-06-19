@@ -106,12 +106,11 @@ fn run_cell(algo: &AlgorithmSpec, scen: &Scenario, spm: f32, trials: usize, seed
     out
 }
 
-/// The new Pareto champion from the big regret/effort sweep + high-trial
-/// confirmation + weight-sensitivity analysis (June 2026):
-/// `Ewma150s / Adapt-spm5[AsymCusum-s0.2-f0.05-t6] / Accel-0.2-0.8-0.05`.
-/// Validated as an interior optimum (not the degenerate never-tighten
-/// corner) and stable across the defensible w_over:w_under range.
-fn champion() -> AlgorithmSpec {
+/// The interim AsymCusum champion (pre-SignPersist) — kept as a plotted
+/// comparison so the radar shows what the sign-persistence discount bought
+/// over the AsymCusum-only config. `Ewma150 / AsymCusum-s0.2-t6 /
+/// Accel-0.2-0.8-0.05`.
+fn champion_asymcusum() -> AlgorithmSpec {
     let name = vardiff_sim::naming::triple_name(
         &EwmaEstimator::new(150),
         &AdaptivePoissonCusum::with_params(
@@ -156,7 +155,8 @@ fn main() -> std::io::Result<()> {
         ("classic_composed", AlgorithmSpec::classic_composed()),
         ("balanced", AlgorithmSpec::balanced()),
         ("react_priority", AlgorithmSpec::react_priority()),
-        ("champion", champion()),
+        ("champion (SignPersist)", AlgorithmSpec::champion()),
+        ("interim (AsymCusum)", champion_asymcusum()),
     ];
     let spms: [f32; 4] = [6.0, 12.0, 20.0, 30.0];
     let metric = LogErrorRegret;

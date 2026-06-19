@@ -630,6 +630,49 @@ impl AlgorithmSpec {
         })
     }
 
+    /// **The regret/effort champion** (June 2026). `EwmaEstimator(150s)` +
+    /// `AdaptiveSignPersist(spm=6)` — PoissonCI below 6 SPM, and
+    /// `SignPersistenceCusumBoundary(sensitivity=0.3, floor=0.05,
+    /// tighten=6.0, discount=0.06, max_discount=0.6)` at/above — +
+    /// `AcceleratingPartialRetarget(0.2, 0.8, 0.05)`.
+    ///
+    /// Found by the §10 regret/effort process (`bin/sweep-regret-big` →
+    /// `sweep-signpersist-regret` → `confirm-signpersist`): it beats the
+    /// prior `balanced`/`react_priority` Pareto champions by trading a low
+    /// over-difficulty cost (`regret_over` ~0.029, near the field minimum)
+    /// for a tolerated, cheap under-difficulty bias. Relative to the
+    /// AsymCusum-only interim champion it adds the sign-persistence
+    /// discount, which corrects most of that under-difficulty bias (faster
+    /// cold-start ramp, tighter steady state) WITHOUT giving back
+    /// death-spiral safety: the discount applies after the tighten
+    /// multiplier, so a one-off spike keeps full tighten-reluctance while a
+    /// *persistent* under-difficulty progressively relaxes it. Validated as
+    /// a weight-robust interior optimum at the §10 3:1 over:under weight;
+    /// 100% detection on the aged-counter −10% drop.
+    pub fn champion() -> Self {
+        let make_boundary = || {
+            composed::AdaptiveSignPersist::sign_persist(
+                composed::SignPersistenceCusumBoundary::new(0.3, 0.05, 6.0, 0.06, 0.6),
+                6,
+            )
+        };
+        let name = crate::naming::triple_name(
+            &composed::EwmaEstimator::new(150),
+            &make_boundary(),
+            &composed::AcceleratingPartialRetarget::new(0.2, 0.8, 0.05),
+        );
+        Self::new(name, move |clock| {
+            let inner = composed::Composed::new(
+                composed::EwmaEstimator::new(150),
+                make_boundary(),
+                composed::AcceleratingPartialRetarget::new(0.2, 0.8, 0.05),
+                1.0,
+                clock,
+            );
+            VardiffBox(Box::new(inner))
+        })
+    }
+
     /// Parameterized FullRemedy: same three-axis composition as
     /// [`full_remedy`](Self::full_remedy) but with the EWMA time
     /// constant, PartialRetarget η, and PoissonCI z-score exposed as

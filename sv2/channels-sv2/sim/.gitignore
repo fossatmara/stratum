@@ -19,7 +19,7 @@
 # the raw output files).
 /*_sweep.md
 /*_sweep_big.md
-/confirm_champions.md
+/confirm_*.md
 /champion_weights.md
 /*.svg
 /compare_out*/
