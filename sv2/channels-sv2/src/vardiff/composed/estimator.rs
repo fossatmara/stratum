@@ -1385,6 +1385,66 @@ impl Estimator for TimeBiasEwmaEstimator {
     }
 }
 
+/// Steady-state debias wrapper for any inner estimator `E`.
+///
+/// Multiplies the inner estimator's hashrate belief (`h_estimate`) by a
+/// fixed `bias` factor, leaving the raw `realized_share_per_min`
+/// observation untouched. The motivation: an asymmetric, tighten-reluctant
+/// boundary (the SignPersist champion) equilibrates at a point where the
+/// under-difficulty deviation just fails to cross the elevated tighten
+/// threshold — a persistent negative `regret_under` offset (≈ −7% in the
+/// trajectory plot). A `bias > 1` lifts the belief so that equilibrium
+/// sits closer to truth.
+///
+/// **Caveat (see `docs/THEORY.md` §5/§9):** the same scaled belief is what
+/// the update rule retargets toward, so raising `bias` trades
+/// `regret_under` down for `regret_over` up. Under the §10 cost
+/// (`w_over:w_under = 3:1`) that trade is priced against you, so this is
+/// expected to *reduce the settle gap but raise the cost* — it exists to
+/// quantify that tradeoff curve and confirm whether the −7% offset is a
+/// defect or the deliberate cost optimum, not as an obvious win.
+#[derive(Debug)]
+pub struct DebiasEstimator<E: Estimator> {
+    /// The wrapped estimator.
+    pub inner: E,
+    /// Multiplicative bias on `h_estimate` (1.0 = no change; >1 lifts the
+    /// belief, pushing the steady-state equilibrium toward truth).
+    pub bias: f32,
+}
+
+impl<E: Estimator> DebiasEstimator<E> {
+    pub fn new(inner: E, bias: f32) -> Self {
+        Self {
+            inner,
+            bias: bias.max(0.0),
+        }
+    }
+}
+
+impl<E: Estimator> Estimator for DebiasEstimator<E> {
+    fn observe(&mut self, n_shares: u32) {
+        self.inner.observe(n_shares);
+    }
+
+    fn on_fire(&mut self, new_hashrate: f32, old_hashrate: f32) {
+        self.inner.on_fire(new_hashrate, old_hashrate);
+    }
+
+    fn snapshot(&self, dt_secs: u64, ctx: &EstimatorContext) -> EstimatorSnapshot {
+        let mut snap = self.inner.snapshot(dt_secs, ctx);
+        snap.h_estimate *= self.bias;
+        snap
+    }
+
+    fn shares_count(&self) -> u32 {
+        self.inner.shares_count()
+    }
+
+    fn code(&self) -> String {
+        format!("{}+bias{}", self.inner.code(), self.bias)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1427,6 +1487,36 @@ mod tests {
         assert!((snap.realized_share_per_min - 12.0).abs() < 1e-9);
         assert_eq!(snap.n_shares, 12);
         assert_eq!(snap.dt_secs, 60);
+    }
+
+    #[test]
+    fn debias_scales_h_estimate_only() {
+        // The debias wrapper must multiply h_estimate by `bias` while
+        // leaving the raw realized rate and share count untouched.
+        let target = Target::MAX;
+        let ctx = EstimatorContext {
+            current_hashrate: 1.0e15,
+            current_target: &target,
+            shares_per_minute: 12.0,
+        };
+
+        let mut base = CumulativeCounter::new();
+        base.observe(12);
+        let base_snap = base.snapshot(60, &ctx);
+
+        let mut wrapped = DebiasEstimator::new(CumulativeCounter::new(), 1.1);
+        wrapped.observe(12);
+        let snap = wrapped.snapshot(60, &ctx);
+
+        assert!(
+            (snap.h_estimate - base_snap.h_estimate * 1.1).abs() <= base_snap.h_estimate * 1e-6,
+            "h_estimate must be scaled by bias: got {}, want {}",
+            snap.h_estimate,
+            base_snap.h_estimate * 1.1
+        );
+        // Raw observation and count pass through unchanged.
+        assert!((snap.realized_share_per_min - base_snap.realized_share_per_min).abs() < 1e-9);
+        assert_eq!(snap.n_shares, base_snap.n_shares);
     }
 
     #[test]

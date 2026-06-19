@@ -279,12 +279,12 @@ fn main() -> std::io::Result<()> {
         .map(|ti| format!("{} min", (ti as u64 + 1) * TICK / 60))
         .unwrap_or_else(|| "never".into());
     println!(
-        "\nOracle settle gap (irreducible noise floor at τ=150): {:+.1}%. \
-         A contender's gap minus this is its policy-induced bias.",
+        "\nAccuracy ceiling (cost-blind, fires every tick) settle gap at τ=150: {:+.1}%. \
+         NOT a target — confirm-debias proved closing a contender's gap to this raises §10 cost monotonically.",
         oracle_gap
     );
     println!(
-        "Oracle ramp-up to ±10% (estimator-only floor at τ=150): {}. \
+        "Accuracy-ceiling ramp-up to ±10% (estimator-only floor at τ=150): {}. \
          A contender's ramp near this is estimator-limited, not policy-limited.",
         oracle_ramp
     );
@@ -324,7 +324,7 @@ fn render(
         r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" font-family="system-ui, sans-serif" font-size="13">
 <rect width="100%" height="100%" fill="#fafafa"/>
 <text x="{cx}" y="30" text-anchor="middle" font-size="16" font-weight="bold">Estimate chasing truth — ramp-up, settle, and an aged −10% drop</text>
-<text x="{cx}" y="50" text-anchor="middle" font-size="12" fill="#555">Difficulty-implied hashrate (median of trials). Closer to dashed truth = better; dotted = oracle (best τ=150 can track). spm={spm}.</text>
+<text x="{cx}" y="50" text-anchor="middle" font-size="12" fill="#555">Difficulty-implied hashrate (median of trials). Dashed = truth; dotted = accuracy ceiling (cost-blind); green band = cost-optimal settle level. spm={spm}.</text>
 "##,
         cx = w / 2,
     ));
@@ -383,6 +383,33 @@ fn render(
         ml + pw / 2.0, mt + ph + 42.0
     ));
 
+    // Cost-optimal corridor: the champion's own settle level. We proved
+    // (confirm-debias) that under the §10 objective the cost minimum sits
+    // at the champion's bias=1.0 — i.e. THIS level, not the accuracy
+    // ceiling, is optimal. Shade a thin band at the champion's back-half
+    // settle median across the settle phase so the champion line visibly
+    // sits IN the optimal corridor rather than "failing" the dotted ceiling.
+    let drop_tick = (DROP_AT / TICK) as usize;
+    if let Some((_, champ)) = series.last() {
+        let w0 = drop_tick.saturating_sub(10);
+        if drop_tick <= champ.len() && w0 < drop_tick {
+            let lvl = median(&champ[w0..drop_tick]) / unit; // in 1e15 units
+            let half = 0.01; // ±1% visual thickness
+            let (x0, x1) = (xt((SETTLE_AT / TICK) as usize - 1), xt(drop_tick - 1));
+            s.push_str(&format!(
+                r##"<rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" fill="#4daf4a" fill-opacity="0.18"/>
+<text x="{:.1}" y="{:.1}" text-anchor="end" font-size="10" fill="#3a8a3a">cost-optimal</text>
+"##,
+                x0,
+                yv(lvl + half),
+                (x1 - x0).max(0.0),
+                (yv(lvl - half) - yv(lvl + half)).max(0.0),
+                x1 - 4.0,
+                yv(lvl + half) - 3.0,
+            ));
+        }
+    }
+
     // Truth (dashed).
     let mut tp = String::new();
     for (ti, &hu) in truth.iter().enumerate() {
@@ -395,9 +422,12 @@ fn render(
         tp.trim()
     ));
 
-    // Oracle reference line (faint, before the contenders so they draw on
-    // top): the best a τ=150 estimator can track — gap to truth is
-    // irreducible noise, gap from a contender to here is policy cost.
+    // Accuracy-ceiling line (faint, before the contenders so they draw on
+    // top): the best a τ=150 estimator can track, but COST-BLIND — it
+    // reaches this only by firing every tick. confirm-debias proved the
+    // gap from a contender to here is NOT recoverable daylight: closing it
+    // raises §10 cost monotonically. So this is an accuracy bound, not a
+    // target; the cost-optimal level is the green corridor above.
     let mut op = String::new();
     for (ti, &hu) in oracle_line.iter().enumerate() {
         op.push_str(&format!("{}{:.1},{:.1}", if ti == 0 { "M" } else { "L" }, xt(ti), yv(hu / unit)));
@@ -488,12 +518,20 @@ fn render(
         ));
         ly += 24.0;
     }
-    // Oracle entry (faint dotted).
+    // Accuracy-ceiling entry (faint dotted) — relabeled from "oracle".
     s.push_str(&format!(
         r##"<line x1="{lx:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}" stroke="#9467bd" stroke-width="1.5" stroke-opacity="0.7" stroke-dasharray="2 3"/>
-<text x="{:.1}" y="{:.1}" font-size="12" fill="#6a4a8a">oracle (best τ=150 can track)</text>
+<text x="{:.1}" y="{:.1}" font-size="12" fill="#6a4a8a">accuracy ceiling (cost-blind)</text>
 "##,
         ly, lx + 26.0, ly, lx + 32.0, ly + 4.0
+    ));
+    ly += 24.0;
+    // Cost-optimal corridor swatch.
+    s.push_str(&format!(
+        r##"<rect x="{lx:.1}" y="{:.1}" width="26" height="12" fill="#4daf4a" fill-opacity="0.18"/>
+<text x="{:.1}" y="{:.1}" font-size="12" fill="#3a8a3a">cost-optimal settle (§10)</text>
+"##,
+        ly - 9.0, lx + 32.0, ly + 1.0
     ));
 
     s.push_str("</svg>\n");
