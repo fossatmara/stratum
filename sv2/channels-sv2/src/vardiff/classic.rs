@@ -7,24 +7,18 @@ const DEFAULT_MIN_HASHRATE: f32 = 1.0;
 
 use super::{error::VardiffError, Vardiff};
 
-/// Variable difficulty controller.
+/// Variable difficulty controller — the upstream classic algorithm.
 ///
-/// Internally uses: `EwmaEstimator(120s) +
-/// AdaptivePoissonCusum(spm_threshold=10) +
-/// AcceleratingPartialRetarget(base=0.2, max=0.4, acc=0.2)`.
+/// Delegates to [`composed::classic_composed`], the three-stage
+/// decomposition of the classic algorithm: `CumulativeCounter +
+/// StepFunction(classic table) + FullRetargetWithClamp`. This keeps
+/// production behavior identical to upstream classic vardiff while
+/// reusing the composed pipeline that the simulation framework drives
+/// (e.g. for clock injection in tests).
 ///
-/// The boundary adapts to the miner's share rate:
-/// - Below SPM 10 (low hashrate miners): PoissonCI provides statistical
-///   rigor, preventing overshoot on sparse data.
-/// - At SPM 10+ (higher hashrate): AsymmetricCUSUM enables aggressive
-///   reaction leveraging abundant statistical evidence.
-///
-/// The AcceleratingPartialRetarget ramps η on consecutive same-direction
-/// fires (0.2 → 0.4), capped at 0.4 to prevent cold-start overshoot
-/// while still accelerating convergence after step changes.
-///
-/// See `sim/docs/CKPOOL_INVESTIGATION.md` for the ckpool comparison and
-/// `sim/compare_out7/` for the parameter sweep that selected these values.
+/// Any production algorithm change (EWMA estimator, adaptive boundary,
+/// partial retarget, …) ships as a separate, clean commit — it is
+/// deliberately NOT bundled with the diagnostic simulation suite.
 #[derive(Debug)]
 pub struct VardiffState {
     inner: Box<dyn Vardiff>,
@@ -50,14 +44,8 @@ impl VardiffState {
         min_allowed_hashrate: f32,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, VardiffError> {
-        use crate::vardiff::composed::{
-            AcceleratingPartialRetarget, AdaptivePoissonCusum, Composed, EwmaEstimator,
-        };
         Ok(VardiffState {
-            inner: Box::new(Composed::new(
-                EwmaEstimator::new(120),
-                AdaptivePoissonCusum::new(10),
-                AcceleratingPartialRetarget::new(0.2, 0.4, 0.2),
+            inner: Box::new(crate::vardiff::composed::classic_composed(
                 min_allowed_hashrate,
                 clock,
             )),
