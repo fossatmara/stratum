@@ -40,10 +40,16 @@ fn spec(c: Cfg) -> AlgorithmSpec {
 }
 
 /// Stable-load false-alarm rate → ARL0 (mean MINUTES between spurious fires
-/// on steady H, after a 30-min warmup to exclude cold-start convergence).
+/// on steady H, counting ONLY TRUE FALSE ALARMS — fires that occur when the
+/// estimate is already at truth (|e| < FA_BAND), i.e. noise tripped the
+/// boundary on a correct belief. Fires at large |e| are corrective work
+/// (the estimate genuinely wandered on a huge low-spm noise band) and are
+/// NOT false alarms — counting them inflated the rate and shortened the
+/// floor, asymmetrically favoring the twitchy champion (false-alarm-check).
+const FA_BAND: f64 = 0.02; // |e| < 2% = "estimate already at truth"
 fn stable_arl0_min(c: Cfg, spm: f32, trials: usize, seed: u64) -> f64 {
     let dur = 6 * 60 * 60u64; // 6h stable
-    let warmup = 30 * 60u64;
+    let warmup = 60 * 60u64; // 1h: well past cold-start settling
     let (cfg, sched) = Scenario::Custom {
         name: "stable6h".into(),
         phases: vec![vardiff_sim::baseline::Phase::Hold { secs: dur, h: TRUE_HASHRATE }],
@@ -51,16 +57,19 @@ fn stable_arl0_min(c: Cfg, spm: f32, trials: usize, seed: u64) -> f64 {
     }.build(spm);
     let config = TrialConfig { tick_interval_secs: 60, ..cfg };
     let a = spec(c);
-    let (mut fires, mut secs) = (0u64, 0u64);
+    let (mut fa, mut secs) = (0u64, 0u64);
     for i in 0..trials {
         let clock = Arc::new(MockClock::new(0));
         let v = (a.factory)(clock.clone());
         let t = run_trial_observed(v, clock, config.clone(), &sched, seed.wrapping_add(i as u64));
-        fires += t.ticks.iter().filter(|tk| tk.fired && tk.t_secs > warmup).count() as u64;
+        fa += t.ticks.iter().filter(|tk| {
+            tk.fired && tk.t_secs > warmup
+                && (tk.current_hashrate_before as f64 / TRUE_HASHRATE as f64).ln().abs() < FA_BAND
+        }).count() as u64;
         secs += dur - warmup;
     }
-    if fires == 0 { return 1e9; } // never false-alarms → effectively infinite ARL0
-    (secs as f64 / 60.0) / fires as f64
+    if fa == 0 { return 1e9; } // no TRUE false alarms → effectively infinite ARL0
+    (secs as f64 / 60.0) / fa as f64
 }
 
 fn react_p50_min(c: Cfg, spm: f32, delta: i32, trials: usize, seed: u64) -> f64 {
@@ -90,9 +99,17 @@ fn floor_min(g: u32, spm: u32, arl0: f64) -> f64 {
         _=>&[(60.,5.),(240.,9.),(1440.,14.)],
     };
     let la = arl0.max(1.0).ln();
-    // linear in ln(ARL0), clamped to table ends
+    // linear in ln(ARL0). Clamp BELOW the table; EXTRAPOLATE above it using
+    // the last segment's slope (the true-false-alarm ARL0 runs far past
+    // 1440min for rarely-false-alarming configs, and the floor keeps growing
+    // ~linearly in ln(ARL0) — clamping would wrongly cap it and flatter those
+    // configs' ratios).
     if la <= pts[0].0.ln() { return pts[0].1; }
-    if la >= pts[pts.len()-1].0.ln() { return pts[pts.len()-1].1; }
+    if la >= pts[pts.len()-1].0.ln() {
+        let (a0,d0)=pts[pts.len()-2]; let (a1,d1)=pts[pts.len()-1];
+        let slope = (d1-d0)/(a1.ln()-a0.ln());
+        return d1 + slope*(la - a1.ln());
+    }
     for w in pts.windows(2) {
         let (a0,d0)=w[0]; let (a1,d1)=w[1];
         if la >= a0.ln() && la <= a1.ln() {
