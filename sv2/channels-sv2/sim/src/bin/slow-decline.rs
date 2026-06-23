@@ -23,8 +23,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use channels_sv2::vardiff::composed::{
-    AcceleratingPartialRetarget, AdaptivePoissonCusum, AsymmetricCusumBoundary, Composed,
-    EwmaEstimator, PoissonCI,
+    AcceleratingPartialRetarget, AdaptivePoissonCusum, AdaptiveSignPersist, AsymmetricCusumBoundary,
+    Composed, EwmaEstimator, PoissonCI, SignPersistenceCusumBoundary,
 };
 use channels_sv2::vardiff::MockClock;
 use vardiff_sim::baseline::{Phase, Scenario, DEFAULT_BASELINE_SEED, TRUE_HASHRATE};
@@ -38,6 +38,26 @@ const OBSERVE_MIN: u64 = 120; // settle window after the decline floor — long
                               // "settled" is steady state, not residual lag
 const MAX_DECLINE_MIN: u64 = 240; // cap a slow decline at 4h
 const TARGET_DROP: f32 = 0.50; // decline until 50% lost (or the 4h cap)
+
+/// The CORRECTED-metric champion (fully-corrected funnel winner): gentler,
+/// longer window than the s0.3 champion — Ewma360 / SignPersist-s1.5 / t8 /
+/// d0.06 / etaMax0.6 / accel0.05. Safety on the decline is UNINHERITED from
+/// the old champion (a sleepier easer is a different animal on the dangerous
+/// direction); this re-clear is mandatory before it can ship.
+fn corrected() -> AlgorithmSpec {
+    AlgorithmSpec::new("corrected(Ewma360/s1.5/t8)", |clock| {
+        VardiffBox(Box::new(Composed::new(
+            EwmaEstimator::new(360),
+            AdaptiveSignPersist::sign_persist(
+                SignPersistenceCusumBoundary::new(1.5, 0.05, 8.0, 0.06, 0.6),
+                6,
+            ),
+            AcceleratingPartialRetarget::new(0.2, 0.6, 0.05),
+            1.0,
+            clock,
+        )))
+    })
+}
 
 /// The interim champion (AsymCusum boundary, no sign-persistence) — the
 /// control that isolates whether the sign-persistence discount specifically
@@ -138,7 +158,8 @@ fn main() {
     // safety regime and the point of this extension.
     let spms = [2.0f32, 4.0, 6.0, 8.0, 12.0, 20.0, 30.0];
     let algos: Vec<(String, Box<dyn Fn() -> AlgorithmSpec + Send + Sync>)> = vec![
-        ("champion".into(), Box::new(AlgorithmSpec::champion)),
+        ("corrected".into(), Box::new(corrected)),     // the config under test
+        ("champion".into(), Box::new(AlgorithmSpec::champion)), // old s0.3, for contrast
         ("interim".into(), Box::new(interim)),
         ("classic".into(), Box::new(AlgorithmSpec::classic_composed)),
     ];
@@ -277,7 +298,7 @@ fn main() {
         );
     }
     println!("Per-algo summary (worst over rates/spm):");
-    for algo in ["champion", "interim", "classic"] {
+    for algo in ["corrected", "champion", "interim", "classic"] {
         let sub: Vec<&Row> = rows.iter().filter(|r| r.algo == algo).collect();
         let worst_max = sub.iter().map(|r| r.max_e_pct).fold(f64::MIN, f64::max);
         let worst_settled = sub.iter().map(|r| r.settled_e_pct).fold(f64::MIN, f64::max);
