@@ -33,7 +33,9 @@ use vardiff_sim::trial::{run_trial_observed, TrialConfig};
 
 const TICK: u64 = 60;
 const MATURE_MIN: u64 = 60; // counter matured on-target before the decline
-const OBSERVE_MIN: u64 = 30; // settle window after the decline floor
+const OBSERVE_MIN: u64 = 120; // settle window after the decline floor — long
+                              // enough that a 2-spm reaction completes, so
+                              // "settled" is steady state, not residual lag
 const MAX_DECLINE_MIN: u64 = 240; // cap a slow decline at 4h
 const TARGET_DROP: f32 = 0.50; // decline until 50% lost (or the 4h cap)
 
@@ -59,8 +61,10 @@ fn interim() -> AlgorithmSpec {
 /// A sustained decline scenario as a Custom phase list: mature on-target,
 /// then drop at `rate_pct_per_hr` in fine 1-min Hold steps until TARGET_DROP
 /// (capped at MAX_DECLINE_MIN), then hold at the floor. Returns the scenario
-/// and the decline window [start_secs, end_secs] for the readout.
-fn decline_scenario(rate_pct_per_hr: f32) -> (Scenario, u64, u64) {
+/// and (decline_start, decline_end, trial_end) for the readout — trial_end
+/// is after the post-decline observe window, where we sample the *settled*
+/// error (so a deep-but-recovering lag is not misread as a runaway).
+fn decline_scenario(rate_pct_per_hr: f32) -> (Scenario, u64, u64, u64) {
     let rate = rate_pct_per_hr / 100.0; // fraction/hr
     // minutes to reach TARGET_DROP at this rate, capped.
     let decline_min = ((TARGET_DROP / rate) * 60.0).min(MAX_DECLINE_MIN as f32) as u64;
@@ -81,6 +85,7 @@ fn decline_scenario(rate_pct_per_hr: f32) -> (Scenario, u64, u64) {
     });
     let start = MATURE_MIN * 60;
     let end = start + decline_min * 60;
+    let trial_end = end + OBSERVE_MIN * 60;
     (
         Scenario::Custom {
             name: format!("decline_{}pph", rate_pct_per_hr as u32),
@@ -89,6 +94,7 @@ fn decline_scenario(rate_pct_per_hr: f32) -> (Scenario, u64, u64) {
         },
         start,
         end,
+        trial_end,
     )
 }
 
@@ -96,11 +102,15 @@ struct Row {
     rate: f32,
     spm: f32,
     algo: String,
+    trials: usize,
     tighten_fires: f64, // mean per trial
     eased: f64,
-    max_e_pct: f64,  // worst over-difficulty %, median over trials
-    end_e_pct: f64,  // e at decline end, median
-    mean_e_pct: f64, // time-avg over-difficulty during decline
+    max_e_pct: f64,     // worst over-difficulty %, median over trials
+    end_e_pct: f64,     // e at decline end (instantaneous trough), median
+    settled_e_pct: f64, // e at the END of the post-decline observe window
+    settled_mid_e_pct: f64, // e at the window MIDPOINT — if > settled_e, the
+                        // offset is still-relaxing lag; if ≈, it's steady bias
+    mean_e_pct: f64,    // time-avg over-difficulty during decline
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -121,20 +131,36 @@ fn main() {
         .ok().and_then(|s| s.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)).max(1);
 
-    let rates = [2.0f32, 5.0, 10.0, 20.0, 40.0];
-    let spms = [6.0f32, 8.0, 12.0, 20.0, 30.0];
+    let rates = [1.0f32, 2.0, 5.0, 10.0, 20.0, 40.0];
+    // Extend BELOW the spm6 guard: {2,4} are the only regime where the
+    // PoissonCI guard is load-bearing, and the big sweep never went under 6
+    // — so the guard's placement there is untested. This is the worst-case
+    // safety regime and the point of this extension.
+    let spms = [2.0f32, 4.0, 6.0, 8.0, 12.0, 20.0, 30.0];
     let algos: Vec<(String, Box<dyn Fn() -> AlgorithmSpec + Send + Sync>)> = vec![
         ("champion".into(), Box::new(AlgorithmSpec::champion)),
         ("interim".into(), Box::new(interim)),
         ("classic".into(), Box::new(AlgorithmSpec::classic_composed)),
     ];
 
+    // Per-cell trial count CI-matched to a reference of 60 spm: estimator
+    // variance ∝ 1/(r*·τ), so a 4-spm cell needs ~15× the trials of a
+    // 60-spm cell for the same confidence interval. Oversample the sparse
+    // cells rather than raising trials everywhere.
+    let trials_for = |spm: f32| -> usize {
+        let scale = (60.0 / spm as f64).max(1.0); // ∝ 1/spm
+        ((trials as f64) * scale).round() as usize
+    };
+
     // Flatten the work into (rate, spm, algo_idx) jobs.
     let jobs: Vec<(f32, f32, usize)> = rates
         .iter()
         .flat_map(|&r| spms.iter().flat_map(move |&s| (0..3).map(move |a| (r, s, a))))
         .collect();
-    eprintln!("slow-decline: {} cells × {} trials, {} threads", jobs.len(), trials, n_threads);
+    eprintln!(
+        "slow-decline: {} cells, base {} trials (sparse cells oversampled up to {}×), {} threads",
+        jobs.len(), trials, (60.0 / spms[0] as f64).round() as u64, n_threads
+    );
 
     let next = AtomicUsize::new(0);
     let out: Mutex<Vec<Row>> = Mutex::new(Vec::new());
@@ -146,25 +172,40 @@ fn main() {
                     break;
                 }
                 let (rate, spm, ai) = jobs[j];
-                let (scen, d_start, d_end) = decline_scenario(rate);
+                let cell_trials = trials_for(spm);
+                let (scen, d_start, d_end, trial_end) = decline_scenario(rate);
                 let (config_proto, schedule) = scen.build(spm);
                 let config = TrialConfig { tick_interval_secs: TICK, ..config_proto };
                 // wrong_dir = tighten (s>0) WHILE still over-difficulty (e>0):
                 //   the literal death-spiral step. A tighten while e<0 is a
                 //   correct staircase-overshoot correction and is NOT counted.
                 let (mut wrong_dir, mut eased) = (0.0f64, 0.0f64);
-                let (mut maxe, mut ende, mut meane) = (vec![], vec![], vec![]);
-                for i in 0..trials {
+                let (mut maxe, mut ende, mut meane, mut settled, mut settled_mid) =
+                    (vec![], vec![], vec![], vec![], vec![]);
+                for i in 0..cell_trials {
                     let clock = Arc::new(MockClock::new(0));
                     let v = (algos[ai].1)().factory.clone()(clock.clone());
                     let t = run_trial_observed(v, clock, config.clone(), &schedule, base_seed.wrapping_add(i as u64));
                     let (mut mx, mut last, mut sum, mut n) = (f64::MIN, 0.0f64, 0.0f64, 0u32);
+                    let mut settled_e = 0.0f64; // last e in the post-decline observe window
+                    let mut settled_mid_e = 0.0f64; // e at the window midpoint
+                    let mid_t = d_end + (trial_end - d_end) / 2;
                     for tk in &t.ticks {
+                        let h_true = schedule.at(tk.t_secs.saturating_sub(TICK / 2)) as f64;
+                        let e = (tk.current_hashrate_before as f64 / h_true).ln();
+                        // post-decline window: track recovered (settled) error.
+                        // mid vs end distinguishes residual lag (mid>end, still
+                        // relaxing) from a true steady bias (mid≈end).
+                        if tk.t_secs > d_end && tk.t_secs <= mid_t {
+                            settled_mid_e = e;
+                        }
+                        if tk.t_secs > d_end && tk.t_secs <= trial_end {
+                            settled_e = e;
+                        }
+                        // decline window: the safety metrics.
                         if tk.t_secs <= d_start || tk.t_secs > d_end {
                             continue;
                         }
-                        let h_true = schedule.at(tk.t_secs.saturating_sub(TICK / 2)) as f64;
-                        let e = (tk.current_hashrate_before as f64 / h_true).ln();
                         mx = mx.max(e);
                         last = e;
                         sum += e.max(0.0); // over-difficulty contribution
@@ -176,8 +217,8 @@ fn main() {
                                     eased += 1.0;
                                 } else if e > 0.02 {
                                     // tighten while genuinely over-difficulty (>2%,
-                                    // i.e. not the noisy e≈0 staircase crossing) =
-                                    // the death-spiral step.
+                                    // not the noisy e≈0 staircase crossing) = the
+                                    // death-spiral step.
                                     wrong_dir += 1.0;
                                 }
                             }
@@ -187,13 +228,17 @@ fn main() {
                         maxe.push(mx * 100.0);
                         ende.push(last * 100.0);
                         meane.push(sum / n as f64 * 100.0);
+                        settled.push(settled_e * 100.0);
+                        settled_mid.push(settled_mid_e * 100.0);
                     }
                 }
-                let tn = trials as f64;
+                let tn = cell_trials as f64;
                 out.lock().unwrap().push(Row {
-                    rate, spm, algo: algos[ai].0.clone(),
+                    rate, spm, algo: algos[ai].0.clone(), trials: cell_trials,
                     tighten_fires: wrong_dir / tn, eased: eased / tn,
-                    max_e_pct: median(maxe), end_e_pct: median(ende), mean_e_pct: median(meane),
+                    settled_mid_e_pct: median(settled_mid),
+                    max_e_pct: median(maxe), end_e_pct: median(ende),
+                    settled_e_pct: median(settled), mean_e_pct: median(meane),
                 });
             });
         }
@@ -202,27 +247,46 @@ fn main() {
     let mut rows = out.into_inner().unwrap();
     rows.sort_by(|a, b| (a.rate, a.spm as u32, a.algo.clone()).partial_cmp(&(b.rate, b.spm as u32, b.algo.clone())).unwrap());
 
-    println!("\n## Slow-decline safety ({} trials/cell). e>0 = over-difficulty (costly).", trials);
-    println!("Hard gate = tighten fired WHILE over-difficulty (the death-spiral step). max_e/end_e track runaway.\n");
-    println!("| rate %/hr | spm | algo | wrong-dir fires | eases | max e% | end e% | mean e% (regret_over) |");
-    println!("| --- | --- | --- | --- | --- | --- | --- | --- |");
+    println!("\n## Slow-decline safety. e>0 = over-difficulty (costly). spm<6 is the guard-only regime.");
+    println!("Runaway test = SETTLED e (after a {}-min recovery window), not the instantaneous trough.\n", OBSERVE_MIN);
+    println!("| rate %/hr | spm | algo | trials | wrong-dir | eases | max e% | settled e% | mean e% |");
+    println!("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
     let mut fails = 0;
     for r in &rows {
-        let flag = if r.tighten_fires > 0.0 { " ⚠TIGHTEN" } else { "" };
-        if r.tighten_fires > 0.0 { fails += 1; }
+        // A genuine runaway = settled (recovered) e still materially over-difficulty.
+        let runaway = r.settled_e_pct > 5.0;
+        let flag = if runaway { " ⚠RUNAWAY" } else if r.tighten_fires > 0.05 { " ·wrongdir" } else { "" };
+        if runaway { fails += 1; }
         println!(
-            "| {} | {} | {} | {:.2}{} | {:.1} | {:+.1} | {:+.1} | {:.2} |",
-            r.rate as u32, r.spm as u32, r.algo, r.tighten_fires, flag, r.eased,
-            r.max_e_pct, r.end_e_pct, r.mean_e_pct
+            "| {} | {} | {} | {} | {:.2} | {:.1} | {:+.1} | {:+.1}{} | {:.2} |",
+            r.rate as u32, r.spm as u32, r.algo, r.trials, r.tighten_fires, r.eased,
+            r.max_e_pct, r.settled_e_pct, flag, r.mean_e_pct
         );
     }
-    println!("\nHard-gate (tighten fires during decline): {} cell(s) flagged.", fails);
-    println!("Champion summary (worst over rates/spm):");
+    println!("\nRunaway cells (settled e > 5% over-difficulty): {}.", fails);
+    // Lag-vs-bias diagnostic for the sub-guard cells: if mid-window e is
+    // materially ABOVE end-window e, the offset is still relaxing (residual
+    // decline lag, benign); if mid ≈ end, it is a true steady-state offset.
+    println!("\nSub-guard (spm<6) lag-vs-bias — champion, e at observe-window mid vs end:");
+    for r in rows.iter().filter(|r| r.spm < 6.0 && r.algo == "champion") {
+        let relaxing = r.settled_mid_e_pct - r.settled_e_pct;
+        let tag = if relaxing > 2.0 { "LAG (still relaxing)" } else { "steady" };
+        println!(
+            "  {}%/hr {}spm: mid {:+.1}% → end {:+.1}%  (Δ {:+.1} = {})",
+            r.rate as u32, r.spm as u32, r.settled_mid_e_pct, r.settled_e_pct, relaxing, tag
+        );
+    }
+    println!("Per-algo summary (worst over rates/spm):");
     for algo in ["champion", "interim", "classic"] {
         let sub: Vec<&Row> = rows.iter().filter(|r| r.algo == algo).collect();
         let worst_max = sub.iter().map(|r| r.max_e_pct).fold(f64::MIN, f64::max);
-        let worst_mean = sub.iter().map(|r| r.mean_e_pct).fold(f64::MIN, f64::max);
-        let tot_tighten: f64 = sub.iter().map(|r| r.tighten_fires).sum();
-        println!("  {}: worst max_e {:+.1}%, worst mean_e {:.2}%, total tighten {:.2}", algo, worst_max, worst_mean, tot_tighten);
+        let worst_settled = sub.iter().map(|r| r.settled_e_pct).fold(f64::MIN, f64::max);
+        let worst_wd = sub.iter().map(|r| r.tighten_fires).fold(f64::MIN, f64::max);
+        // Worst sub-guard cell (spm<6) specifically — the untested regime.
+        let worst_guard = sub.iter().filter(|r| r.spm < 6.0).map(|r| r.settled_e_pct).fold(f64::MIN, f64::max);
+        println!(
+            "  {}: worst max_e {:+.1}%, worst SETTLED e {:+.1}%, worst sub-guard settled {:+.1}%, worst wrong-dir/run {:.2}",
+            algo, worst_max, worst_settled, worst_guard, worst_wd
+        );
     }
 }

@@ -116,37 +116,73 @@ flags a champion-vs-interim divergence worth confirming in hardware —
 otherwise it is an extra overnight run for a question the sim already
 answered.
 
-## 6. Simulation results (`bin/slow-decline`, 300 trials/cell)
+## 6. Simulation results (`bin/slow-decline`)
 
-Run over rate ∈ {2,5,10,20,40} %/hr × spm ∈ {6,8,12,20,30} × {champion,
-interim, classic}. Worst-case over all cells:
+Grid: rate ∈ {1,2,5,10,20,40} %/hr × spm ∈ {2,4,6,8,12,20,30} × {champion,
+interim, classic}. Sparse cells are oversampled (trials ∝ 1/spm, CI-matched
+to a 60-spm reference). The **runaway test is the SETTLED error after a
+120-min post-decline recovery window** — long enough that even a 2-spm
+reaction completes — not the instantaneous trough during the decline.
 
-| algo | worst mean_e (regret_over) | worst end_e | worst max_e | verdict |
+### Operating regime (spm ≥ 6)
+
+Worst-case over rates, spm ≥ 6:
+
+| algo | worst mean_e (during) | worst SETTLED e | worst max_e | verdict |
 | --- | --- | --- | --- | --- |
-| champion | 4.3% | +4% (mostly negative) | +16% | tracks decline down, ends safe-side |
-| interim | 3.5% | +4% | +13% | same, slightly tighter |
-| **classic** | **31%** | **+69%** | **+69%** | **falls progressively behind; runs away** |
+| champion | 4.3% | **−1.6% (negative — safe side)** | +16% | tracks down, settles safe |
+| interim | 3.5% | −2.0% | +13% | same, slightly tighter |
+| **classic** | **31%** | **+8.3%** | **+69%** | severe transient lag; recovers slowly |
 
-**Champion passes; classic is the spiral risk — the opposite of the naive
-worry.** The champion tracks every sustained decline monotonically down,
-ending on the *under*-difficulty (safe) side at every rate (`end_e ≤ +4%`,
-mostly negative) with bounded over-difficulty (`max_e ≤ 16%`). Classic, too
-slow to keep up, falls steadily behind and ends as deep as **+69%
-over-difficulty** at 40%/hr — `e ≈ ln(1.69)`, a badly starved miner, with no
-recovery in-window. This is the §6 death spiral, and it is the *incumbent*
-that exhibits it; the responsive champion is **safer** on a decline, not
-riskier.
+The champion tracks every decline down and **settles on the safe
+(under-difficulty) side** at every spm≥6 cell. Classic falls badly behind
+*during* the decline — up to +69% over-difficulty transiently at 40%/hr,
+`e≈ln(1.69)`, a badly starved miner — and is slow to recover (settled +8.3%
+still over-difficulty). **The correction to an earlier draft:** classic's
++69% is the transient *trough*, not where it settles; with the 120-min
+recovery window it does eventually catch up. So the honest framing is
+*severe transient lag in the dangerous direction*, not permanent runaway —
+but the champion's worst transient (+16%) is ~4× gentler, the same shape as
+the detection result (champion fixes a real failure classic has, not merely
+not-breaking).
 
-**Residual, reported honestly (not a failure).** The champion makes rare
-wrong-direction fires — a tighten while still >2% over-difficulty — peaking
-at ~1.6 per run (≈4% of its ~34 fires) at the noisiest cell (2%/hr, 6 spm).
-These are Poisson-noise mis-reads on sparse low-spm data (a burst of fast
-shares momentarily reads as a rise), not sustained wrong-way push: every
-such cell still ends safe-side with bounded `max_e`. They scale *down* with
-rate and *up* with sparsity, the signature of noise, not spiral. The
-low-SPM-guard-freeze hypothesis (§1) is **not** borne out — the champion's
-ease count stays high (10–37/run) across the decline; the guard does not
-stall the correction.
+### Sub-guard regime (spm < 6) — a real, named, bounded limit
 
-**Status:** the §6 death-spiral safety claim is earned in simulation. The
-hardware confirmation (§5 above) remains the deployment gate.
+Below the spm6 PoissonCI guard — the regime the 9,216-config sweep never
+exercised — the champion carries a **steady positive (over-difficulty)
+bias**: settled e ≈ **+5% at 2 spm, +2.6% at 4 spm**, *flat across all
+decline rates* (a 120-min-settled, lag-free measurement). It is present
+identically in champion and interim, so it is **not** the sign-persistence
+discount — it is the shared low-SPM guard.
+
+**Root cause (isolated, not assumed).** A stable-load probe with the
+PoissonCI margin zeroed moved the bias only +5.16%→+4.58% — so the additive
+margin is *not* the source. The sign flips exactly at the guard boundary
+(below: +5%; at/above: −9% to −6%, the intended asymmetry-optimal side).
+The mechanism is two-legged, in order: (1) the guard's symmetric PoissonCI
+**removes** the protective ≈−0.67σ asymmetry the high-SPM boundary carries
+(the 3:1 tighten cost), and (2) that **exposes** the EWMA small-N upward
+(Jensen) bias — `≈+1/(2N)` on `ln`, partially damped by the EWMA's
+overlapping windows, landing at ~+5% rather than the bare ~+10% at N≈5.
+
+**Why this ships anyway.** The +5% is inside the §3 noise band at 2 spm
+(σ = 1/√(r*τ) ≈ 45%, so +5% ≈ 0.11σ); it is below the 4–6 spm operating
+range; and the champion still beats classic on every sub-guard cell
+(max_e +27–42% vs classic's +107%). 2 spm is marginal for the *application*
+(a connection that sparse has a noisy hashrate estimate regardless of
+vardiff — part of why `r*` is set above it). The named fix —
+`AsymmetricPoissonCI` for the guard — is deferred (§9(d) of the metric
+paper): taking it would reopen champion selection at the margin and owe a
+spm≥6 re-confirm, a bad trade unless real connection-rate data shows a tail
+living at 2–4 spm.
+
+**Residual wrong-direction fires.** Rare tighten-while-over-difficulty
+fires (~4% of fires at the noisiest cells) are Poisson mis-reads on sparse
+data, scaling up with sparsity and down with rate — the signature of noise,
+not spiral. The low-SPM-guard-*freeze* hypothesis is **not** borne out: ease
+counts stay high (6–37/run) throughout.
+
+**Status:** the §6 death-spiral safety claim is earned in simulation —
+spm6 guard well-placed (not proven optimal); champion settles safe-side in
+the operating range and stays bounded and far better than classic below it.
+Hardware confirmation (§5) remains the deployment gate.

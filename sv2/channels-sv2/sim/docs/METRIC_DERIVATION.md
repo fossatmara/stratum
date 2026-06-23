@@ -45,7 +45,12 @@ constant doing three jobs at once: it caps the bandwidth and CPU each
 connection costs, it fixes the variance of the pool's per-miner hashrate
 estimate, and it bounds the miner's reward variance. The controller's whole
 job is to hold the realized rate at `r*` as `H` drifts — which is exactly
-what the rest of this document scores.
+what the rest of this document scores. This also fixes the floor of the
+operating range: a connection delivering only a few shares per minute has a
+hashrate estimate so noisy (its band is `1/√(r*τ)`, §3) that reward
+variance and detection both suffer regardless of vardiff — which is *why*
+`r*` is set well above that floor, and why the controller's worst regime
+(§9, the sub-guard analysis) is one the system is provisioned to avoid.
 
 Two modeling choices fall out of the physics; neither is a free knob.
 **Share arrivals are Poisson** because each hash is an independent trial
@@ -117,9 +122,11 @@ only in log coordinates are an over- and an under-shoot by the same
 control goal is `e → 0`.
 
 A **scenario** specifies `H(t)` and the initial belief; the named classes
-(`baseline.rs`) are *cold-start*, *stable*, *step ±p%*, and *settled-aged
-drop* (truth holds long enough to mature the share counter, then drops). A
-**metric** ranks algorithms by averaging over a fixed ensemble of classes.
+(`baseline.rs`) are *cold-start*, *stable*, *step ±p%*, *settled-aged drop*
+(truth holds long enough to mature the share counter, then drops), and
+*sustained decline* (a continuous `−ρ %/hr` ramp — the safety scenario of
+§9). A **metric** ranks algorithms by averaging over a fixed ensemble of
+classes.
 
 ---
 
@@ -180,6 +187,27 @@ negligible); when §8/§10 quote the accuracy ceiling as "≈−0.8%," that is t
 *width* of this band at the operating `r*τ`, the scatter a perfect tracker
 still shows, against which a real algorithm's *systematic* offset (§10) is
 measured.
+
+**The achievable frontier, in one line each.** Two floors follow from (3.1)
+and bound what *any* algorithm can do; the sub-guard analysis (§9) places
+the champion against them.
+
+- *Static (stable load).* On steady `H`, the cost-minimizing settled offset
+  under the §6 asymmetry is not zero but a quantile of the noise band:
+  `e* ≈ −0.67·σ`, `σ = 1/√(r*τ)` (the point where the 3×-weighted
+  over-difficulty tail balances the 1×-weighted under tail). At 60 spm,
+  `σ≈8%`; at 2 spm with `τ≈2.5 min`, `r*τ≈5` so `σ≈45%` — the band swamps
+  any few-percent offset, i.e. at low share rate the asymmetry-optimal
+  target is itself lost in the noise.
+- *Dynamic (declining load).* On a ramp of `ρ` per minute, an estimator of
+  effective averaging time `τ_eff` lags truth by `≈ ρ·τ_eff`, while its
+  noise is `1/√(r*τ_eff)`. Shrinking `τ_eff` to cut the lag widens the
+  noise; their sum
+  `L(τ_eff) ≈ ρ·τ_eff + z/√(r*τ_eff)`
+  has a floor at `τ_eff ∝ (z/ρ)^{2/3}·r*^{-1/3}` — a minimum tracking error
+  no algorithm beats on a decline of that rate and share count. This is the
+  bound the §9 sub-guard cells are read against: the champion tracks it;
+  classic falls off it (paying the lag in the dangerous direction).
 
 ---
 
@@ -493,12 +521,45 @@ the honest scope is **behaviorally validated on real hardware; the cost-
 model weights remain a calibrated judgment** — stronger than internal
 consistency (§10) alone, short of a full economic backtest.
 
-**Open hardware tests** (mapping to the residual risks): a *sustained slow
-decline* (`−X%/hr` ramp, runnable via shape-proxy's Ramp profile) to earn
-the death-spiral safety claim that §6 currently only argues — the one input
-that could turn a persistence-based actuator into a slow runaway;
-*multi-connection* operation, since the model assumes one worker per
-connection while real connections aggregate many; and measuring `c` to
+**Sustained decline — the death-spiral safety test (simulation).** The one
+scenario the ensemble lacked, and the input most able to turn a
+persistence-based actuator into a slow runaway. `bin/slow-decline` runs
+rate ∈ {1–40} %/hr × spm ∈ {2–30} × {champion, interim, classic}, gating on
+the *settled* error after a 120-min recovery window (not the transient
+trough). Result, mirroring the detection finding in shape: **in the
+operating range (spm ≥ 6) the champion tracks every decline down and
+settles on the safe, under-difficulty side; classic lags badly in the
+dangerous direction** — to +69% over-difficulty transiently at 40%/hr
+(`e≈ln(1.69)`, a starved miner), ~4× the champion's worst transient. The
+death-spiral risk is the *incumbent's*, not the candidate's. Full results
+in `docs/SLOW_DECLINE_TEST.md`; the §6 claim is earned in simulation,
+hardware confirmation (below) pending.
+
+**Sub-guard limit (spm < 6) — a named, bounded degradation.** Below the
+spm6 PoissonCI guard — the regime the parameter sweep never exercised — the
+champion carries a steady *positive* (over-difficulty) offset: ~+5% at
+2 spm, ~+2.6% at 4 spm, flat across decline rates (a lag-free,
+120-min-settled measurement). It is identical in champion and interim, so
+it is the shared low-SPM guard, not the sign-persistence discount. An
+isolation probe (PoissonCI margin zeroed: +5.16% → +4.58%) rules out the
+additive margin; the sign flips exactly at the guard boundary (below: +5%;
+at/above: the intended −9% to −6%). **Mechanism, two legs in order:** the
+guard's symmetric PoissonCI (1) *removes* the protective ≈−0.67σ asymmetry
+the high-SPM boundary carries (§3, §6's 3:1 cost), and (2) *exposes* a small
+positive estimator bias at tiny share counts that the asymmetry otherwise
+masks. (Only leg (1) is isolated; the residual positive sign at small N is
+observed, not derived — a standard log-of-count Jensen term is *negative*,
+so the exact source is left open rather than dressed in a formula whose sign
+fails.) This ships because the offset is **inside the §3 noise band** at
+2 spm (σ≈45%, so +5% ≈ 0.11σ), below the 4–6 spm operating range, and the
+champion still beats classic at every sub-guard cell (max_e +27–42% vs
+classic +107%). The verdict is **spm6 well-placed, not proven optimal**.
+
+**Open hardware tests** (mapping to the residual risks): the *sustained
+slow decline* above, re-run on iron (shape-proxy Ramp profile, champion vs
+classic side-by-side) to confirm the simulation the way PR #2154 confirmed
+the step; *multi-connection* operation, since the model assumes one worker
+per connection while real connections aggregate many; and measuring `c` to
 close the §6 share-volume term. Production runs at `r* ≈ 4–6` spm with
 headroom (so the linear-small share-volume regime holds, and running
 *faster* — higher `r*` — is supported by the model: it tightens both the
@@ -540,6 +601,18 @@ essential); (c) the best algorithm changes within `w_over:w_under ∈
 outside the scored ensemble — a coverage gap to declare, not a soundness
 error.
 
+**Declared coverage gap (d): the asymmetry-blind sub-guard.** Below spm6
+the guard is a symmetric PoissonCI, so it abandons the §6 safety asymmetry
+exactly where data is sparsest (§9) — a known, bounded degradation, not a
+soundness error. The named fix is an `AsymmetricPoissonCI` guard (it exists
+in the codebase) carrying the same 3:1 cost, which would restore the
+safe-side bias below spm6. It is *deferred*, not unknown: taking it reopens
+champion selection at the margin and owes a spm≥6 re-confirmation (the
+validated regime is the whole result), a bad trade for cells below the
+operating range and mostly inside the noise band. The trigger that would
+force it: hardware A/B or real connection-rate data showing a non-trivial
+tail of connections living at 2–4 spm.
+
 ---
 
 ## 11. Status of each claim
@@ -559,6 +632,8 @@ error.
 | Share-volume cost is ~linear in `\|e\|`, one-sided | Argument | §6 |
 | Counter-age mechanism on real hardware | Observation (HW) | §9, PR #2154 |
 | Champion beats classic on a live drop | Observation (HW) | §9, PR #2154 |
+| Death-spiral safety: champion safe, classic lags dangerously | Observation | §9, `slow-decline` |
+| Sub-guard (spm<6) +5% bias: symmetric guard, bounded, deferred fix | Observation + coverage note | §9, §9(d) |
 
 Every clause of the metric — linear sign-split regret, quadratic
 direction-split effort, an explicit detection rate, per class, `3:1`
