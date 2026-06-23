@@ -141,25 +141,35 @@ where
             uncertainty: snap.uncertainty,
         });
 
-        // Per-decision instrumentation. `e = ln(Ĥ/H)` is the paper's tracking
-        // error (§1): the controller's belief over true hashrate, in log units.
-        // Logged EVERY cycle (not only on fires) so that the steady-state
-        // settle error is observable between the champion's sparse fires —
-        // which is exactly the quantity the per-retarget target log cannot pin
-        // down. `vardiff=debug` surfaces it.
+        // Per-decision instrumentation. Paper coordinate (§1): `e = ln(Ĥ/H)`,
+        // where Ĥ is the controller's CURRENT set-point belief and H is the
+        // true delivered hashrate. In this pipeline:
+        //   Ĥ = `hashrate` (the nominal/set-point the controller currently holds,
+        //       fed back from the previous fire via update_channel), and
+        //   H  = `snap.h_estimate` (fresh, share-derived from the observed stream
+        //       at the current target — the best available proxy for delivered H).
+        // So paper-e = ln(hashrate / h_estimate). (An earlier version logged the
+        // reciprocal and mislabeled the operands, which inverted the sign.)
+        //
+        // CHECKABLE INVARIANT (verify against the raw observable, never the
+        // algebra): e < 0  ⟺  under-difficulty  ⟺  realized_spm > r*. The
+        // realized rate is logged alongside so the sign can be confirmed against
+        // a quantity that does not pass through hash_rate_from_target.
         let e = if hashrate > 0.0 && snap.h_estimate > 0.0 {
-            (snap.h_estimate as f64 / hashrate as f64).ln()
+            (hashrate as f64 / snap.h_estimate as f64).ln()
         } else {
             f64::NAN
         };
         tracing::debug!(
             target: "channels_sv2::vardiff",
-            e, delta, threshold,
-            h_estimate = snap.h_estimate,
-            h_true = hashrate,
-            spm = shares_per_minute,
+            e,
+            realized_spm = snap.realized_share_per_min,
+            r_star = shares_per_minute,
+            delta, threshold,
+            h_belief = hashrate,
+            h_delivered_est = snap.h_estimate,
             will_fire = delta >= threshold,
-            "vardiff decision"
+            "vardiff decision (e=ln(Ĥ/H)<0 ⟺ under-difficulty ⟺ realized_spm>r_star)"
         );
 
         if delta < threshold {
@@ -179,17 +189,22 @@ where
         self.timestamp_of_last_update = now;
         self.estimator.on_fire(new_hashrate, hashrate);
 
-        // `s = ln(Ĥ⁺/Ĥ⁻)` is the log-step (§1): the fire's size and sign
-        // (s>0 tighten, s<0 ease) — the gentleness/direction signal.
-        let s = if new_hashrate > 0.0 && snap.h_estimate > 0.0 {
-            (new_hashrate as f64 / snap.h_estimate as f64).ln()
+        // `s = ln(Ĥ⁺/Ĥ⁻)` is the log-step (§1): the change in the controller's
+        // SET-POINT belief across the fire — new set-point over OLD set-point,
+        // i.e. ln(new_hashrate / hashrate). (`s>0` tightens — raises difficulty;
+        // `s<0` eases.) NOTE the operand: the prior belief is `hashrate` (the
+        // current set-point), NOT `snap.h_estimate` (the share-derived delivered
+        // estimate); an earlier version used h_estimate, producing a mixed ratio
+        // whose sign was not a clean tighten/ease signal.
+        let s = if new_hashrate > 0.0 && hashrate > 0.0 {
+            (new_hashrate as f64 / hashrate as f64).ln()
         } else {
             f64::NAN
         };
         tracing::debug!(
             target: "channels_sv2::vardiff",
-            s, new_hashrate, h_was = snap.h_estimate,
-            "vardiff fire"
+            s, new_hashrate, h_belief_prev = hashrate,
+            "vardiff fire (s=ln(Ĥ⁺/Ĥ⁻); s>0 tighten, s<0 ease)"
         );
 
         Ok(Some(new_hashrate))
