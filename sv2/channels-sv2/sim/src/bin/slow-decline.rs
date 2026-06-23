@@ -39,17 +39,14 @@ const OBSERVE_MIN: u64 = 120; // settle window after the decline floor — long
 const MAX_DECLINE_MIN: u64 = 240; // cap a slow decline at 4h
 const TARGET_DROP: f32 = 0.50; // decline until 50% lost (or the 4h cap)
 
-/// The CORRECTED-metric champion (fully-corrected funnel winner): gentler,
-/// longer window than the s0.3 champion — Ewma360 / SignPersist-s1.5 / t8 /
-/// d0.06 / etaMax0.6 / accel0.05. Safety on the decline is UNINHERITED from
-/// the old champion (a sleepier easer is a different animal on the dangerous
-/// direction); this re-clear is mandatory before it can ship.
-fn corrected() -> AlgorithmSpec {
-    AlgorithmSpec::new("corrected(Ewma360/s1.5/t8)", |clock| {
+/// A SignPersist-family config by (tau, sens) — the two axes the minimax-over-
+/// r* band sweep stresses. tighten=8, d0.06, etaMax0.6, accel0.05 fixed.
+fn band_cfg(name: &'static str, tau: u64, sens: f64) -> AlgorithmSpec {
+    AlgorithmSpec::new(name, move |clock| {
         VardiffBox(Box::new(Composed::new(
-            EwmaEstimator::new(360),
+            EwmaEstimator::new(tau),
             AdaptiveSignPersist::sign_persist(
-                SignPersistenceCusumBoundary::new(1.5, 0.05, 8.0, 0.06, 0.6),
+                SignPersistenceCusumBoundary::new(sens, 0.05, 8.0, 0.06, 0.6),
                 6,
             ),
             AcceleratingPartialRetarget::new(0.2, 0.6, 0.05),
@@ -58,6 +55,17 @@ fn corrected() -> AlgorithmSpec {
         )))
     })
 }
+
+/// The single-rate corrected champion (funnel winner at spm 4-6): Ewma360/s1.5.
+fn corrected() -> AlgorithmSpec { band_cfg("corrected(Ewma360/s1.5)", 360, 1.5) }
+
+/// The minimax-over-r* band cluster (λ-robust over λ∈{0.5,1,2}, all ~1.12
+/// worst-rate ratio). The band-optimal cost drifts INTO the sleepy corner as
+/// the firing penalty rises, so — exactly as at single-rate — the decline
+/// gate must break the tie. Safety is UNINHERITED for every one of these.
+fn band_480_s15() -> AlgorithmSpec { band_cfg("band(Ewma480/s1.5)", 480, 1.5) }
+fn band_480_s2() -> AlgorithmSpec { band_cfg("band(Ewma480/s2)", 480, 2.0) }
+fn band_720_s2() -> AlgorithmSpec { band_cfg("band(Ewma720/s2)", 720, 2.0) }
 
 /// The interim champion (AsymCusum boundary, no sign-persistence) — the
 /// control that isolates whether the sign-persistence discount specifically
@@ -158,11 +166,15 @@ fn main() {
     // safety regime and the point of this extension.
     let spms = [2.0f32, 4.0, 6.0, 8.0, 12.0, 20.0, 30.0];
     let algos: Vec<(String, Box<dyn Fn() -> AlgorithmSpec + Send + Sync>)> = vec![
-        ("corrected".into(), Box::new(corrected)),     // the config under test
+        // the minimax-over-r* band cluster (the tie the decline gate breaks)
+        ("band720s2".into(), Box::new(band_720_s2)),   // sleepiest — expected corner
+        ("band480s2".into(), Box::new(band_480_s2)),
+        ("band480s15".into(), Box::new(band_480_s15)),
+        ("corrected".into(), Box::new(corrected)),     // single-rate champion
         ("champion".into(), Box::new(AlgorithmSpec::champion)), // old s0.3, for contrast
-        ("interim".into(), Box::new(interim)),
         ("classic".into(), Box::new(AlgorithmSpec::classic_composed)),
     ];
+    let _ = interim;
 
     // Per-cell trial count CI-matched to a reference of 60 spm: estimator
     // variance ∝ 1/(r*·τ), so a 4-spm cell needs ~15× the trials of a
@@ -176,7 +188,7 @@ fn main() {
     // Flatten the work into (rate, spm, algo_idx) jobs.
     let jobs: Vec<(f32, f32, usize)> = rates
         .iter()
-        .flat_map(|&r| spms.iter().flat_map(move |&s| (0..3).map(move |a| (r, s, a))))
+        .flat_map(|&r| spms.iter().flat_map(move |&s| (0..6).map(move |a| (r, s, a))))
         .collect();
     eprintln!(
         "slow-decline: {} cells, base {} trials (sparse cells oversampled up to {}×), {} threads",
@@ -288,8 +300,8 @@ fn main() {
     // Lag-vs-bias diagnostic for the sub-guard cells: if mid-window e is
     // materially ABOVE end-window e, the offset is still relaxing (residual
     // decline lag, benign); if mid ≈ end, it is a true steady-state offset.
-    println!("\nSub-guard (spm<6) lag-vs-bias — champion, e at observe-window mid vs end:");
-    for r in rows.iter().filter(|r| r.spm < 6.0 && r.algo == "champion") {
+    println!("\nSub-guard (spm<6) lag-vs-bias — band720s2 (sleepiest, most at-risk), e at observe-window mid vs end:");
+    for r in rows.iter().filter(|r| r.spm < 6.0 && r.algo == "band720s2") {
         let relaxing = r.settled_mid_e_pct - r.settled_e_pct;
         let tag = if relaxing > 2.0 { "LAG (still relaxing)" } else { "steady" };
         println!(
@@ -298,7 +310,7 @@ fn main() {
         );
     }
     println!("Per-algo summary (worst over rates/spm):");
-    for algo in ["corrected", "champion", "interim", "classic"] {
+    for algo in ["band720s2", "band480s2", "band480s15", "corrected", "champion", "classic"] {
         let sub: Vec<&Row> = rows.iter().filter(|r| r.algo == algo).collect();
         let worst_max = sub.iter().map(|r| r.max_e_pct).fold(f64::MIN, f64::max);
         let worst_settled = sub.iter().map(|r| r.settled_e_pct).fold(f64::MIN, f64::max);
