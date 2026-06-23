@@ -22,6 +22,7 @@
 /confirm_*.md
 /champion_weights.md
 /*.svg
+/docs/*.svg
 /compare_out*/
 /sweep_out/
 

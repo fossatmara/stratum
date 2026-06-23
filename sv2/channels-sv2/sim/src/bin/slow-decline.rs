@@ -166,15 +166,21 @@ fn main() {
     // safety regime and the point of this extension.
     let spms = [2.0f32, 4.0, 6.0, 8.0, 12.0, 20.0, 30.0];
     let algos: Vec<(String, Box<dyn Fn() -> AlgorithmSpec + Send + Sync>)> = vec![
-        // the minimax-over-r* band cluster (the tie the decline gate breaks)
-        ("band720s2".into(), Box::new(band_720_s2)),   // sleepiest — expected corner
-        ("band480s2".into(), Box::new(band_480_s2)),
-        ("band480s15".into(), Box::new(band_480_s15)),
+        // The five configs that DOMINATE the champion on both axes of the
+        // 12-spm steady-vs-transient scatter while passing the weak 6-spm
+        // gate. The authoritative cross-rate (incl. sub-guard 2-4 spm) gate
+        // decides whether they are genuinely better-and-safe (champion wrong)
+        // or sleepy configs the weak single-rate gate failed to reject.
+        ("dom720s03".into(), Box::new(|| band_cfg("dom(Ewma720/s0.3)", 720, 0.3))),
+        ("dom720s06".into(), Box::new(|| band_cfg("dom(Ewma720/s0.6)", 720, 0.6))),
+        ("dom480s1".into(), Box::new(|| band_cfg("dom(Ewma480/s1)", 480, 1.0))),
+        ("dom480s06".into(), Box::new(|| band_cfg("dom(Ewma480/s0.6)", 480, 0.6))),
+        ("dom480s03".into(), Box::new(|| band_cfg("dom(Ewma480/s0.3)", 480, 0.3))),
         ("corrected".into(), Box::new(corrected)),     // single-rate champion
         ("champion".into(), Box::new(AlgorithmSpec::champion)), // old s0.3, for contrast
         ("classic".into(), Box::new(AlgorithmSpec::classic_composed)),
     ];
-    let _ = interim;
+    let _ = (interim, band_720_s2, band_480_s2, band_480_s15);
 
     // Per-cell trial count CI-matched to a reference of 60 spm: estimator
     // variance ∝ 1/(r*·τ), so a 4-spm cell needs ~15× the trials of a
@@ -188,7 +194,7 @@ fn main() {
     // Flatten the work into (rate, spm, algo_idx) jobs.
     let jobs: Vec<(f32, f32, usize)> = rates
         .iter()
-        .flat_map(|&r| spms.iter().flat_map(move |&s| (0..6).map(move |a| (r, s, a))))
+        .flat_map(|&r| spms.iter().flat_map(move |&s| (0..8).map(move |a| (r, s, a))))
         .collect();
     eprintln!(
         "slow-decline: {} cells, base {} trials (sparse cells oversampled up to {}×), {} threads",
@@ -300,8 +306,8 @@ fn main() {
     // Lag-vs-bias diagnostic for the sub-guard cells: if mid-window e is
     // materially ABOVE end-window e, the offset is still relaxing (residual
     // decline lag, benign); if mid ≈ end, it is a true steady-state offset.
-    println!("\nSub-guard (spm<6) lag-vs-bias — band720s2 (sleepiest, most at-risk), e at observe-window mid vs end:");
-    for r in rows.iter().filter(|r| r.spm < 6.0 && r.algo == "band720s2") {
+    println!("\nSub-guard (spm<6) lag-vs-bias — dom720s03 (sleepiest dominator, most at-risk), e at observe-window mid vs end:");
+    for r in rows.iter().filter(|r| r.spm < 6.0 && r.algo == "dom720s03") {
         let relaxing = r.settled_mid_e_pct - r.settled_e_pct;
         let tag = if relaxing > 2.0 { "LAG (still relaxing)" } else { "steady" };
         println!(
@@ -310,7 +316,7 @@ fn main() {
         );
     }
     println!("Per-algo summary (worst over rates/spm):");
-    for algo in ["band720s2", "band480s2", "band480s15", "corrected", "champion", "classic"] {
+    for algo in ["dom720s03", "dom720s06", "dom480s1", "dom480s06", "dom480s03", "corrected", "champion", "classic"] {
         let sub: Vec<&Row> = rows.iter().filter(|r| r.algo == algo).collect();
         let worst_max = sub.iter().map(|r| r.max_e_pct).fold(f64::MIN, f64::max);
         let worst_settled = sub.iter().map(|r| r.settled_e_pct).fold(f64::MIN, f64::max);
