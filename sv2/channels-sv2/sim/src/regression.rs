@@ -460,7 +460,7 @@ mod tests {
         let toml = r#"
 # A comment
 [meta]
-algorithm = "VardiffState"
+algorithm = "classic"
 trial_count = 1000
 base_seed = 0xDEADBEEF
 
@@ -471,7 +471,7 @@ convergence_rate = 0.95
 jitter_p50_per_min = 0.04
         "#;
         let doc = parse_baseline_toml(toml).expect("should parse");
-        assert_eq!(doc.meta.algorithm, "VardiffState");
+        assert_eq!(doc.meta.algorithm, "classic");
         assert_eq!(doc.meta.trial_count, 1000);
         assert_eq!(doc.meta.base_seed, 0xDEADBEEF);
         let cell = &doc.cells["spm_12.stable_1ph"];
@@ -486,7 +486,7 @@ jitter_p50_per_min = 0.04
     fn parser_handles_u64_base_seed_beyond_i64_max() {
         let hex_toml = r#"
 [meta]
-algorithm = "VardiffState"
+algorithm = "classic"
 trial_count = 1000
 base_seed = 0xDEADBEEFCAFEF00D
         "#;
@@ -495,7 +495,7 @@ base_seed = 0xDEADBEEFCAFEF00D
 
         let decimal_toml = r#"
 [meta]
-algorithm = "VardiffState"
+algorithm = "classic"
 trial_count = 1000
 base_seed = 16045690984503111693
         "#;
@@ -525,7 +525,7 @@ base_seed = 16045690984503111693
     fn comparison_reports_clean_for_identical_run() {
         let toml = r#"
 [meta]
-algorithm = "VardiffState"
+algorithm = "classic"
 trial_count = 1
 base_seed = 1
 
@@ -555,7 +555,7 @@ jitter_p95_per_min = 0.20
     fn comparison_flags_convergence_rate_drop() {
         let toml = r#"
 [meta]
-algorithm = "VardiffState"
+algorithm = "classic"
 trial_count = 1
 base_seed = 1
 
@@ -580,7 +580,7 @@ convergence_rate = 0.95
     fn comparison_flags_jitter_increase_beyond_absolute_tolerance() {
         let toml = r#"
 [meta]
-algorithm = "VardiffState"
+algorithm = "classic"
 trial_count = 1
 base_seed = 1
 
@@ -605,7 +605,7 @@ jitter_p50_per_min = 0.04
     fn comparison_flags_reaction_rate_drop_at_large_delta() {
         let toml = r#"
 [meta]
-algorithm = "VardiffState"
+algorithm = "classic"
 trial_count = 1
 base_seed = 1
 
@@ -632,7 +632,7 @@ reaction_rate = 0.90
         // drop is large but should not fail.
         let toml = r#"
 [meta]
-algorithm = "VardiffState"
+algorithm = "classic"
 trial_count = 1
 base_seed = 1
 
@@ -660,7 +660,7 @@ reaction_rate = 0.90
     fn comparison_reports_missing_cells_on_both_sides() {
         let toml = r#"
 [meta]
-algorithm = "VardiffState"
+algorithm = "classic"
 trial_count = 1
 base_seed = 1
 
@@ -681,7 +681,7 @@ scenario = "stable_1ph"
     #[test]
     #[ignore = "slow regression test; run with `cargo test --release -- --ignored`"]
     fn classic_algorithm_no_regression() {
-        let baseline_str = include_str!("../baseline_VardiffState.toml");
+        let baseline_str = include_str!("../baseline_classic.toml");
         let baseline = parse_baseline_toml(baseline_str).expect("baseline parses");
 
         let cells = default_cells();

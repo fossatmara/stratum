@@ -42,7 +42,9 @@ pub use boundary::{
     HysteresisGate, PoissonCI, SignPersistenceCusumBoundary, StepFunction, VolatilityAdaptiveBoundary,
     WarmupBoundary,
 };
-pub use composed::{classic_composed, ClassicComposed, Composed};
+pub use composed::{
+    champion_composed, classic_composed, ChampionComposed, ClassicComposed, Composed,
+};
 pub use decision::DecisionRecord;
 pub use estimator::Uncertainty;
 pub use estimator::{

@@ -29,7 +29,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use channels_sv2::vardiff::MockClock;
-use channels_sv2::VardiffState;
 
 use crate::metrics::{self, MetricValues};
 use crate::schedule::HashrateSchedule;
@@ -459,8 +458,13 @@ pub fn run_cell(cell: &Cell, trial_count: usize, base_seed: u64, cell_index: u64
             .wrapping_add(cell_index.wrapping_shl(20))
             .wrapping_add(trial_index as u64);
         let clock = Arc::new(MockClock::new(0));
-        let vardiff = VardiffState::new_with_clock(1.0, clock.clone())
-            .expect("VardiffState construction should never fail");
+        // The baseline anchor is the CLASSIC algorithm. Build classic_composed
+        // directly: production VardiffState now delegates to the champion, but
+        // run_baseline must stay the classic reference (its frozen baseline
+        // TOML and every "vs. classic" comparison depend on it). classic_composed
+        // is fire-for-fire identical to the pre-champion VardiffState, so the
+        // frozen baseline numbers are unchanged.
+        let vardiff = channels_sv2::vardiff::composed::classic_composed(1.0, clock.clone());
         let trial = run_trial(vardiff, clock, config.clone(), &schedule, seed);
         trials.push(trial);
     }
@@ -927,9 +931,9 @@ mod tests {
             scenario: Scenario::Stable,
         }];
         let results = run_baseline(&cells, 3, 0xCAFE);
-        let toml = serialize_toml(&results, "VardiffState", 3, 0xCAFE);
+        let toml = serialize_toml(&results, "classic", 3, 0xCAFE);
         assert!(toml.contains("[meta]"));
-        assert!(toml.contains("algorithm = \"VardiffState\""));
+        assert!(toml.contains("algorithm = \"classic\""));
         assert!(toml.contains("[cell.spm_12.stable_1ph]"));
         assert!(toml.contains("convergence_rate ="));
     }
@@ -951,7 +955,7 @@ mod tests {
             },
         ];
         let results = run_baseline(&cells, 3, 0xCAFE);
-        let md = serialize_markdown(&results, "VardiffState", 3, 0xCAFE);
+        let md = serialize_markdown(&results, "classic", 3, 0xCAFE);
         assert!(md.contains("# Vardiff baseline characterization"));
         assert!(md.contains("## Convergence time"));
         assert!(md.contains("## Settled accuracy"));

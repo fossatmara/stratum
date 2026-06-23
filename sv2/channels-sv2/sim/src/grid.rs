@@ -58,7 +58,6 @@ use bitcoin::Target;
 use channels_sv2::vardiff::pow2_pid::Pow2PidVardiff;
 use channels_sv2::vardiff::pid_tuned::{PidConfig, PidTunedVardiff};
 use channels_sv2::vardiff::{error::VardiffError, Clock, MockClock, Vardiff};
-use channels_sv2::VardiffState;
 
 use crate::baseline::{Cell, CellResult, Scenario, DEFAULT_BASELINE_SEED, DEFAULT_TRIAL_COUNT};
 use crate::composed;
@@ -233,16 +232,17 @@ impl AlgorithmSpec {
         }
     }
 
-    /// The production `VardiffState`. Wrapped in [`AsObservable`] so
-    /// it satisfies the grid's `Vardiff + Observable` requirement;
-    /// `last_decision` always returns `None`, so introspection-only
-    /// metrics (bias, variance, overshoot) gracefully report `None`
-    /// for this algorithm.
+    /// The **classic** baseline algorithm, as the sim's comparison anchor.
+    ///
+    /// NOTE: production `VardiffState` now delegates to the champion
+    /// composition, NOT classic. So this spec is built from
+    /// [`composed::classic_composed`] directly — it must remain the *classic*
+    /// baseline (that is its role in every diagnostic bin that compares a
+    /// candidate against "the algorithm we run today / the upstream
+    /// reference"). Building it from `VardiffState` would silently make the
+    /// champion its own anchor. The name still reflects the classic triple,
+    /// which is now honest because the build target is classic again.
     pub fn classic_vardiff_state() -> Self {
-        // The monolith is fire-equivalent to Cumul / Step / FullClamp. Derive
-        // the name from those three components and append the `*` monolith
-        // marker so it is distinguishable from ClassicComposed (which the
-        // sanitize_filename fn keeps collision-free on disk).
         let name = format!(
             "{}*",
             crate::naming::triple_name(
@@ -252,14 +252,18 @@ impl AlgorithmSpec {
             )
         );
         Self::new(name, |clock| {
-            let inner = VardiffState::new_with_clock(1.0, clock)
-                .expect("VardiffState construction should never fail");
+            // Build the classic composition directly (NOT VardiffState, which
+            // is now the champion) and wrap in AsObservable to preserve the
+            // introspection-blind `*` monolith semantics this spec has always
+            // had — the classic baseline reports None for bias/variance, same
+            // as the opaque production monolith it originally stood in for.
+            let inner = composed::classic_composed(1.0, clock);
             VardiffBox(Box::new(AsObservable(inner)))
         })
     }
 
-    /// The three-stage-decomposed Classic algorithm. Asserted
-    /// fire-for-fire equivalent to `VardiffState`; additionally
+    /// The three-stage-decomposed Classic algorithm. Fire-for-fire
+    /// equivalent to the original classic monolith; additionally
     /// exposes the per-tick decision state, so bias / variance /
     /// overshoot metrics work.
     pub fn classic_composed() -> Self {
@@ -1561,6 +1565,9 @@ pub fn run_cell_with_algorithm(
 mod tests {
     use super::*;
     use crate::baseline::{default_cells, run_baseline};
+    // VardiffState (now the champion) used here only as an arbitrary concrete
+    // Vardiff for AsObservable/factory plumbing tests — not as a classic anchor.
+    use channels_sv2::VardiffState;
 
     #[test]
     fn default_classic_has_one_algorithm_eight_rates_ten_scenarios() {

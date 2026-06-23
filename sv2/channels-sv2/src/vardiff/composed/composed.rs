@@ -13,10 +13,12 @@ use bitcoin::Target;
 
 use crate::vardiff::{error::VardiffError, Clock, Vardiff};
 
-use super::boundary::{Boundary, StepFunction};
+use super::boundary::{
+    AdaptiveSignPersist, Boundary, SignPersistenceCusumBoundary, StepFunction,
+};
 use super::decision::DecisionRecord;
-use super::estimator::{CumulativeCounter, Estimator, EstimatorContext};
-use super::update::{FullRetargetWithClamp, UpdateRule};
+use super::estimator::{CumulativeCounter, Estimator, EstimatorContext, EwmaEstimator};
+use super::update::{AcceleratingPartialRetarget, FullRetargetWithClamp, UpdateRule};
 
 /// A vardiff algorithm composed of three sequential pipeline stages.
 ///
@@ -175,6 +177,38 @@ pub fn classic_composed(min_hashrate: f32, clock: Arc<dyn Clock>) -> ClassicComp
         CumulativeCounter::new(),
         StepFunction::classic_table(),
         FullRetargetWithClamp::classic(),
+        min_hashrate,
+        clock,
+    )
+}
+
+// ============================================================================
+// ChampionComposed — the production champion selected by the simulation study
+// ============================================================================
+
+/// The champion algorithm as a `Composed` triple.
+///
+/// `EwmaEstimator(τ=360s) + AdaptiveSignPersist(SignPersistenceCusumBoundary,
+/// spm_threshold=6) + AcceleratingPartialRetarget(base=0.2, max=0.6,
+/// acc=0.05)`. Selected by minimax over the target share rate with a
+/// decline-safety constraint (see `sim/docs/METRIC_DERIVATION.md`): the
+/// gentlest configuration that stays decline-safe across the rate band.
+pub type ChampionComposed =
+    Composed<EwmaEstimator, AdaptiveSignPersist, AcceleratingPartialRetarget>;
+
+/// Constructs the champion algorithm as a `Composed` triple. The parameters
+/// are the exact values the simulation framework's `slow-decline`,
+/// `sweep-minimax`, and `steady-transient` binaries identify and clear:
+/// `Ewma360 / SignPersist(s1.5, floor0.05, t8, d0.06, dm0.6) over spm6 /
+/// Accel(0.2, 0.6, 0.05)`.
+pub fn champion_composed(min_hashrate: f32, clock: Arc<dyn Clock>) -> ChampionComposed {
+    Composed::new(
+        EwmaEstimator::new(360),
+        AdaptiveSignPersist::sign_persist(
+            SignPersistenceCusumBoundary::new(1.5, 0.05, 8.0, 0.06, 0.6),
+            6,
+        ),
+        AcceleratingPartialRetarget::new(0.2, 0.6, 0.05),
         min_hashrate,
         clock,
     )

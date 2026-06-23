@@ -7,18 +7,19 @@ const DEFAULT_MIN_HASHRATE: f32 = 1.0;
 
 use super::{error::VardiffError, Vardiff};
 
-/// Variable difficulty controller — the upstream classic algorithm.
+/// Variable difficulty controller — the production champion.
 ///
-/// Delegates to [`composed::classic_composed`], the three-stage
-/// decomposition of the classic algorithm: `CumulativeCounter +
-/// StepFunction(classic table) + FullRetargetWithClamp`. This keeps
-/// production behavior identical to upstream classic vardiff while
-/// reusing the composed pipeline that the simulation framework drives
-/// (e.g. for clock injection in tests).
+/// Delegates to [`composed::champion_composed`]: `EwmaEstimator(τ=360s) +
+/// AdaptiveSignPersist(spm_threshold=6) + AcceleratingPartialRetarget(0.2,
+/// 0.6, 0.05)`. This is the configuration the simulation framework selected
+/// by minimax over the target share rate under a decline-safety constraint
+/// (see `sim/docs/METRIC_DERIVATION.md`): the gentlest controller that stays
+/// decline-safe across the rate band.
 ///
-/// Any production algorithm change (EWMA estimator, adaptive boundary,
-/// partial retarget, …) ships as a separate, clean commit — it is
-/// deliberately NOT bundled with the diagnostic simulation suite.
+/// The classic algorithm's three-stage decomposition remains available as
+/// [`composed::classic_composed`] and is what the simulation crate's
+/// equivalence suite pins against the original monolith; it is no longer the
+/// production path.
 #[derive(Debug)]
 pub struct VardiffState {
     inner: Box<dyn Vardiff>,
@@ -45,7 +46,7 @@ impl VardiffState {
         clock: Arc<dyn Clock>,
     ) -> Result<Self, VardiffError> {
         Ok(VardiffState {
-            inner: Box::new(crate::vardiff::composed::classic_composed(
+            inner: Box::new(crate::vardiff::composed::champion_composed(
                 min_allowed_hashrate,
                 clock,
             )),

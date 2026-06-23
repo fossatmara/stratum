@@ -1,7 +1,8 @@
-//! Runs the default baseline grid against the classic [`VardiffState`]
-//! algorithm and writes `baseline_VardiffState.toml` (machine-readable,
-//! consumed by regression assertions) and `baseline_VardiffState.md`
-//! (human-readable summary) to the current working directory.
+//! Runs the default baseline grid against the **classic** algorithm
+//! (`classic_composed`; production `VardiffState` is now the champion) and
+//! writes `baseline_classic.toml` (machine-readable, consumed by regression
+//! assertions) and `baseline_classic.md` (human-readable summary) to the
+//! current working directory.
 //!
 //! ## Usage
 //!
@@ -58,12 +59,12 @@ fn main() -> std::io::Result<()> {
     let elapsed = started.elapsed();
     eprintln!("Baseline run complete in {:.2}s", elapsed.as_secs_f64());
 
-    let toml = serialize_toml(&results, "VardiffState", trial_count, base_seed);
-    let md = serialize_markdown(&results, "VardiffState", trial_count, base_seed);
+    let toml = serialize_toml(&results, "classic", trial_count, base_seed);
+    let md = serialize_markdown(&results, "classic", trial_count, base_seed);
 
     fs::create_dir_all(&out_dir)?;
-    let toml_path = out_dir.join("baseline_VardiffState.toml");
-    let md_path = out_dir.join("baseline_VardiffState.md");
+    let toml_path = out_dir.join("baseline_classic.toml");
+    let md_path = out_dir.join("baseline_classic.md");
     fs::write(&toml_path, toml)?;
     fs::write(&md_path, md)?;
     eprintln!("Wrote {}", toml_path.display());
