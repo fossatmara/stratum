@@ -187,6 +187,36 @@ fn decline_settled_e_pct(p: P, trials: usize, seed: u64) -> f64 {
 /// operational requirement (safe-side after a decline), not a tuned weight.
 const GATE_PCT: f64 = 2.0;
 
+/// Responsiveness gate: median reaction to a −10% drop (matured 60-min
+/// counter) at production rates. The corner sacrifices THIS (corner −10%
+/// p50 15–28min vs responsive 3–10min); a −50% gate is non-binding
+/// (corner catches a halving in 3–7min). Floor-relative per Theorem 2.
+fn react10_p50_min(p: P, spm: f32, trials: usize, seed: u64) -> f64 {
+    let (cfg, sched) = Scenario::SettledStep { settle_minutes: 60, delta_pct: -10 }.build(spm);
+    let config = TrialConfig { tick_interval_secs: 60, ..cfg };
+    let event = 60 * 60u64;
+    let a = spec(p);
+    let mut trials_v = Vec::with_capacity(trials);
+    for i in 0..trials {
+        let clock = Arc::new(MockClock::new(0));
+        let v = (a.factory)(clock.clone());
+        trials_v.push(run_trial_observed(v, clock, config.clone(), &sched, seed.wrapping_add(i as u64)));
+    }
+    let (_, dist) = vardiff_sim::reaction_time_distribution(&trials_v, event, 180 * 60);
+    dist.p50().unwrap_or(f64::NAN) / 60.0
+}
+
+/// CUSUM (Lorden-optimal) floor for a −10% drop at ARL0=60min (matching the
+/// detection metric's 60-min window convention), computed by cusum-floor.rs.
+/// The gate is reaction ≤ k × floor[spm].
+fn cusum_floor10_min(spm: f32) -> f64 {
+    match spm as u32 {
+        4 => 21.0,
+        6 => 18.0,
+        _ => 18.0, // production band; high-r* not gated here
+    }
+}
+
 fn cost(c: (f64, f64, f64, f64), lambda: f64) -> f64 {
     W_OVER * c.0 + W_UNDER * c.1 + RHO * (c.2 + lambda * c.3)
 }
@@ -227,7 +257,10 @@ fn main() {
     // excluded by the §9 safety gate we already justified, not by a new
     // weighted term. Gate trials are fewer (the median settled-e is robust).
     let gate_trials = (trials / 2).max(100);
-    let out: Mutex<Vec<(P, (f64, f64, f64, f64), f64)>> = Mutex::new(Vec::with_capacity(grid.len()));
+    // Per config: (P, components, decline_settled_e%, react10_ratio) where
+    // react10_ratio = median −10% reaction / CUSUM floor, averaged over the
+    // production rates {4,6}. The responsiveness gate is react10_ratio ≤ k.
+    let out: Mutex<Vec<(P, (f64, f64, f64, f64), f64, f64)>> = Mutex::new(Vec::with_capacity(grid.len()));
     let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     std::thread::scope(|s| {
         for _ in 0..n_threads {
@@ -236,7 +269,14 @@ fn main() {
                 if i >= grid.len() { break; }
                 let c = components(grid[i], trials, base_seed);
                 let gate = decline_settled_e_pct(grid[i], gate_trials, base_seed ^ 0xDEC11E);
-                out.lock().unwrap().push((grid[i], c, gate));
+                // react ratio vs floor, averaged over production rates.
+                let mut rr = 0.0; let mut nrr = 0.0;
+                for &spm in &[4.0f32, 6.0] {
+                    let r = react10_p50_min(grid[i], spm, gate_trials, base_seed ^ 0x0eac7_u64);
+                    rr += r / cusum_floor10_min(spm); nrr += 1.0;
+                }
+                let react_ratio = rr / nrr;
+                out.lock().unwrap().push((grid[i], c, gate, react_ratio));
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                 if d % 64 == 0 { eprintln!("  {}/{} ({:.0}s)", d, grid.len(), started.elapsed().as_secs_f64()); }
             });
@@ -245,38 +285,48 @@ fn main() {
     let results = out.into_inner().unwrap();
     eprintln!("done {} in {:.0}s", results.len(), started.elapsed().as_secs_f64());
 
-    // THE KEY TEST: does the slow-decline safety gate (applied during the
-    // search) close the degenerate 'barely-fire' corner on its own — with NO
-    // new weighted term? Partition into gate-pass / gate-fail and check
-    // whether the gate-passing frontier has an INTERIOR optimum.
-    let pass: Vec<&(P,(f64,f64,f64,f64),f64)> = results.iter().filter(|(_,_,g)| *g <= GATE_PCT).collect();
-    let fail = results.len() - pass.len();
-    println!("\n## Slow-decline gate (settled e ≤ {:+.0}% after 10%/hr decline): {} pass, {} fail of {}.",
-        GATE_PCT, pass.len(), fail, results.len());
-
-    for &lambda in &LAMBDAS {
-        // Unconstrained winner (the corner) vs gate-constrained winner.
+    // Constrained minimization: min production cost (λ=1, mid of the
+    // grounded range) s.t. (i) slow-decline gate (settled e ≤ GATE_PCT) AND
+    // (ii) responsiveness gate (react10_ratio ≤ k), swept over k. The
+    // responsiveness gate is the one that binds the corner (the decline gate
+    // alone does not). Present champion-as-a-function-of-k: the threshold k
+    // is the operator input; the curve is the deliverable.
+    let lambda = 1.0;
+    let edge_tau = 720u64;
+    // Diagnostic: the react_ratio distribution. If even the corner is ≤ ~1,
+    // the −10% floor is so long at production rates that NO config exceeds
+    // it — the gate can't bind, because the floor itself is the limit.
+    {
+        let mut rr: Vec<f64> = results.iter().map(|(_,_,_,r)| *r).collect();
+        rr.sort_by(|a,b| a.partial_cmp(b).unwrap());
+        println!("\n[diag] react10_ratio across grid: min {:.2}, median {:.2}, max {:.2}",
+            rr[0], rr[rr.len()/2], rr[rr.len()-1]);
+    }
+    println!("\n## Constrained champion as a function of k  (λ={lambda})");
+    println!("Gate = slow-decline safe-side AND react(−10%) ≤ k×CUSUM-floor (ARL0=60min: 21min@4spm, 18min@6spm).");
+    println!("k is the OPERATOR threshold (how many × the information floor is acceptable); the curve is the result.\n");
+    println!("| k | champion (gate-passing min-cost) | cost | react ratio | decline e% | at τ-edge? |");
+    println!("| --- | --- | --- | --- | --- | --- |");
+    // Unconstrained (corner) reference row.
+    {
         let unc = results.iter().min_by(|a,b| cost(a.1,lambda).partial_cmp(&cost(b.1,lambda)).unwrap()).unwrap();
-        let con = pass.iter().min_by(|a,b| cost(a.1,lambda).partial_cmp(&cost(b.1,lambda)).unwrap());
-        println!("\n### λ={lambda}");
-        println!("  unconstrained best: Ewma{} s{} t{} (cost {:.4}, gate {:+.1}%)  {}",
-            unc.0.tau, unc.0.sens, unc.0.tighten, cost(unc.1,lambda), unc.2,
-            if unc.2 > GATE_PCT { "← FAILS gate (corner)" } else { "(passes gate)" });
-        if let Some(c) = con {
-            // is the gate-constrained winner INTERIOR in tau? (not at grid edge)
-            let taus_sorted = [240u64,360,480,600,720];
-            let at_edge = c.0.tau == *taus_sorted.last().unwrap();
-            println!("  gate-constrained best: Ewma{} s{} t{} (cost {:.4}, gate {:+.1}%)  {}",
-                c.0.tau, c.0.sens, c.0.tighten, cost(c.1,lambda), c.2,
-                if at_edge { "← still at tau edge (gate did NOT close corner)" } else { "← INTERIOR (gate closed the corner)" });
-        }
-        // top 6 gate-passing configs
-        let mut p2 = pass.clone();
-        p2.sort_by(|a,b| cost(a.1,lambda).partial_cmp(&cost(b.1,lambda)).unwrap());
-        println!("  gate-passing top 6:");
-        for (i,(p,c,g)) in p2.iter().take(6).enumerate() {
-            println!("    {} | Ewma{} s{} t{} d{} eta{} acc{} | cost {:.4} | gate {:+.1}%",
-                i+1, p.tau, p.sens, p.tighten, p.discount, p.eta_max, p.accel, cost(*c,lambda), g);
+        println!("| ∞ (no gate) | Ewma{} s{} t{} d{} | {:.4} | {:.2} | {:+.1} | {} |",
+            unc.0.tau, unc.0.sens, unc.0.tighten, unc.0.discount, cost(unc.1,lambda), unc.3, unc.2,
+            if unc.0.tau == edge_tau { "YES (corner)" } else { "no" });
+    }
+    for k in [1.5f64, 2.0, 3.0] {
+        let pass: Vec<&(P,(f64,f64,f64,f64),f64,f64)> = results.iter()
+            .filter(|(_,_,g,rr)| *g <= GATE_PCT && *rr <= k).collect();
+        if let Some(c) = pass.iter().min_by(|a,b| cost(a.1,lambda).partial_cmp(&cost(b.1,lambda)).unwrap()) {
+            println!("| {} | Ewma{} s{} t{} d{} eta{} acc{} | {:.4} | {:.2} | {:+.1} | {} |",
+                k, c.0.tau, c.0.sens, c.0.tighten, c.0.discount, c.0.eta_max, c.0.accel,
+                cost(c.1,lambda), c.3, c.2, if c.0.tau == edge_tau { "YES" } else { "no (interior)" });
+        } else {
+            println!("| {} | (none pass) | | | | |", k);
         }
     }
+    println!("\nReading: tighter k (more responsive required) ⇒ shorter τ / higher fire rate;");
+    println!("looser k ⇒ sleepier. The corner (τ-edge) is excluded once k binds. The operator");
+    println!("picks k from the same economics as c (how long a degrading miner may run mis-diff'd).");
+    println!("\nNOTE: −10% is the binding stimulus; re-run with the −25% gate as the robustness check.");
 }
