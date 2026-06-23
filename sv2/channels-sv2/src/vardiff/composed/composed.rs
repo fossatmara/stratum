@@ -141,6 +141,27 @@ where
             uncertainty: snap.uncertainty,
         });
 
+        // Per-decision instrumentation. `e = ln(Ĥ/H)` is the paper's tracking
+        // error (§1): the controller's belief over true hashrate, in log units.
+        // Logged EVERY cycle (not only on fires) so that the steady-state
+        // settle error is observable between the champion's sparse fires —
+        // which is exactly the quantity the per-retarget target log cannot pin
+        // down. `vardiff=debug` surfaces it.
+        let e = if hashrate > 0.0 && snap.h_estimate > 0.0 {
+            (snap.h_estimate as f64 / hashrate as f64).ln()
+        } else {
+            f64::NAN
+        };
+        tracing::debug!(
+            target: "channels_sv2::vardiff",
+            e, delta, threshold,
+            h_estimate = snap.h_estimate,
+            h_true = hashrate,
+            spm = shares_per_minute,
+            will_fire = delta >= threshold,
+            "vardiff decision"
+        );
+
         if delta < threshold {
             return Ok(None);
         }
@@ -157,6 +178,19 @@ where
         // Notify estimator of the fire.
         self.timestamp_of_last_update = now;
         self.estimator.on_fire(new_hashrate, hashrate);
+
+        // `s = ln(Ĥ⁺/Ĥ⁻)` is the log-step (§1): the fire's size and sign
+        // (s>0 tighten, s<0 ease) — the gentleness/direction signal.
+        let s = if new_hashrate > 0.0 && snap.h_estimate > 0.0 {
+            (new_hashrate as f64 / snap.h_estimate as f64).ln()
+        } else {
+            f64::NAN
+        };
+        tracing::debug!(
+            target: "channels_sv2::vardiff",
+            s, new_hashrate, h_was = snap.h_estimate,
+            "vardiff fire"
+        );
 
         Ok(Some(new_hashrate))
     }
