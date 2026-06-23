@@ -362,7 +362,14 @@ impl Estimator for EwmaEstimator {
         EstimatorSnapshot {
             h_estimate,
             realized_share_per_min,
-            n_shares: self.shares_count(),
+            // RAW per-tick share count (the `pending` observed this window,
+            // captured BEFORE the flush to 0 above). This is the un-smoothed
+            // count whose variance Theorem 2 bounds (`Var ≥ 1/(r*τ)`) — the
+            // quantity the lever/band-scaling claim is actually about, upstream
+            // of the EWMA smoothing that `realized_share_per_min` has been
+            // through. `shares_count()` here would read 0 (post-flush), so use
+            // `pending` directly.
+            n_shares: pending,
             dt_secs,
             uncertainty: None,
         }

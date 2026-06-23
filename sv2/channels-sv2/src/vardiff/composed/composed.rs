@@ -165,6 +165,14 @@ where
             e,
             realized_spm = snap.realized_share_per_min,
             r_star = shares_per_minute,
+            // RAW per-window share count (un-smoothed). Var(raw_count) is the
+            // quantity Theorem 2 bounds (1/(r*τ)); the lever/band-scaling claim
+            // must be tested against the SD of THIS across a flat-belief window,
+            // NOT against the SD of `e` (which is smoothed by the EWMA and so is
+            // silent on the floor's rate-scaling). Expect SD(raw_count) to scale
+            // ≈ √(r*τ) with rate at fixed window.
+            raw_count = snap.n_shares,
+            dt_secs = snap.dt_secs,
             delta, threshold,
             h_belief = hashrate,
             h_delivered_est = snap.h_estimate,
