@@ -1,118 +1,134 @@
-# A Derivation of the Vardiff Evaluation Metric
+# Vardiff at the Information Floor: What a Share-Rate Controller Can and Cannot Do
 
-**Abstract.** A variable-difficulty (vardiff) controller is unusual: the
-only thing it can measure is its own tracking error. From that one fact we
-derive the quantities used to score vardiff algorithms in this crate. Two
-theorems (the measurement identity and an information floor) show the
-problem reduces to two coordinates — tracking error and control effort.
-One lemma shows the obvious error norm (squared) is blind to the failure
-operators care about most, forcing a linear norm plus a separate detection
-term. A short asymmetry argument fixes the directional weights. The result
-is: **linear log-error regret (split by sign) + quadratic effort (split by
-direction) + a detection rate, scored per scenario class.** The model's
-behavioral predictions — counter-age dependence, and the champion beating
-the incumbent on a live hashrate drop — are confirmed on real mining
-hardware (§9); the cost-model weights remain a calibrated judgment.
+**Abstract.** A variable-difficulty (vardiff) controller is unusual: the only
+thing it can measure is its own tracking error. We take that one fact to its
+conclusion and arrive at a result that is structural, not a horse race. Two
+theorems — a *measurement identity* (the observable depends on hashrate only
+through the controller's error) and an *information floor* (the error estimate's
+variance is Cramér–Rao-bounded by `1/(r*τ)`) — together imply that across the
+operating band (`r* ≈ 4–30` spm) **every reasonable controller is pinned to the
+same floor**: the spread between best and worst is a narrow band in composite
+cost — about 12% — the residual differences are *gentleness and safety* rather
+than *agility*, and the one lever that moves the floor is the share rate `r*`
+itself. The metric we use
+to score algorithms — **linear sign-split tracking regret + direction-split
+effort, per scenario class, with detection reported separately as a
+rate-dependent diagnostic rather than folded into the production score** — is
+derived from the same two theorems; an earlier version that scored detection
+inside the production scalar was corrected after measurement showed the term is
+floor-saturated (carries no ranking signal) below ~10 spm.
 
-Convention: *Theorem* and *Lemma* are reserved for results genuinely
-proved from the model (Theorems 1–2, the §4 Lemma, §6(ii)); everything
-else load-bearing is an *Argument*, *Rationale*, or *Choice* — our
-reasoning or our decisions — and *Observation* is a fact about particular
-algorithms established in simulation (named inline). Mathematical claims
-are never "validated numerically": they are proved or they are not. A
-future, more formal treatment would restore Theorem framing to the
-Arguments and sketch their proofs.
+The champion we ship, `Ewma360/s1.5`, is **not the hero of this story**: it is
+the *existence proof* that the safe corner of the achievable frontier is
+occupiable. It is deliberately the **gentlest decline-safe configuration**, and
+it pays for that with slow transients — ~65-min cold-start ramp and ~28-min
+detection latency at 12 spm — which read as a regression only if one expects "our
+best algorithm" and read as the thesis once one expects "the gentlest config
+that is provably safe on a sustained decline." The discipline that produced this
+is itself part of the result: three candidate hero claims were drawn and killed
+by measurement before they could be published (§8), and the surviving claims are
+trustworthy precisely because the casualties are named rather than buried.
+
+Scope, stated once and honestly: the *behavioral* layer (counter-age blindness,
+champion-beats-incumbent on a live drop) is confirmed on real hardware for the
+*previous* champion; the present champion is a simulation re-selection under a
+corrected metric, and its decline response is hardware-confirmed *in direction*
+(it eases on the safe side, no rejection runaway) but its settled offset and its
+behavior on a slow *moderate* decline remain simulation results (§9.4). The
+cost-model weights remain a calibrated judgment.
+
+Convention: *Theorem* and *Lemma* are reserved for results genuinely proved from
+the model (Theorems 1–2, the §4 Lemma, §6(ii)); everything else load-bearing is
+an *Argument*, *Rationale*, or *Choice* — our reasoning or our decisions — and
+*Observation* is a fact about particular algorithms established in simulation
+(named inline). Mathematical claims are never "validated numerically": they are
+proved or they are not.
 
 Note on terminology: *regret* here means the time-integrated tracking loss
-`∫|e|`, **not** online-learning regret against a comparator; read it as
-"tracking loss."
+`∫|e|`, **not** online-learning regret against a comparator; read it as "tracking
+loss."
 
 ---
 
 ## 1. The problem, and the model
 
-Variable difficulty exists because the miners on one pool span many orders
-of magnitude in hashrate, while the pool needs every connection to deliver
-shares at roughly the same rate. A share is a proof-of-work that clears a
-per-connection difficulty `D`; a miner of hashrate `H` clears it and
-submits valid shares at a rate proportional to `H/D`. A single global `D`
-would bury the pool under shares from its biggest miners and starve its
-smallest of shares entirely — and starving a connection of shares means no
-timely hashrate estimate for it and a high-variance, lumpy reward.
-Per-connection vardiff fixes this by moving each `D` so that connection's
-share rate stays near a target `r*`. That makes `r*` the one design
-constant doing three jobs at once: it caps the bandwidth and CPU each
-connection costs, it fixes the variance of the pool's per-miner hashrate
-estimate, and it bounds the miner's reward variance. The controller's whole
-job is to hold the realized rate at `r*` as `H` drifts — which is exactly
-what the rest of this document scores. This also fixes the floor of the
-operating range: a connection delivering only a few shares per minute has a
-hashrate estimate so noisy (its band is `1/√(r*τ)`, §3) that reward
-variance and detection both suffer regardless of vardiff — which is *why*
-`r*` is set well above that floor, and why the controller's worst regime
-(§9, the sub-guard analysis) is one the system is provisioned to avoid.
+Variable difficulty exists because the miners on one pool span many orders of
+magnitude in hashrate, while the pool needs every connection to deliver shares at
+roughly the same rate. A share is a proof-of-work that clears a per-connection
+difficulty `D`; a miner of hashrate `H` clears it and submits valid shares at a
+rate proportional to `H/D`. A single global `D` would bury the pool under shares
+from its biggest miners and starve its smallest of shares entirely — and starving
+a connection of shares means no timely hashrate estimate for it and a
+high-variance, lumpy reward. Per-connection vardiff fixes this by moving each `D`
+so that connection's share rate stays near a target `r*`.
 
-Two modeling choices fall out of the physics; neither is a free knob.
-**Share arrivals are Poisson** because each hash is an independent trial
-with a tiny success probability against an enormous number of trials per
-window, so over any window short enough that `H` is steady, the count is
-Poisson with rate equal to hashrate over work-per-share. Under `D = Ĥ/r*`
-that rate is `r_obs = r*·H/Ĥ` — equation (1) — with the proportionality
-constant folded into the units of `D`, which is why nothing downstream
-depends on it. And **the natural coordinate is `e = ln(Ĥ/H)`** because the
-controller only ever acts on `D` multiplicatively, the only thing it can
-observe depends on `Ĥ` solely through the ratio `H/Ĥ`, and only in log
-units is a 2× over-difficulty the same distance from target as a 2×
-under-difficulty. Working in `e` turns a retarget into an additive step `s`
-and makes the two signs honest, symmetric coordinates instead of artifacts
-of where you sit on the difficulty axis. A metric written in raw `D` or raw
-share rate would punish the same percentage error differently depending on
-absolute difficulty — exactly the bug log coordinates remove.
+That makes `r*` the one design constant doing three jobs at once: it caps the
+bandwidth and CPU each connection costs, it fixes the variance of the pool's
+per-miner hashrate estimate, and it bounds the miner's reward variance. The
+controller's whole job is to hold the realized rate at `r*` as `H` drifts. **`r*`
+is also, as the rest of this document shows, the only quantity that moves the
+fundamental limit on how well any controller can do that job** — which is why it
+recurs from the model here (§1) to the floor (§3) to the lever (§8). A connection
+delivering only a few shares per minute has a hashrate estimate so noisy (its
+band is `1/√(r*τ)`, §3) that reward variance and detection both suffer regardless
+of vardiff — which is *why* `r*` is set above that floor, and why the
+controller's worst regime (§9, the sub-guard analysis) is one the system is
+provisioned to avoid.
 
-This is an *evaluation* model, not a control-design model. To rank
-algorithms we need only the path each produces — the sequence of `(error,
-did-it-fire, step-size)` — and the Poisson-in-log model produces exactly
-that: cheaply, repeatably, and identically for an algorithm whose internals
-we can read and one we cannot, because the only signal any controller has
-is a function of `e` alone (Theorem 1). That is what lets one metric rank
-the whole field without privileged knowledge of anyone's implementation.
+Two modeling choices fall out of the physics; neither is a free knob. **Share
+arrivals are Poisson** because each hash is an independent trial with a tiny
+success probability against an enormous number of trials per window, so over any
+window short enough that `H` is steady, the count is Poisson with rate equal to
+hashrate over work-per-share. Under `D = Ĥ/r*` that rate is `r_obs = r*·H/Ĥ` —
+equation (1) — with the proportionality constant folded into the units of `D`,
+which is why nothing downstream depends on it. And **the natural coordinate is `e
+= ln(Ĥ/H)`** because the controller only ever acts on `D` multiplicatively, the
+only thing it can observe depends on `Ĥ` solely through the ratio `H/Ĥ`, and only
+in log units is a 2× over-difficulty the same distance from target as a 2×
+under-difficulty. Working in `e` turns a retarget into an additive step `s` and
+makes the two signs honest, symmetric coordinates instead of artifacts of where
+you sit on the difficulty axis.
 
-What the model leaves out — because the metric covers exactly the
-situations the model can express. It assumes `H` is constant within a
-window (true over one retarget, false across a real ramp, which is why
-scenarios drive `H(t)` explicitly rather than leaning on the within-window
-assumption); one worker per connection (real connections pool many workers,
-raising the effective rate and reshaping the noise); retargets that are
-instant and lossless except for the in-flight work the §6 asymmetry already
-charges for (real retargets fight network and propagation latency,
-producing stale shares the model does not separately represent); and a
-continuous difficulty with no floor and no rate limit on how often it can
-change (real pools clamp `D` from below and cap fire cadence). The first is
-handled by construction; two of the rest — the cadence cap and the
-stale-share channel — land on the effort term and are taken up in §7.
+This is an *evaluation* model, not a control-design model. To rank algorithms we
+need only the path each produces — the sequence of `(error, did-it-fire,
+step-size)` — and the Poisson-in-log model produces exactly that: cheaply,
+repeatably, and identically for an algorithm whose internals we can read and one
+we cannot, because the only signal any controller has is a function of `e` alone
+(Theorem 1). That is what lets one metric rank the whole field without privileged
+knowledge of anyone's implementation.
+
+What the model leaves out — because the metric covers exactly the situations the
+model can express. It assumes `H` is constant within a window (true over one
+retarget, false across a real ramp, which is why scenarios drive `H(t)`
+explicitly); one worker per connection (real connections pool many workers,
+raising the effective rate and reshaping the noise); retargets that are instant
+and lossless except for the in-flight work the §6 asymmetry already charges for;
+and a continuous difficulty with no floor and no rate limit on how often it can
+change (real pools clamp `D` from below and cap fire cadence). The cadence cap
+and the stale-share channel land on the effort term and are taken up in §7.
 Anything beyond this list is a coverage gap to declare, not a hole in the
 derivation.
 
 ### Setup
 
-A **miner** has true hashrate `H > 0`. The **controller** holds a belief
-`Ĥ > 0` and sets difficulty `D = Ĥ/r*`, where `r*` is the target share
-rate (shares/min). Shares then arrive as a Poisson process of rate
+A **miner** has true hashrate `H > 0`. The **controller** holds a belief `Ĥ > 0`
+and sets difficulty `D = Ĥ/r*`, where `r*` is the target share rate
+(shares/min). Shares then arrive as a Poisson process of rate
 
 ```
   r_obs = r* · H/Ĥ.                                                  (1)
 ```
 
-Over a window of `τ` minutes the controller sees a single number: the
-share count `N ~ Poisson(λ)`, `λ = r_obs·τ`. It periodically **fires** —
-rescales `Ĥ` by a factor, i.e. adds a **log-step** `s = ln(Ĥ⁺/Ĥ⁻)` to its
-belief; `s > 0` *tightens*, `s < 0` *eases*.
+Over a window of `τ` minutes the controller sees a single number: the share count
+`N ~ Poisson(λ)`, `λ = r_obs·τ`. It periodically **fires** — rescales `Ĥ` by a
+factor, i.e. adds a **log-step** `s = ln(Ĥ⁺/Ĥ⁻)` to its belief; `s > 0`
+*tightens*, `s < 0` *eases*.
 
-**Definition 1 (error coordinate).** The controller acts multiplicatively
-(it scales `Ĥ`) and, by (1), the observable depends on `Ĥ` only through the
-ratio `H/Ĥ`. A multiplicative quantity is linearized by its logarithm, and
-only in log coordinates are an over- and an under-shoot by the same
-*factor* equidistant from the target. So work in
+**Definition 1 (error coordinate).** The controller acts multiplicatively (it
+scales `Ĥ`) and, by (1), the observable depends on `Ĥ` only through the ratio
+`H/Ĥ`. A multiplicative quantity is linearized by its logarithm, and only in log
+coordinates are an over- and an under-shoot by the same *factor* equidistant from
+the target. So work in
 
 ```
   e = ln(Ĥ/H),     so that     r_obs/r* = e^{−e}.                    (2)
@@ -123,120 +139,129 @@ control goal is `e → 0`.
 
 A **scenario** specifies `H(t)` and the initial belief; the named classes
 (`baseline.rs`) are *cold-start*, *stable*, *step ±p%*, *settled-aged drop*
-(truth holds long enough to mature the share counter, then drops), and
-*sustained decline* (a continuous `−ρ %/hr` ramp — the safety scenario of
-§9). A **metric** ranks algorithms by averaging over a fixed ensemble of
-classes.
+(truth holds long enough to mature the share counter, then drops), and *sustained
+decline* (a continuous `−ρ %/hr` ramp — the safety scenario of §9). A **metric**
+ranks algorithms by averaging over a fixed ensemble of classes, **per class,
+never pooled**, and — as §3 forces — **per share rate `r*`**, because `r*` moves
+the floor that everything else is measured against.
 
 ---
 
 ## 2. The controller measures only its own error
 
-**Theorem 1.** *The sole observable `N` has a distribution depending on `H`
-and `Ĥ` only through the error `e`.*
+**Theorem 1.** *The sole observable `N` has a distribution depending on `H` and
+`Ĥ` only through the error `e`.*
 
-*Proof.* By (1)–(2), `N ~ Poisson(r*τ·e^{−e})`. The parameter is a function
-of `e` alone. ∎
+*Proof.* By (1)–(2), `N ~ Poisson(r*τ·e^{−e})`. The parameter is a function of
+`e` alone. ∎
 
-There is no measurement of the miner separate from the error being
-controlled. Every familiar quality statistic — accuracy, jitter, reaction,
-overshoot — is therefore a functional of the one scalar process `e(t)`
-together with the fire sequence the controller derives from it. This is
-why a small set of `e`-based terms can suffice, and why the metric is
-written entirely in `e` and `s`.
+There is no measurement of the miner separate from the error being controlled.
+Every familiar quality statistic — accuracy, jitter, reaction, overshoot — is
+therefore a functional of the one scalar process `e(t)` together with the fire
+sequence the controller derives from it. This is why a small set of `e`-based
+terms can suffice, and why the metric is written entirely in `e` and `s`.
 
 ---
 
-## 3. Precision costs time, and time costs agility
+## 3. Precision costs time, and time costs agility — the result everything rests on
 
-**Theorem 2 (information floor).** *Any unbiased estimate of `e` from a
-window of `τ` minutes has `Var(ê) ≥ 1/(r*τ)`.*
+**Theorem 2 (information floor).** *Any unbiased estimate of `e` from a window of
+`τ` minutes has `Var(ê) ≥ 1/(r*τ)`.*
 
-*Proof.* The window's count is `N ~ Poisson(λ)`, `λ = r*τ·e^{−e}`. For a
-Poisson observation the log-likelihood in `e` is `N ln λ − λ`, with score
-`∂_e(N ln λ − λ) = (N/λ − 1)·λ' = λ − N` since `λ' = −λ`. The Fisher
-information is `E[(λ−N)²] = Var(N) = λ`; at the operating point `e≈0`,
-`λ = r*τ`. Cramér–Rao gives `Var(ê) ≥ 1/(r*τ)`. ∎
+*Proof.* The window's count is `N ~ Poisson(λ)`, `λ = r*τ·e^{−e}`. For a Poisson
+observation the log-likelihood in `e` is `N ln λ − λ`, with score `∂_e(N ln λ −
+λ) = (N/λ − 1)·λ' = λ − N` since `λ' = −λ`. The Fisher information is `E[(λ−N)²] =
+Var(N) = λ`; at the operating point `e≈0`, `λ = r*τ`. Cramér–Rao gives `Var(ê) ≥
+1/(r*τ)`. ∎
 
-(The crate encodes this as `SettledAccuracy::poisson_floor`,
-`metrics.rs:864` — `1/√(r*τ)` as a percentile.)
+(The crate encodes this as `SettledAccuracy::poisson_floor`, `metrics.rs:864` —
+`1/√(r*τ)` as a percentile.)
 
-**Corollary (the central trade-off).** Steady-state precision improves
-only by enlarging the averaging window `τ`; but the same `τ` is the lag in
-following a real change. **Accuracy and agility are bought from one budget
-at a fixed rate `r*`.** Two consequences:
+This is the load-bearing result of the entire document. Read structurally, it
+says the controller's information per unit time is fixed by `r*` alone; a
+controller can spend that information on precision (long window) or on agility
+(short window), but it cannot manufacture more of it. Three consequences follow,
+and they are the spine of everything below.
 
-- *The apparent quality axes are one trade-off.* The estimator's window
-  trades accuracy against lag; the fire threshold trades false alarms
-  against detection delay; the retarget gain trades convergence against
-  overshoot. Each is one knob on the same accuracy-vs-agility line.
-  Scoring six such projections with equal weight (the deprecated
-  `EqualWeightFitness`) rewards the *middle* of the trade-off curve, not
-  the *frontier*. **Observation (commit `31a9dbc1`):** four independent
-  parameterizations of the pipeline all saturate at the same quality
-  ≈0.55 — one wall seen four ways. So score the frontier's own
-  coordinates: **tracking error** and **control effort**, nothing derived
-  from them.
-- *A steady offset has a price, not a defect.* An algorithm sitting short
-  of the floor is paying for it elsewhere (agility, effort); §7 uses this.
+**Corollary (the central trade-off).** Steady-state precision improves only by
+enlarging the averaging window `τ`; but the same `τ` is the lag in following a
+real change. **Accuracy and agility are bought from one budget at a fixed rate
+`r*`.**
+
+- *The apparent quality axes are one trade-off.* The estimator's window trades
+  accuracy against lag; the fire threshold trades false alarms against detection
+  delay; the retarget gain trades convergence against overshoot. Each is one knob
+  on the same accuracy-vs-agility line. Scoring six such projections with equal
+  weight (the deprecated `EqualWeightFitness`) rewards the *middle* of the
+  trade-off curve, not the *frontier*. **Observation (commit `31a9dbc1`):** four
+  independent parameterizations of the pipeline all saturate at the same quality
+  ≈0.55 — one wall seen four ways. So score the frontier's own coordinates:
+  **tracking error** and **control effort**, nothing derived from them.
+- *A steady offset has a price, not a defect.* An algorithm sitting short of the
+  floor is paying for it elsewhere (agility, effort); §10 uses this.
+- *The field is flat across the operating band; detection is floor-limited at
+  production rates.* This is the structural headline, and it is a direct reading
+  of the bound: when `r*τ` is small (production rates, monitoring-length windows),
+  the noise band
+  `1/√(r*τ)` is wide enough that controllers differing in window or threshold
+  produce nearly the same achievable tracking error and nearly the same
+  (in)ability to see a small change. §8 measures this directly — a ~12% best-to-
+  worst spread in composite cost across the 4–30 spm operating band, and a
+  detection signal that is statistically zero below ~10 spm and opens up only as
+  `r*` rises (Figure, §8.4: the lever).
 
 The floor `1/√(r*τ)` is a **noise band** — one standard deviation of an
-*unbiased* estimator — not a systematic offset. The ideal estimator is not
-biased downward (its log-of-count Jensen bias here is `~ −1/(2r*τ)`,
-negligible); when §8/§10 quote the accuracy ceiling as "≈−0.8%," that is the
-*width* of this band at the operating `r*τ`, the scatter a perfect tracker
-still shows, against which a real algorithm's *systematic* offset (§10) is
-measured.
+*unbiased* estimator — not a systematic offset. When §8/§10 quote an accuracy
+ceiling, that is the *width* of this band at the operating `r*τ`, the scatter a
+perfect tracker still shows, against which a real algorithm's *systematic* offset
+(§10) is measured.
 
-**The achievable frontier, in one line each.** Two floors follow from (3.1)
-and bound what *any* algorithm can do; the sub-guard analysis (§9) places
-the champion against them.
+**The achievable frontier, in one line each.** Two floors follow from Theorem 2
+and bound what *any* algorithm can do; the §9 sub-guard analysis places the
+champion against them.
 
-- *Static (stable load).* On steady `H`, the cost-minimizing settled offset
-  under the §6 asymmetry is not zero but a quantile of the noise band:
-  `e* ≈ −0.67·σ`, `σ = 1/√(r*τ)` (the point where the 3×-weighted
-  over-difficulty tail balances the 1×-weighted under tail). At 60 spm,
-  `σ≈8%`; at 2 spm with `τ≈2.5 min`, `r*τ≈5` so `σ≈45%` — the band swamps
-  any few-percent offset, i.e. at low share rate the asymmetry-optimal
-  target is itself lost in the noise.
+- *Static (stable load).* On steady `H`, the cost-minimizing settled offset under
+  the §6 asymmetry is not zero but a quantile of the noise band: `e* ≈ −0.67·σ`,
+  `σ = 1/√(r*τ)`. At 60 spm, `σ≈8%`; at 2 spm with `τ≈2.5 min`, `r*τ≈5` so
+  `σ≈45%` — the band swamps any few-percent offset, i.e. at low share rate the
+  asymmetry-optimal target is itself lost in the noise.
 - *Dynamic (declining load).* On a ramp of `ρ` per minute, an estimator of
-  effective averaging time `τ_eff` lags truth by `≈ ρ·τ_eff`, while its
-  noise is `1/√(r*τ_eff)`. Shrinking `τ_eff` to cut the lag widens the
-  noise; their sum
-  `L(τ_eff) ≈ ρ·τ_eff + z/√(r*τ_eff)`
-  has a floor at `τ_eff ∝ (z/ρ)^{2/3}·r*^{-1/3}` — a minimum tracking error
-  no algorithm beats on a decline of that rate and share count. This is the
-  bound the §9 sub-guard cells are read against: the champion tracks it;
-  classic falls off it (paying the lag in the dangerous direction).
+  effective averaging time `τ_eff` lags truth by `≈ ρ·τ_eff`, while its noise is
+  `1/√(r*τ_eff)`. Shrinking `τ_eff` to cut the lag widens the noise; their sum
+  `L(τ_eff) ≈ ρ·τ_eff + z/√(r*τ_eff)` has a floor at `τ_eff ∝
+  (z/ρ)^{2/3}·r*^{-1/3}` — a minimum tracking error no algorithm beats on a
+  decline of that rate and share count. This is the bound the §9 sub-guard cells
+  are read against, and it is the physics behind the τ-safety-valley of §8: too
+  long a window lags a sustained decline into the dangerous direction, too short
+  a window is too noisy to act on, and the safe window is the minimum of `L`.
 
 ---
 
 ## 4. The error norm: squared is blind, linear is not
 
-Tracking cost is `∫ f(e) dt` for some norm `f`. The choice of `f` is a
-judgment about how harm scales with error — but one judgment is
-inadmissible.
+Tracking cost is `∫ f(e) dt` for some norm `f`. The choice of `f` is a judgment
+about how harm scales with error — but one judgment is inadmissible.
 
 **Lemma (blindness of the square).** *A persistent, undetected fractional
-hashrate drop of size `g` produces a steady error `e = −ln(1−g) = g +
-O(g²)`. Under `f(e)=e²` it costs `e² = g² + O(g³)`; under `f(e)=|e|` it
-costs `|e| = g + O(g²)`.*
+hashrate drop of size `g` produces a steady error `e = −ln(1−g) = g + O(g²)`.
+Under `f(e)=e²` it costs `e² = g² + O(g³)`; under `f(e)=|e|` it costs `|e| = g +
+O(g²)`.*
 
-*Proof.* The drop sends `H → (1−g)H` with `Ĥ` fixed, so `e = ln(Ĥ/((1−g)H))
-= −ln(1−g)`; expand. ∎
+*Proof.* The drop sends `H → (1−g)H` with `Ĥ` fixed, so `e = ln(Ĥ/((1−g)H)) =
+−ln(1−g)`; expand. ∎
 
-Operational harm from a difficulty error (lost or excess work) scales with
-its **magnitude** `g`, i.e. linearly. The squared norm undervalues it by a
-factor `1/g`, which diverges as `g → 0`: a small *persistent* leak — a
-failing or throttling ASIC, the case operators care about most — is
-essentially free under `e²`. **Observation (`regret-effort`):** an
-algorithm that detects a −10% drop ~1% of the time scores *better* on `e²`
-than one that detects it always, because the miss costs only `(ln0.9)² ≈
-0.01`/min. The linear norm removes this blind spot (the same miss costs
-`≈0.10`/min) and only reorders the middle of the ranking, never the top.
+Operational harm from a difficulty error (lost or excess work) scales with its
+**magnitude** `g`, i.e. linearly. The squared norm undervalues it by a factor
+`1/g`, which diverges as `g → 0`: a small *persistent* leak — a failing or
+throttling ASIC, the case operators care about most — is essentially free under
+`e²`. **Observation (`regret-effort`):** an algorithm that detects a −10% drop
+~1% of the time scores *better* on `e²` than one that detects it always, because
+the miss costs only `(ln0.9)² ≈ 0.01`/min. The linear norm removes this blind
+spot (the same miss costs `≈0.10`/min) and only reorders the middle of the
+ranking, never the top.
 
-**Choice 1.** Use `f(e) = |e|`. Report it split by sign, since the two
-signs carry different harm (§6):
+**Choice 1.** Use `f(e) = |e|`. Report it split by sign, since the two signs
+carry different harm (§6):
 
 ```
   regret_over  = ⟨|e|⟩ over time with e > 0       (over-difficulty)
@@ -245,373 +270,407 @@ signs carry different harm (§6):
 
 ---
 
-## 5. Detection is a separate axis, not a smaller `f`
+## 5. Detection is a separate axis — and at production rates the floor flattens it
 
-Linear regret narrows the blind spot but does not close it: a fast
-algorithm with occasional large errors can still outscore a chronically
-blind one on `∫|e|`. The deeper reason is structural.
+Linear regret narrows the blind spot but does not close it: a fast algorithm with
+occasional large errors can still outscore a chronically blind one on `∫|e|`. The
+deeper reason is structural.
 
-**Argument (detection is not derivable from the scored error paths).**
-*There is no functional `F` with `detection = F(e on stable, e on step)`
-holding across all algorithms.*
+**Argument (detection is not derivable from the scored error paths).** *There is
+no functional `F` with `detection = F(e on stable, e on step)` holding across all
+algorithms.*
 
-*Why.* Catching a small drop requires the share counter to be *young* when
-the drop lands: a matured counter averages the weak post-drop signal
-against a long pre-drop baseline and never crosses threshold. Counter age
-at the drop is determined by the fire history of a *matured, on-target*
-loop — a state the stable scenario (never perturbed) and the step scenarios
-(perturbed while young or with a large signal) never enter. Two controllers
-can therefore produce *identical* stable and step error paths yet differ on
-detection, because they differ only in that matured-counter regime — so no
-`F` on the scored paths can recover it. (A formal version would exhibit
-such a pair explicitly.)
-
-So detection must be carried explicitly:
+*Why.* Catching a small drop requires the share counter to be *young* when the
+drop lands: a matured counter averages the weak post-drop signal against a long
+pre-drop baseline and never crosses threshold. Counter age at the drop is
+determined by the fire history of a *matured, on-target* loop — a state the
+stable scenario (never perturbed) and the step scenarios (perturbed while young
+or with a large signal) never enter. Two controllers can therefore produce
+*identical* stable and step error paths yet differ on detection, because they
+differ only in that matured-counter regime. So detection must be carried
+explicitly:
 
 ```
   detection = P[ fire within W min | counter matured, then −g drop ].
 ```
 
-It is an absolute probability — reported raw, never normalized against the
-candidate set. **Choice 2.** Operationalize as the `settled 60min, −10%`
-cell (`settled_reaction_rate`); **observation (commit `70fcb260`):** this
-reproduces the known counter-age failure (one algorithm 30%→1% across
-share rates, another ~0%), so it measures the real mode.
+**But detection must be measured against its own false-alarm rate, and at
+production rates that correction sends it to zero.** The honest quantity is not
+the raw fire probability — which a twitchy controller inflates by firing often
+regardless of any drop — but the **excess**:
+
+```
+  EXCESS = P[fire within W | −g drop] − P[fire within W | no drop].
+```
+
+**Observation (`detection-control`, `excess-lever`):** at production rates the
+information floor (Theorem 2) is so coarse that a −10% drop is statistically
+invisible within a monitoring window — `EXCESS = 0.00` at a 60-min window and
+`+0.05` at a 15-min window at 4–6 spm, *for the whole field*. The raw detection
+number is then an artifact of fire cadence (the window straddles scheduled
+settling fires whether or not a drop occurred), which is exactly the trap an
+earlier version of this metric fell into. The correction has two parts, and both
+matter:
+
+**Choice 2 (corrected).** *Detection is removed from the production score.* Below
+~10 spm it is floor-saturated (Theorem 2) and carries no ranking signal; folding
+it into the scalar there merely rewards twitchiness. It is instead reported as a
+**rate-dependent diagnostic** — `EXCESS` versus `r*` — where it does discriminate
+(§8, the lever): the same `EXCESS` climbs monotonically to `+0.75` at 60 spm as
+the floor recedes. Detection thus stops being a scoring axis and becomes the
+visible measure of what raising `r*` buys.
 
 ---
 
 ## 6. The two directions are not symmetric
 
-**Argument.** *Over-difficulty is worse than under-difficulty, and
-tightening is worse than easing.*
+**Argument.** *Over-difficulty is worse than under-difficulty, and tightening is
+worse than easing.*
 
-*Why.* (i) `e < 0` (difficulty low): shares run a little fast; all work
-stays valid; cost is mild inefficiency. `e > 0` (difficulty high): the
-connection is starved of valid shares, which inflates both the miner's
-reward variance and the pool's hashrate-estimate variance for it — risking
-an offline misread — and compounds when `H` is genuinely falling. (ii)
-[proved] A tightening fire (`s>0`) invalidates in-flight shares aimed at
-the old, easier target — fraction `1 − e^{−s} > 0` lost; an easing fire
-leaves prior work valid. ∎
+*Why.* (i) `e < 0` (difficulty low): shares run a little fast; all work stays
+valid; cost is mild inefficiency. `e > 0` (difficulty high): the connection is
+starved of valid shares, which inflates both the miner's reward variance and the
+pool's hashrate-estimate variance for it — risking an offline misread — and
+compounds when `H` is genuinely falling. (ii) [proved] A tightening fire (`s>0`)
+invalidates in-flight shares aimed at the old, easier target — fraction `1 −
+e^{−s} > 0` lost; an easing fire leaves prior work valid. ∎
 
-This proves the *direction* of the asymmetry. Its *magnitude* is a
-judgment. **Choice 3:** weight both at `3:1` (over:under and up:down),
-matching the production `tighten_multiplier = 3` (commit `a1d3fa7b`).
-**Observation (`champion-weights`):** the best algorithm is the same for
-every ratio in `[1:1, 4:1]`; only an ungrounded `5:1` changes it. So the
-ranking does not hinge on the exact value.
+This proves the *direction* of the asymmetry. Its *magnitude* is a judgment.
+**Choice 3:** weight both at `3:1` (over:under and up:down), matching the
+production `tighten_multiplier = 3` (commit `a1d3fa7b`). **Observation
+(`champion-weights`):** the best algorithm is the same for every ratio in `[1:1,
+4:1]`; only an ungrounded `5:1` changes it. So the ranking does not hinge on the
+exact value.
 
-*The under-difficulty side has its own cost, and the metric only partly
-prices it.* Under-difficulty (`e<0`) is not free: at the realized rate
-`r = r*·e^{−e}`, an `e=−0.07` offset runs the connection ~7% over its
-target share rate, permanently — and bounding exactly that per-connection
-load is *why* `r*` is set where it is (§1). The resource cost (extra
-bandwidth, CPU, share-accounting) is linear in excess volume, and since
-`r − r* ≈ −r*·e` near the operating point, **linear in excess volume is to
-first order linear in `|e|`** — so it adds no new functional form, only a
-one-sided increase to the `regret_under` coefficient. The current metric
-charges this as part of `regret_under = ⟨|e|⟩` at weight 1, but does not
-*separately* price the share-volume resource cost beyond that, and the
-`3:1` weight was derived for the death-spiral asymmetry alone. The honest
-consequence: the cost-optimal offset (§10) is the value under a model that
-under-charges the under side, so pricing share volume explicitly can only
-*shrink* it. The magnitude is expected to be modest — for pools run with
-per-connection headroom (the common case) the resource curve is linear and
-far from its convex knee, and a partial offset works the other way (more
-volume tightens the hashrate estimate, `Var ∝ 1/N`, the concave benefit the
-"under is safe" intuition already banks). The exception is a hard
-per-connection quota-with-buffer (flat-then-steep, convex): there the
-correction is large, and that is the regime to model for stressed/older
-hardware. The clean way to settle it is one measured number — marginal cost
-`c` per extra share (CPU-ms / bytes / `$`) from share-accounting telemetry —
-added as `c·r*·max(0,−e)` to the objective; this is left as the one
-external-economics input the simulation cannot supply.
+*The under-difficulty side has its own cost, and the metric only partly prices
+it.* Under-difficulty (`e<0`) is not free: at the realized rate `r = r*·e^{−e}`,
+an `e=−0.07` offset runs the connection ~7% over its target share rate,
+permanently — and bounding exactly that per-connection load is *why* `r*` is set
+where it is (§1). The resource cost (extra bandwidth, CPU, share-accounting) is
+linear in excess volume, and since `r − r* ≈ −r*·e` near the operating point,
+**linear in excess volume is to first order linear in `|e|`** — so it adds no new
+functional form, only a one-sided increase to the `regret_under` coefficient. The
+clean way to settle it is one measured number — marginal cost `c` per extra share
+from share-accounting telemetry — added as `c·r*·max(0,−e)`; this is left as the
+one external-economics input the simulation cannot supply.
 
 ---
 
 ## 7. The metric
 
-Per scenario class, from the trajectory `{(e, fired, s)}` alone — hence
-computable for every algorithm, transparent or opaque
+Per scenario class **and per share rate `r*`**, from the trajectory `{(e, fired,
+s)}` alone — hence computable for every algorithm, transparent or opaque
 (`LogErrorRegret`, `metrics.rs`):
 
 ```
-  regret_over, regret_under  =  ⟨|e|⟩, split by sign of e       (§4)
-  effort_up,  effort_down    =  Σ s², split by sign of s        (below)
-  detection                  =  P[fire | matured, small drop]   (§5)
+  regret_over, regret_under  =  ⟨|e|⟩, split by sign of e            (§4)
+  effort_up,  effort_down    =  Σs² and Σ|s|, split by sign of s     (below)
+  [diagnostic] EXCESS(r*)    =  P[fire|drop] − P[fire|no drop]       (§5, NOT scored below ~10 spm)
 ```
 
-The **five-vector is the primary object**; for ranking only, a *rough
-summary* scalar is
+The **vector is the primary object**; for ranking, the *production* scalar is
 
 ```
   cost = 3·regret_over + 1·regret_under
-       + ρ·(3·effort_up + 1·effort_down)
-       + w·(1 − detection),         ρ = w = ½ (overridable).
+       + ρ·( (3·effort_up + 1·effort_down)_quadratic
+             + λ·(3·effort_up + 1·effort_down)_linear ),     ρ = ½.
 ```
 
-A caveat that keeps the scalar honest: the three families are not
-naturally commensurable — `regret` is a time-average, `effort` is a *sum*
-over fires, `(1−detection)` is `O(1)` — so at `ρ = w = ½` the raw scalar
-is detection-dominated and scales with the window length. To compare scalars
-across window choices, express effort as a rate (mean `s²` per fire, or
-`Σs²/T`) and rescale the three families to comparable ranges before
-weighting. We do not lean on the scalar past coarse ranking; §8 explains
-why, and the five-vector is what is reported.
+Two things changed from the earlier version, both forced by measurement:
+**detection is no longer in the scalar** (§5 — floor-saturated at production
+rates), and **effort now carries a linear `Σ|s|` term alongside `Σs²`**. The
+linear term closes the dual of §4's blind spot: hold `Σs²` fixed, shrink each
+step's amplitude, and raise the fire frequency, and `Σ|s| → ∞` while `Σs² → 0`.
+Lost work is linear in each step (`1 − e^{−s} ≈ s`, §6(ii)), so cumulative lost
+work scales as `Σ|s|`, which the quadratic term cannot see — high-frequency,
+low-amplitude churn would otherwise score as "gentle." The quadratic term still does its own job
+(penalizing overshoot and concentrated actuation — one large retarget costs more
+than several small ones, `S² > k(S/k)²`). `λ` is anchored on principle (a tighten
+of step `s` loses `≈s` of in-flight work, §6(ii), so `Σ|s|` is cumulative
+lost-work in regret's currency; `λ=1` enters it at face value) and the champion
+is stable across `λ ∈ {0,½,1,2}` (§9).
 
-**Effort, and an honest note on its shape.** `effort = Σ s²` penalizes
-churning the difficulty. Squared is the right shape *here* — opposite to
-§4 — because the two terms answer different questions: regret asks "how bad
-is being wrong?" (must not vanish as `e→0`, hence linear), while effort
-penalizes overshoot and concentrated actuation — one large retarget costs
-more than several small ones summing to the same total (`S² > k(S/k)²`), so
-it prefers gentle, distributed correction. It is *not* a model of work lost
-to a tighten — that loss is `1−e^{−s} ≈ s`, linear in the step; the
-lost-work *asymmetry*, not its size, is what the directional split carries.
+*Assumption (fire cadence is capped).* Real pools forbid the churn corner with a
+**minimum inter-fire interval**, which the model adopts as an explicit
+assumption; with the linear effort term *and* the cadence cap, the gentleness
+reading of effort is honest from both sides.
 
-*Assumption (fire cadence is capped).* `Σs²` read as "gentleness" has a
-blind spot that is the exact dual of §4's: hold `Σs²` fixed, shrink each
-step's amplitude, and raise the fire frequency, and the *true* linear lost
-work `Σ|s| ≈ Σs/2` diverges while `Σs²→0` — high-frequency, low-amplitude
-churn would score as "gentle." Real pools forbid this with a **minimum
-inter-fire interval**, which the model adopts as an explicit assumption; it
-bounds fire frequency and closes the blind spot. (Absent that cap, `Σs²`
-should be read purely as overshoot regularization, not as a charge for
-total actuation.)
-
-**Per class, never pooled.** Cold-start cost dwarfs steady-state cost, so a
-pooled average erases every distinction that matters; each class is
-reported on its own.
-
-This metric meets its obligations: it is computable from the trajectory
-for any algorithm; the detection term blocks the blind-but-numerically-fine
-algorithm that defeats a pure-regret score; the asymmetry prices the
-runaway direction; and it contains no free constants beyond the three
-declared `3:1`/`½` weights, which are shown not to swing the ranking.
+**Per class and per rate, never pooled.** Cold-start cost dwarfs steady-state
+cost, and the floor moves with `r*`, so a pooled average erases every distinction
+that matters. This is not bookkeeping: §8 shows the champion is selected by a
+*minimax over `r*`* — best worst-case across the band — precisely because no
+single rate's ranking is the answer.
 
 ---
 
-## 8. Three questions, three views — and why not one number or a radar
+## 8. What the figures show — and what we tried to show and could not
 
-The metric is a five-number vector per scenario class. The question is not
-*how* to draw five numbers — it is *what question each drawing answers* —
-because no single picture answers all of them, and the wrong picture hides
-the exact failure you most need to see. There are three questions, and they
-want three different instruments. All three are built only from the
-trajectory `{(e, fired, s)}`, so they apply to every algorithm.
+The metric is a vector per class per rate. The hard part is not drawing it; it is
+knowing *what claim each picture is allowed to make*. This investigation killed
+three candidate principal figures by measurement before any of them was
+published, and that record is not an embarrassment to hide — it is the strongest
+evidence that the harness was permitted to invalidate its own conclusions. We
+state the casualties first, then the survivors.
 
-**How much total cost? — the scalar.** You need it to rank, and it is
-useless for anything else. A scalar is a time-integral: it gives the total
-but throws away *when* the cost happened and *what kind* it was. Two
-controllers with the same score can be opposites — one twitchy but
-accurate, one calm but blind. Worse, the scalar cannot tell a slow leak
-from a transient: a small error that persists forever and a large error
-that heals in a minute can integrate to the same number, though the first
-quietly drains the operator and the second fixes itself. Hand an engineer
-"0.71" and they cannot tell whether the algorithm is slow to converge,
-biased at rest, or asleep through a drift. So rank with the scalar; never
-debug with it.
+### 8.1 Three premises drawn and killed
 
-**Where does this algorithm spend its budget? — the radar, on a short
-leash.** A radar is the natural reach for "show me the trade-off shape,"
-and an unconstrained one is actively misleading in two ways engineers walk
-straight into. First, its enclosed area depends on the *order* of the axes
-— permute the spokes and the same data draws a different polygon with a
-different area — so "bigger area is better," which is how everyone reads a
-radar, is an artifact of layout, not a real aggregate. Second, best-in-set
-normalization rescales every vertex whenever the candidate set changes, so
-the same algorithm looks different depending on who else is in the
-comparison, and you need a deliberately bad strawman just to make the
-spread visible. The regret-radar (`regret-radar`) sidesteps both by
-construction: a **fixed reference algorithm** — the classic vardiff you
-already run — sits on a mid-ring; every contender reads directly as "beats
-it / loses to it" on each axis (`ref/(ref+cost)`); detection is plotted raw
-as a probability; and there are no invented axis ceilings (the O4
-obligation). The §3 corollary is what licenses a radar at all: its five
-axes — **tracking** (`−regret`), **gentleness** (`−effort`), **detection**,
-**over-difficulty safety** (`−regret_over`), **tighten-care**
-(`−effort_up`) — are not arbitrary but the frontier coordinates the six old
-ones collapsed into. Constrained this way it answers one genuinely useful
-question — does this algorithm spend its budget on accuracy, gentleness, or
-safety? — and a companion panel on the familiar measurements (convergence,
-settled accuracy, reaction, jitter, per-axis log-scaled) bridges it to
-numbers people already have instincts about. But keep its limits in view:
-it is still five numbers, and it still cannot show time. *What it shows
-here:* the champion encloses the classic reference on every axis, its area
-concentrated in gentleness and tighten-care (it corrects in small,
-distributed steps) while merely matching on raw tracking — the §6 asymmetry
-made visible.
+- **The floor as an estimator bound under the field.** The natural hero figure
+  was "performance versus `r*`, every controller hugging the Poisson floor from
+  above." It is false as drawn: the cost-blind maximum-likelihood estimator (the
+  policy-free controller that fires every tick and emits its raw belief) sits
+  *above* the field, not below it — a real controller *holds* difficulty between
+  fires, low-pass-filtering the very noise the every-tick MLE emits. The floor is
+  not a line beneath emitted-difficulty error, so the figure cannot be drawn that
+  way.
+- **A thin ribbon in steady-state error.** The flatness is real but does not live
+  on the steady-RMS axis: there the field spreads +89–161%, and worse, that axis
+  crowns *classic* (which holds an effectively enormous window and so tracks a
+  stable stream tightly while failing every transient and the safety gate). The
+  ~12% flatness lives in the *composite* cost across rates, not in steady error.
+- **The champion as the Pareto frontier.** On a steady-vs-transient scatter the
+  champion is *inside* the field's Pareto front — five configurations are cheaper
+  on steady cost *and* faster on transient lag. It becomes the frontier only once
+  the points are colored by safety (§8.2): all five dominators fail the
+  cross-rate decline gate. The champion is the *safe* frontier, not the cost
+  frontier — a weaker and more honest claim.
 
-**When does the cost happen, and what does the failure look like? — the
-trajectory.** This is the only view that keeps the dimension the other two
-destroy: sequence and duration. One run (`trajectory-plot`) walks through
-cold-start, settle, and an aged −10% drop — the three regimes that map
-one-to-one onto the three forces in the metric (agility §3; the settle
-offset, the §3 price / §6 asymmetry; detection §5), in the order an
-operator actually lives through them. The **fire raster** beneath turns
-"gentle versus violent" from an adjective into something countable: one
-tick mark per fire, height `∝ |s|` — classic's handful of tall marks
-against the champion's many short ones. And it is the only picture that can
-show the headline at a glance: an algorithm that tracks *tighter* in steady
-state and is *blind* to a slow drop. Two reference marks make the
-document's central point visual rather than asserted, drawn *separately* so
-that minimum error and minimum cost are visibly not the same place:
+Each premise died to the same discipline: render the measured points before
+writing the caption. The figures that survived did so because they were checked
+the same way.
 
-- the **accuracy ceiling** — a policy-free estimator firing every tick,
-  reaching the §3 information floor (≈−0.8% offset) but at unbounded
-  effort, so it is an accuracy *bound*, not a target; and
-- the **cost-optimal corridor** — where §7's objective actually wants the
-  algorithm to sit.
+### 8.2 The companion: the champion is the safe frontier (steady-vs-transient scatter)
 
-*What it shows — the finding,* where the theory predicts the algorithms
-separate:
+`steady-transient.rs` plots every configuration at a fixed rate as a point: x =
+steady-state cost (tracking + effort on a pure stable stream), y = transient lag
+(cold-start ramp + aged-drop detection latency), each point colored by
+decline-safety — the worst settled over-difficulty after a sustained decline,
+measured over the *authoritative* rate×magnitude grid (identical to the safety
+gate of §9; an earlier partial grid mis-colored the long-window family and was
+corrected). Lower-left is better on both axes.
 
-| regime | classic (real vardiff) | champion |
-| --- | --- | --- |
-| cold-start ramp | ~11 min | ~15 min |
-| settle offset | ≈0% | ≈−7% (cost-optimal, §10) |
-| aged −10% drop | **never detects** (in window) | detects ~9 min |
+*What it shows.* A clean convex frontier exists, parametrized by the estimator
+window. The champion is the **lower-left-most safe point**: the five
+configurations that beat it on both axes all fail the decline gate (they are red)
+— so no *safe* configuration dominates it. The safe configurations themselves
+trace a convex envelope, and the champion is its gentle-steady corner. This is
+the minimax-over-`r*`-plus-safety selection made visual: the champion is chosen
+not because it wins the field but because it is the gentlest configuration that
+is *safe everywhere*. Confirmed at 12 and 30 spm; at 4 spm the field is
+window-degenerate (configurations of the same window collapse to one point, so
+the neighborhood cannot be resolved there) — stated rather than implied.
 
-Classic tracks truth tightly in steady state and rejects the champion's
-small offset — but it **never reacts** to the slow drop, because a matured
-counter has diluted the signal (§5 made flesh). The champion accepts a
-small, cost-optimal under-difficulty offset and in exchange catches the
-drift that is the operator's real loss.
+![Steady cost vs transient lag at 12 spm. Each point is a configuration; green =
+decline-safe (worst settled over-difficulty ≤ 5% over the cross-rate grid), hollow
+red = fails the gate. The new champion (Ewma360/s1.5) is the lower-left-most green
+point; the five configurations below-left of it — cheaper on steady cost *and*
+faster on transient lag — are all red, so no *safe* configuration dominates it.
+The dashed line is the envelope of the safe configurations.](steady_transient.svg)
 
-These are not three views of one thing; they are a hierarchy of questions:
-**rank** with the scalar, **characterize** with the constrained radar, and
-**trust** with the trajectory — because trust comes from watching the
-controller behave across the regimes you care about, not from a number that
-has already integrated those regimes away. For a mining engineer the
-trajectory is the one to put on the wall: it reads like the dashboards and
-incident timelines they already live in.
+### 8.3 The mechanism: why the champion's window is what it is (the τ-safety-valley)
+
+The scatter shows cheaper-and-faster points colored red with no in-panel reason.
+`tau-valley.rs` supplies the reason: worst settled over-difficulty after a
+sustained decline is a **U-shaped function of the estimator window τ**, with its
+minimum at the champion's window. Too long a window (sleepy) lags a sustained
+decline into the dangerous over-difficulty direction; too short a window
+(twitchy) overshoots it; the safe band is the minimum of the dynamic floor
+`L(τ_eff)` from §3. **Observation:** the curve is *sensitivity-invariant* — worst
+settled error is identical to 0.1% across boundary sensitivities `s∈{0.3…2}`,
+because settled error after recovery is an estimator-window property, not a
+firing-threshold one (a per-fixed-sensitivity sweep controls the window×threshold
+confound: the floor sits at the champion's window at *every* fixed sensitivity).
+This converts "we picked this window" from a selection outcome into a visible
+physical reason.
+
+![Worst settled over-difficulty (over the cross-rate decline grid) versus
+estimator window τ. The curve is a U floored at the champion's window (τ=360,
+ringed): both flanks — sleepy long windows that lag a sustained decline, twitchy
+short windows that overshoot it — rise above the +5% runaway gate (dashed). The
+green band is the safe region. The valley is sensitivity-invariant (identical to
+0.1% across boundary sensitivities s0.3–s2), so it is a genuine window effect, not
+a window×threshold confound.](tau_valley.svg)
+
+### 8.4 The lever: raising `r*` buys agility (EXCESS vs `r*`)
+
+The structural claim's other half — *the one lever that moves the floor is `r*`*
+— is carried by `excess-lever.rs`: false-alarm-corrected detection `EXCESS` of a
+−10% drop versus share rate. The honest object is detection-excess, **not** the
+composite cost (which is non-monotone in `r*` and so cannot show a clean lever)
+and **not** the stable-safe-window result (which is a *robustness* claim about
+the champion, not a claim that `r*` buys anything). `EXCESS` climbs monotonically
+from `+0.05` at 4 spm to `+0.75` at 60 spm, and the whole field is bunched near
+the floor at the low end — the floor binds *everyone* at production rates and
+recedes for *everyone* as `r*` rises.
+
+*Caption obligation, because "floor-limited" is window-dependent.* At production
+rates a −10% drop is at-or-near the detection floor: `EXCESS = 0.00` at a 60-min
+monitoring window (the saturation finding — the drop is perfectly invisible) and
+`+0.05` at a 15-min window (near-floor). Both numbers must appear or the +0.05
+reads as contradicting the ≈0 saturation result, when in fact they are the same
+finding at two window lengths.
+
+![False-alarm-corrected detection EXCESS of a −10% drop (15-min window, false-alarm
+control held at the same window) versus share rate r* (log axis, window fixed). The
+champion's EXCESS climbs monotonically from +0.05 at 4 spm — inside the shaded
+production band, where the drop is at the information floor — to +0.75 at 60 spm as
+the floor recedes; the field (faint) is bunched near the floor at low r*, so the
+limit binds *everyone* at production rates. At a 60-min window the production EXCESS
+is 0.00 (the drop is perfectly invisible); the +0.05 here is the same finding at the
+tighter window.](excess_lever.svg)
+
+### 8.5 The trajectory, demoted
+
+The single-timeline trajectory plot (`trajectory-plot`) — estimate chasing truth
+through cold-start, settle, and an aged drop, with a fire-raster showing
+"gentle versus violent" — is kept only as a §8 supporting detail. It is *not* a
+principal figure: it shows absolute behavior at one rate, where "slow" is a
+property of the rate, not the controller, and it makes the champion's deliberate
+gentleness look like a regression. Its one genuine virtue is the fire-raster
+(many short marks for the champion versus a handful of tall ones for classic);
+that virtue does not earn it the opening of the paper.
 
 ---
 
-## 9. Validation against real hardware
+## 9. Selection, safety, and validation
 
-Everything above is derived from a model and scored in simulation. The
-model's *behavioral* predictions were then checked against real miners —
-an Antminer S21 (~200 TH/s) on testnet4, driven through the **shape-proxy**
-tool (which gates a real share stream to impose a chosen rate profile
-without touching firmware), against side-by-side SRI pool instances. This
-tests the mechanism, not merely the metric that prefers the champion.
+### 9.1 How the champion was selected (minimax over `r*`)
 
-**The classic algorithm's mechanics reproduced quantitatively** (sim
-prediction vs. live observation, all matching): steady-state jitter zero
-over 30+ min; deterministic −16.7% per fire; exact 300 s fire cadence;
-~60% post-staircase overshoot (sim p99 = 69%); ±50% symmetry. Most
-important, the **counter-age dependence** the §5 mechanism rests on:
-a 5-min counter reacted in 4.4 min, a 51-min counter in 51.8 min — the
-matured-counter blindness, seen in hardware.
+The target share rate is a static deployment parameter whose value is not known
+in advance, so the champion is chosen by a **minimax over `r*`**: the
+configuration whose *worst* gap to the per-rate best-in-field, across `r* ∈
+{4,6,12,30}` (60 spm as a high-rate anchor, outside the minimax), is smallest.
+`sweep-minimax.rs` scores the corrected metric (§7) at each rate independently —
+so each configuration's own per-rate false-alarm behavior enters through the
+stable-scenario effort term, with no false-alarm convention reused across rates.
 
-**The champion's win reproduced live.** Deployed side-by-side with classic,
-both mining overnight to mature their counters, then both miners' hashrate
-halved at once: **classic took several hours and first moved in the *wrong*
-direction; the champion responded in minutes and settled correctly.** This
-is the §5 detection claim and the §6 wrong-direction (runaway-risk) claim,
-both confirmed outside the simulation.
+Three findings, all consistent with §3. The field is **flat** (~12% best-to-worst
+at every rate — Theorem 2 again). The cost-optimal configuration **walks with the
+effort weight `λ`**, drifting toward the long-window "sleepy" corner as firing is
+penalized more — so a configuration crowned by cost alone would be free-tuned by a
+weight grounded only to within a factor. And the band-optimal cost lands in the
+same sleepy corner the single-rate search did, so **the decline-safety gate is
+the actual selector**, not the cost.
 
-**What this does and does not anchor.** It externally validates the
-*behavioral* layer — reaction times, age-dependence, direction of response,
-the relative ranking of classic vs. champion. It does **not** validate the
-*economic weights* (the `3:1` asymmetry, the share-volume coefficient `c`):
-those are operator-value calibrations the hardware tests do not probe. So
-the honest scope is **behaviorally validated on real hardware; the cost-
-model weights remain a calibrated judgment** — stronger than internal
-consistency (§10) alone, short of a full economic backtest.
+### 9.2 The decline-safety gate (the death-spiral test)
 
-**Sustained decline — the death-spiral safety test (simulation).** The one
-scenario the ensemble lacked, and the input most able to turn a
-persistence-based actuator into a slow runaway. `bin/slow-decline` runs
-rate ∈ {1–40} %/hr × spm ∈ {2–30} × {champion, interim, classic}, gating on
-the *settled* error after a 120-min recovery window (not the transient
-trough). Result, mirroring the detection finding in shape: **in the
-operating range (spm ≥ 6) the champion tracks every decline down and
-settles on the safe, under-difficulty side; classic lags badly in the
-dangerous direction** — to +69% over-difficulty transiently at 40%/hr
-(`e≈ln(1.69)`, a starved miner), ~4× the champion's worst transient. The
-death-spiral risk is the *incumbent's*, not the candidate's. Full results
-in `docs/SLOW_DECLINE_TEST.md`; the §6 claim is earned in simulation,
-hardware confirmation (below) pending.
+A sustained decline drives `e` positive (over-difficulty), the costly direction;
+the death-spiral risk is self-reinforcing starvation. `slow-decline.rs` runs rate
+∈ {1–40} %/hr × spm ∈ {2–30}, gating on the *settled* error after a 120-min
+recovery window (not the transient trough). The gate is the selector among the
+near-tied band-optimal configurations, and it is **uninherited**: a sleepier
+easer is a different animal on a decline, so safety is re-cleared from scratch for
+each candidate.
 
-**Sub-guard limit (spm < 6) — a named, bounded degradation.** Below the
-spm6 PoissonCI guard — the regime the parameter sweep never exercised — the
-champion carries a steady *positive* (over-difficulty) offset: ~+5% at
-2 spm, ~+2.6% at 4 spm, flat across decline rates (a lag-free,
-120-min-settled measurement). It is identical in champion and interim, so
-it is the shared low-SPM guard, not the sign-persistence discount. An
-isolation probe (PoissonCI margin zeroed: +5.16% → +4.58%) rules out the
-additive margin; the sign flips exactly at the guard boundary (below: +5%;
-at/above: the intended −9% to −6%). **Mechanism, two legs in order:** the
-guard's symmetric PoissonCI (1) *removes* the protective ≈−0.67σ asymmetry
-the high-SPM boundary carries (§3, §6's 3:1 cost), and (2) *exposes* a small
-positive estimator bias at tiny share counts that the asymmetry otherwise
-masks. (Only leg (1) is isolated; the residual positive sign at small N is
-observed, not derived — a standard log-of-count Jensen term is *negative*,
-so the exact source is left open rather than dressed in a formula whose sign
-fails.) This ships because the offset is **inside the §3 noise band** at
-2 spm (σ≈45%, so +5% ≈ 0.11σ), below the 4–6 spm operating range, and the
-champion still beats classic at every sub-guard cell (max_e +27–42% vs
-classic +107%). The verdict is **spm6 well-placed, not proven optimal**.
+**Result.** Among the λ-robust band cluster, **only the champion `Ewma360/s1.5`
+has zero runaway cells** (worst settled +2.7%); every sleepier configuration that
+beats it on band-cost fails at the sub-guard 2–4 spm cells (settled +5.6% to
++9.6%) — the rates a single-rate or 12-spm view cannot see. The classic incumbent
+fails hardest (settled +22%, transiently +109% — a starved miner). The
+death-spiral risk is the *incumbent's*, not the candidate's, and the gate
+confirms rather than re-selects the champion: the configurations that beat it on
+cost are exactly the ones that are unsafe.
 
-**Open hardware tests** (mapping to the residual risks): the *sustained
-slow decline* above, re-run on iron (shape-proxy Ramp profile, champion vs
-classic side-by-side) to confirm the simulation the way PR #2154 confirmed
-the step; *multi-connection* operation, since the model assumes one worker
-per connection while real connections aggregate many; and measuring `c` to
-close the §6 share-volume term. Production runs at `r* ≈ 4–6` spm with
-headroom (so the linear-small share-volume regime holds, and running
-*faster* — higher `r*` — is supported by the model: it tightens both the
-detection floor and the estimate at a volume cost the headroom absorbs);
-older, stressed machines are the convex-quota exception to model
-separately.
+### 9.3 The gate is a constraint, not a weighted objective
+
+Decline-safety enters as a **hard constraint satisfied across all plausible
+failure magnitudes**, not as a weighted term calibrated to a failure-magnitude
+distribution — and this is forced, not stylistic. The magnitude at which the
+responsiveness gate would bind is **firmware/config-mix determined and
+operator-movable**: an operator can classify miners into similar-profile proxies
+and *normalize* the per-proxy distribution, flattening the very magnitude a tuned
+controller would target. The pool operators, asked, **do not know** the current
+distribution. A controller tuned to a distribution that is both unknown *and*
+actively homogenizable would be optimizing against a target that moves out from
+under it. So the gate stays a footnote: the champion satisfies it everywhere
+(which is how it was selected), and "the distribution is unknown and
+operator-movable" is a stronger reason not to tune to it than any measured weight
+would have been.
+
+### 9.4 What real hardware validates — and what it does not
+
+Everything above is derived from a model and scored in simulation. The model's
+*behavioral* predictions were checked against real miners — an Antminer S21 (~200
+TH/s) on testnet4, driven through the **shape-proxy** tool against side-by-side
+SRI pool instances.
+
+**The classic algorithm's mechanics reproduced quantitatively:** steady-state
+jitter zero over 30+ min; deterministic −16.7% per fire; exact 300 s cadence;
+~60% post-staircase overshoot; ±50% symmetry. Most important, the
+**counter-age dependence** the §5 mechanism rests on: a 5-min counter reacted in
+4.4 min, a 51-min counter in 51.8 min — the matured-counter blindness, seen in
+hardware. And a **previous** champion's win reproduced live: deployed beside
+classic, both matured overnight, both miners halved at once — classic took hours
+and first moved in the *wrong* direction; the champion responded in minutes and
+settled correctly (the §5 detection and §6 wrong-direction claims, outside
+simulation).
+
+**The present champion on iron — what now holds, and what is still owed.** The
+quantitative-mechanics and counter-age tests above were run on the *previous*
+(`s0.3`) champion. The present champion `Ewma360/s1.5` has since been deployed
+**pool-only** (no translator in the difficulty path, so its `VardiffState`
+governs the miner directly) at `r* = 6` and `r* = 30` spm and subjected to a
+sustained −50% step held ~50 min. The decline response reproduced PR #2154's
+result for the new parameters: the difficulty-implied hashrate **eased downward**
+to follow the drop, shares kept flowing, and — the load-bearing tell — the
+**share-rejection rate stayed flat at zero** through the decline. A runaway (the
+classic failure mode) would have pinned difficulty high and starved the miner,
+spiking rejections; their absence is direct evidence the champion eased on the
+safe side rather than into over-difficulty. So the **direction-and-starvation**
+claim — the one that matters most, and the death-spiral the §9 gate exists to
+prevent — now holds on hardware for the present champion, not only in simulation.
+
+Two things the live run does **not** yet license, kept explicitly sim-only.
+*(i) The settled offset.* The dashboards show direction and zero rejections, not
+the implied-H/true-H ratio at settle, and ~50 min at 6 spm is short of the
+120-min settle window (§9.2); so the quantitative `+2.7%` settled-over-difficulty
+figure remains a simulation result. *(ii) The gate-stress decline.* A −50% step
+is the *easy* signal — every reasonable config catches a halving fast (§9.2); the
+slow, *moderate* decline on which the safety gate actually binds (the corner that
+discriminates configs) was not run on iron. So the open hardware tests are: the
+quantitative settle measurement (pool `vardiff=debug` over a longer drop, to
+match `+2.7%`); the slow-moderate sustained decline, champion vs classic
+side-by-side; multi-connection operation (the model assumes one worker per
+connection); and measuring `c` to close the §6 share-volume term. Production runs at `r* ≈ 4–6`
+spm with headroom, and the model supports running *faster* — higher `r*` tightens
+both the detection floor and the estimate at a volume cost the headroom absorbs;
+this is the §8.4 lever, and it is the one recommendation that follows directly
+from the structural finding.
 
 ---
 
 ## 10. One consistency check, and how to break the result
 
-**The offset is optimal, not a defect (`confirm-debias`).** The best
-algorithm sits at a steady ≈−7% under-difficulty, short of the ≈−0.8%
-floor a policy-free estimator reaches by firing every tick. Multiplying its
-belief by `b ≥ 1` closes the offset smoothly (to 0 near `b≈1.10`), but the
-cost rises monotonically from `b = 1`: `regret_under` falls while
-`regret_over` rises faster under the `3:1` weight. The unbiased belief is
-the cost minimum, so the offset is not an error — exactly as §3 predicts.
+**The offset is optimal, not a defect (`confirm-debias`).** The champion sits at a
+steady under-difficulty offset, short of the noise-band floor a policy-free
+estimator reaches by firing every tick. Multiplying its belief by `b ≥ 1` closes
+the offset smoothly, but the cost rises monotonically from `b = 1`:
+`regret_under` falls while `regret_over` rises faster under the `3:1` weight. The
+unbiased belief is the cost minimum, so the offset is not an error — exactly as §3
+predicts. What it *is*, precisely: under the `3:1` asymmetry the cost-minimizing
+center of the noise band is not its mean but a quantile below it, `≈ −0.67·σ_eff`;
+the `3:1` weight fixes the coefficient and sign, `σ_eff` is set by the window
+choice. `confirm-debias` verifies the *quantile condition* (`b=1` minimizes
+cost), not the band *width* — so an independent knob that *could* push accuracy
+toward the floor is correctly scored *worse*. The metric is self-consistent.
 
-What the offset *is*, precisely: the algorithm runs inside a noise band of
-width `σ_eff` (the §3 floor at its effective window), and under the `3:1`
-asymmetry the cost-minimizing place to center is not the band's mean but a
-**quantile below it** — roughly `−0.67·σ_eff` (the point where the
-3×-weighted over-difficulty tail balances the 1×-weighted under tail). The
-`3:1` weight fixes that coefficient and its sign; `σ_eff` is set by the
-effort/agility choice (the short estimator window). `confirm-debias`
-verifies the *quantile condition* (that `b=1` minimizes cost), not the
-*width* of the band. So an independent knob that *could* push accuracy
-toward the floor is correctly scored *worse* — the metric is
-self-consistent. (The offset carries an unpriced share-volume cost noted in
-the findings; it does not change the quantile result.)
+**Falsifiers.** The result should be revised if: (a) some `∫f(e)` on the scored
+scenarios reproduces the detection ranking, refuting the §5 Argument; (b) an
+*unbiased* estimator beats `1/(r*τ)`, refuting Theorem 2 (biased estimators
+routinely beat the CRB on variance, so the qualifier is essential); (c) the
+champion changes within `w_over:w_under ∈ [1:1,4:1]` or across `λ ∈ {0,½,1,2}`,
+breaking the §6/§7 robustness; or (d) a real failure mode falls outside the
+scored ensemble — a coverage gap to declare, not a soundness error. Three further
+premises *did* fail and were retired (§8.1); that they were drawn, measured, and
+killed is the mechanism by which the survivors earn trust.
 
-**Falsifiers.** The result should be revised if: (a) some `∫f(e)` on the
-scored scenarios reproduces the detection ranking, refuting the §5
-Argument; (b) an *unbiased* estimator beats `1/(r*τ)`, refuting Theorem 2
-(biased estimators routinely beat the CRB on variance, so the qualifier is
-essential); (c) the best algorithm changes within `w_over:w_under ∈
-[1:1,4:1]`, breaking §6's robustness; or (d) a real failure mode falls
-outside the scored ensemble — a coverage gap to declare, not a soundness
-error.
-
-**Declared coverage gap (d): the asymmetry-blind sub-guard.** Below spm6
-the guard is a symmetric PoissonCI, so it abandons the §6 safety asymmetry
-exactly where data is sparsest (§9) — a known, bounded degradation, not a
-soundness error. The named fix is an `AsymmetricPoissonCI` guard (it exists
-in the codebase) carrying the same 3:1 cost, which would restore the
-safe-side bias below spm6. It is *deferred*, not unknown: taking it reopens
-champion selection at the margin and owes a spm≥6 re-confirmation (the
-validated regime is the whole result), a bad trade for cells below the
-operating range and mostly inside the noise band. The trigger that would
-force it: hardware A/B or real connection-rate data showing a non-trivial
-tail of connections living at 2–4 spm.
+**Declared coverage gap (d): the asymmetry-blind sub-guard.** Below spm6 the
+guard is a symmetric PoissonCI, so it abandons the §6 safety asymmetry exactly
+where data is sparsest — a known, bounded degradation (the offset is inside the §3
+noise band there, σ≈45% at 2 spm), not a soundness error. The named fix
+(`AsymmetricPoissonCI`, in the codebase) is *deferred*: taking it reopens champion
+selection at the margin and owes a spm≥6 re-confirmation, a bad trade for cells
+below the operating range. The trigger that would force it: real connection-rate
+data showing a non-trivial tail of connections living at 2–4 spm.
 
 ---
 
@@ -622,22 +681,34 @@ tail of connections living at 2–4 spm.
 | Observable depends only on `e` | Theorem 1 | §2 |
 | Precision floor `1/(r*τ)` | Theorem 2 | §3 |
 | Quality axes are one trade-off | Corollary + obs. | §3, `31a9dbc1` |
+| Field is flat across `r*` (~12% spread in composite cost) | Observation | §8, `sweep-minimax` |
 | Squared norm blind to small drops | Lemma | §4 |
-| …a 1%-detector scores well on `e²` | Observation | `regret-effort` |
 | Detection not derivable from `e(t)` | Argument | §5 |
-| …real algorithms go blind | Observation | `70fcb260` |
+| Detection floor-saturated at production rates → out of scalar | Observation | §5, `detection-control` |
+| Detection EXCESS rises with `r*` (the lever) | Observation | §8, `excess-lever` |
 | Over>under, tighten>ease | Argument (ii proved) | §6 |
-| `3:1` weight; robust over `[1:1,4:1]` | Choice + obs. | `a1d3fa7b`, `champion-weights` |
-| −7% offset is cost-optimal | Observation | `confirm-debias` |
-| Share-volume cost is ~linear in `\|e\|`, one-sided | Argument | §6 |
+| `3:1` weight; robust over `[1:1,4:1]`; champion robust over `λ` | Choice + obs. | `a1d3fa7b`, `champion-weights` |
+| Linear `Σ\|s\|` effort term closes the churn blind spot | Argument | §7 |
+| Champion = the *safe* frontier (not the cost frontier) | Observation | §8, `steady-transient` |
+| Decline-safety is a τ-valley, floored at the champion's window | Observation | §8, `tau-valley` |
+| Champion selected by minimax over `r*`, safety as constraint | Choice + obs. | §9, `sweep-minimax`, `slow-decline` |
+| Steady under-difficulty offset (`≈−0.67·σ_eff`) is cost-optimal | Observation | §10, `confirm-debias` |
 | Counter-age mechanism on real hardware | Observation (HW) | §9, PR #2154 |
-| Champion beats classic on a live drop | Observation (HW) | §9, PR #2154 |
-| Death-spiral safety: champion safe, classic lags dangerously | Observation | §9, `slow-decline` |
-| Sub-guard (spm<6) +5% bias: symmetric guard, bounded, deferred fix | Observation + coverage note | §9, §9(d) |
+| *Previous* champion beats classic on a live drop | Observation (HW) | §9, PR #2154 |
+| *Present* champion decline response hardware-confirmed *in direction* (eases safe-side, no rejection runaway) | Observation (HW) | §9.4 |
+| Present champion settled-offset + slow-moderate-decline still simulation | Scope note | §9.4 |
+| Three hero premises drawn and killed by measurement | Method | §8.1 |
 
-Every clause of the metric — linear sign-split regret, quadratic
-direction-split effort, an explicit detection rate, per class, `3:1`
-weights — is proved from §§2–3, forced by §§4–5, or a judgment shown
-robust in §6. The behavioral predictions are externally confirmed on real
-hardware (§9); the cost-model weights remain a calibrated judgment, robust
-over the grounded range and open to an economic backtest.
+The structural finding — across the operating band the field is flat, the
+residual axis is gentleness-and-safety not agility, detection is floor-limited at
+production rates, and the one lever is `r*` — is proved from Theorems 1–2 and
+confirmed by direct measurement.
+The champion is the existence proof that the safe corner of the frontier is
+occupiable, selected by minimax over `r*` with decline-safety as a hard
+constraint. The behavioral layer is externally confirmed on real hardware for the
+previous champion, and the present champion's decline response is hardware-
+confirmed *in direction* (eases safe-side, no rejection runaway, §9.4); its
+settled offset and its behavior on a slow *moderate* decline remain
+simulation-selected, and the cost-model weights remain a calibrated judgment —
+robust over the grounded range and open to the remaining hardware tests (§9.4)
+and an economic backtest.

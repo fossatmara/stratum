@@ -32,8 +32,8 @@ use std::fs;
 use std::sync::Arc;
 
 use channels_sv2::vardiff::composed::{
-    AcceleratingPartialRetarget, AdaptivePoissonCusum, AsymmetricCusumBoundary, Composed,
-    EwmaEstimator, FullRetargetNoClamp, PoissonCI, StepFunction,
+    AcceleratingPartialRetarget, AdaptiveSignPersist, Composed, EwmaEstimator, FullRetargetNoClamp,
+    SignPersistenceCusumBoundary, StepFunction,
 };
 use channels_sv2::vardiff::MockClock;
 use vardiff_sim::baseline::{COLD_START_INITIAL_HASHRATE, TRUE_HASHRATE};
@@ -50,19 +50,19 @@ const DROP_FRAC: f32 = 0.90; // −10% sag
 
 const COLORS: &[&str] = &["#777777", "#377eb8", "#4daf4a", "#e41a1c", "#ff7f00", "#984ea3"];
 
-/// The interim AsymCusum champion (pre-SignPersist) — kept as a plotted
-/// comparison so the trajectory shows what the sign-persistence discount
-/// bought over the AsymCusum-only config (faster ramp, tighter settle).
-fn champion_asymcusum() -> AlgorithmSpec {
-    AlgorithmSpec::new("interim (AsymCusum)", |clock| {
+/// The NEW champion: the minimax-over-r* / corrected-metric winner, confirmed
+/// also as the band champion (the configs that beat it on band-cost fail the
+/// decline-safety gate). Gentler, longer window than the old s0.3 champion —
+/// Ewma360 / SignPersist-s1.5 / t8 / d0.06 / etaMax0.6 / accel0.05.
+fn champion_new() -> AlgorithmSpec {
+    AlgorithmSpec::new("new champion (Ewma360/s1.5)", |clock| {
         VardiffBox(Box::new(Composed::new(
-            EwmaEstimator::new(150),
-            AdaptivePoissonCusum::with_params(
-                PoissonCI::default_parametric(),
-                AsymmetricCusumBoundary::new(0.2, 0.05, 6.0),
-                5,
+            EwmaEstimator::new(360),
+            AdaptiveSignPersist::sign_persist(
+                SignPersistenceCusumBoundary::new(1.5, 0.05, 8.0, 0.06, 0.6),
+                6,
             ),
-            AcceleratingPartialRetarget::new(0.2, 0.8, 0.05),
+            AcceleratingPartialRetarget::new(0.2, 0.6, 0.05),
             1.0,
             clock,
         )))
@@ -152,14 +152,15 @@ fn main() -> std::io::Result<()> {
         tick_interval_secs: TICK,
     };
 
-    // classic (real vardiff) as the baseline, the interim AsymCusum
-    // champion, and the final SignPersist champion — so the plot shows the
-    // ramp/settle/detection gains at each step. Each gets a median line AND
-    // a fire-raster lane.
+    // The three the comparison asks for: original vardiff (classic baseline),
+    // the OLD winner (s0.3 SignPersist champion), and the NEW winner (the
+    // corrected-metric / minimax-over-r* champion Ewma360/s1.5). Ordered
+    // baseline → old → new so the legend and colors read as the progression.
+    // Each gets a median line AND a fire-raster lane.
     let algos = vec![
-        ("classic (real vardiff)", AlgorithmSpec::classic_composed()),
-        ("interim (AsymCusum)", champion_asymcusum()),
-        ("champion (SignPersist)", AlgorithmSpec::champion()),
+        ("classic (original vardiff)", AlgorithmSpec::classic_composed()),
+        ("old champion (s0.3)", AlgorithmSpec::champion()),
+        ("new champion (Ewma360/s1.5)", champion_new()),
     ];
 
     let n_ticks = (END / TICK) as usize;

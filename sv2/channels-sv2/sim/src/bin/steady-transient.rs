@@ -389,8 +389,8 @@ fn render(pts: &[Pt], safe_front: &[&Pt], spm: f32) -> String {
     s.push_str(&format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" font-family="system-ui, sans-serif" font-size="13">
 <rect width="100%" height="100%" fill="#fafafa"/>
-<text x="{cx}" y="30" text-anchor="middle" font-size="16" font-weight="bold">Steady cost vs transient lag — the field, safety-colored (NO boundary drawn yet)</text>
-<text x="{cx}" y="50" text-anchor="middle" font-size="12" fill="#555">Each point a config at spm={spm}. x = steady tracking+effort, y = cold-start+detection lag. Lower-left better. Color = decline-safety.</text>
+<text x="{cx}" y="30" text-anchor="middle" font-size="16" font-weight="bold">The champion is the SAFE frontier: steady cost vs transient lag</text>
+<text x="{cx}" y="50" text-anchor="middle" font-size="12" fill="#555">Each point a config at spm={spm}. x = steady tracking+effort, y = cold-start+detection lag. Lower-left better. Color = decline-safety (worst over the cross-rate grid). Dashed line = safe-config envelope.</text>
 "##,
         cx = w / 2
     ));
@@ -430,6 +430,14 @@ fn render(pts: &[Pt], safe_front: &[&Pt], spm: f32) -> String {
 
     // points
     for p in pts {
+        // Guard non-finite transient lag (a config whose detection never
+        // resolves at this rate — e.g. the long-window sleepy corner at high
+        // spm). Such a point has no y position; drop it rather than emit a
+        // cy="NaN" circle that breaks the SVG. (It is unsafe regardless and
+        // not on the frontier; its absence does not change the claim.)
+        if !p.x.is_finite() || !p.y.is_finite() {
+            continue;
+        }
         let (x, y) = (lx(p.x), ly(p.y));
         let safe = p.settled <= GATE_PCT;
         let (fill, stroke) = if safe { ("#2e8b2e", "#1d5e1d") } else { ("#fff", "#e41a1c") };
@@ -459,11 +467,16 @@ fn render(pts: &[Pt], safe_front: &[&Pt], spm: f32) -> String {
         r##"<circle cx="{:.1}" cy="{lgy:.1}" r="6" fill="#fff" stroke="#e41a1c" stroke-width="2"/>
 <text x="{:.1}" y="{:.1}" font-size="12">UNSAFE (fails decline gate)</text>
 "##, lgx+6.0, lgx+20.0, lgy+4.0));
-    lgy += 34.0;
+    lgy += 30.0;
     s.push_str(&format!(
-        r##"<text x="{lgx:.1}" y="{:.1}" font-size="11" fill="#555" font-style="italic">No frontier line drawn —</text>
-<text x="{lgx:.1}" y="{:.1}" font-size="11" fill="#555" font-style="italic">reading whether the points</text>
-<text x="{lgx:.1}" y="{:.1}" font-size="11" fill="#555" font-style="italic">form one first (option 4).</text>
+        r##"<line x1="{lgx:.1}" y1="{lgy:.1}" x2="{:.1}" y2="{lgy:.1}" stroke="#2e8b2e" stroke-width="1.6" stroke-opacity="0.6" stroke-dasharray="5 4"/>
+<text x="{:.1}" y="{:.1}" font-size="12" fill="#555">safe-config envelope</text>
+"##, lgx + 24.0, lgx + 30.0, lgy + 4.0));
+    lgy += 30.0;
+    s.push_str(&format!(
+        r##"<text x="{lgx:.1}" y="{:.1}" font-size="11" fill="#555" font-style="italic">The champion is the lower-left-most</text>
+<text x="{lgx:.1}" y="{:.1}" font-size="11" fill="#555" font-style="italic">SAFE point: every config that beats</text>
+<text x="{lgx:.1}" y="{:.1}" font-size="11" fill="#555" font-style="italic">it on both axes fails the decline gate.</text>
 "##, lgy, lgy+16.0, lgy+32.0));
 
     s.push_str("</svg>\n");
