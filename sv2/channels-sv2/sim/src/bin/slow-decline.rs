@@ -166,17 +166,23 @@ fn main() {
     // safety regime and the point of this extension.
     let spms = [2.0f32, 4.0, 6.0, 8.0, 12.0, 20.0, 30.0];
     let algos: Vec<(String, Box<dyn Fn() -> AlgorithmSpec + Send + Sync>)> = vec![
-        // The five configs that DOMINATE the champion on both axes of the
-        // 12-spm steady-vs-transient scatter while passing the weak 6-spm
-        // gate. The authoritative cross-rate (incl. sub-guard 2-4 spm) gate
-        // decides whether they are genuinely better-and-safe (champion wrong)
-        // or sleepy configs the weak single-rate gate failed to reject.
+        // VALIDATION SET (must reproduce the original selection or the gate is
+        // wrong): `corrected`=Ewma360/s1.5 must PASS; the `dom*` long-window
+        // configs that originally FAILED the cross-rate sub-guard must FAIL.
         ("dom720s03".into(), Box::new(|| band_cfg("dom(Ewma720/s0.3)", 720, 0.3))),
         ("dom720s06".into(), Box::new(|| band_cfg("dom(Ewma720/s0.6)", 720, 0.6))),
         ("dom480s1".into(), Box::new(|| band_cfg("dom(Ewma480/s1)", 480, 1.0))),
         ("dom480s06".into(), Box::new(|| band_cfg("dom(Ewma480/s0.6)", 480, 0.6))),
         ("dom480s03".into(), Box::new(|| band_cfg("dom(Ewma480/s0.3)", 480, 0.3))),
-        ("corrected".into(), Box::new(corrected)),     // single-rate champion
+        ("corrected".into(), Box::new(corrected)),     // single-rate champion (must PASS)
+        // RECALIBRATION λ-WINNERS (the configs the recalibrated cost picks at
+        // various λ): does the sub-guard gate reject the long-window ones the
+        // way it did originally (→ champion holds), or do they now pass (→
+        // champion moves, owe a full re-sweep + uninherited hardware re-clear)?
+        ("rcl720s2".into(),  Box::new(|| band_cfg("rcl(Ewma720/s2)",  720, 2.0))),
+        ("rcl240s15".into(), Box::new(|| band_cfg("rcl(Ewma240/s1.5)",240, 1.5))),
+        ("rcl150s1".into(),  Box::new(|| band_cfg("rcl(Ewma150/s1)",  150, 1.0))),
+        ("rcl150s03".into(), Box::new(|| band_cfg("rcl(Ewma150/s0.3)",150, 0.3))),
         ("champion".into(), Box::new(AlgorithmSpec::champion)), // old s0.3, for contrast
         ("classic".into(), Box::new(AlgorithmSpec::classic_composed)),
     ];
@@ -194,7 +200,7 @@ fn main() {
     // Flatten the work into (rate, spm, algo_idx) jobs.
     let jobs: Vec<(f32, f32, usize)> = rates
         .iter()
-        .flat_map(|&r| spms.iter().flat_map(move |&s| (0..8).map(move |a| (r, s, a))))
+        .flat_map(|&r| spms.iter().flat_map(move |&s| (0..12).map(move |a| (r, s, a))))
         .collect();
     eprintln!(
         "slow-decline: {} cells, base {} trials (sparse cells oversampled up to {}×), {} threads",
@@ -316,7 +322,7 @@ fn main() {
         );
     }
     println!("Per-algo summary (worst over rates/spm):");
-    for algo in ["dom720s03", "dom720s06", "dom480s1", "dom480s06", "dom480s03", "corrected", "champion", "classic"] {
+    for algo in ["corrected", "rcl720s2", "rcl240s15", "rcl150s1", "rcl150s03", "dom720s03", "dom720s06", "dom480s1", "dom480s06", "dom480s03", "champion", "classic"] {
         let sub: Vec<&Row> = rows.iter().filter(|r| r.algo == algo).collect();
         let worst_max = sub.iter().map(|r| r.max_e_pct).fold(f64::MIN, f64::max);
         let worst_settled = sub.iter().map(|r| r.settled_e_pct).fold(f64::MIN, f64::max);

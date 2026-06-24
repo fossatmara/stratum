@@ -393,6 +393,31 @@ price worth paying. The asymmetry's *direction* is safety-load-bearing; its
 *magnitude* is a soft tuning choice, no longer propped up by a transition cost
 that does not exist.
 
+**The retraction was stress-tested by a full champion-hunt reopen, and the
+champion held — but the headline is *why*.** `sweep-recalibrated.rs` re-ran
+selection under the corrected cost (effort-direction forced to `1:1`; `λ` swept
+*and* dropped), with the decline gate as the selector. **The load-bearing
+result: selection never rested on the cost weighting in the first place.** With
+`λ`'s anchor gone the *cost*-optimal config is now `λ`-sensitive across the whole
+window range (it swings from `Ewma150/s0.3` at `λ=0` to `Ewma720/s2` at `λ=2`) —
+so a champion defined by the cost would be arbitrary now. But the champion was
+defined by the *binding decline-safety gate* (§9), which is pure §6(i)
+operating-point safety and untouched by the retraction. The cost-leaders the
+recalibration favors at the long-window end fail that gate **decisively**:
+`Ewma720/s2` (the `λ=1–2` cost-winner) settles at **+9.6%** over-difficulty at
+the worst sub-guard cell — multiple cells well over the 5% gate — while the
+champion `Ewma360/s1.5` passes comfortably at **+2.7%**. (Honest margin note:
+the short-window `λ=0` cost-winner `Ewma150/s0.3` lands *at* the gate line —
+exactly +5.0% in a single worst cell, indistinguishable from the threshold — so
+it is gate-*indeterminate*, not a decisive failure; the vindication rests on the
+unambiguous +9.6% rejection, not on the boundary configs.) So the soft `λ` was
+always free to wander; it simply never mattered, because the *gate*, not the
+cost, was doing the selecting all along — a clean vindication of constraint-over-
+cost. One nuance kept visible: a shorter window, `Ewma240/s1.5`, also passes the
+gate (+3.5%), so the champion's specific `τ=360` is now justified as the *safest*
+gate-passer (2.7% vs 3.5%) and by the §8.3 τ-valley floor — not by any cost
+consideration, which `λ` no longer anchors.
+
 *The under-difficulty side has its own cost, and the metric only partly prices
 it.* Under-difficulty (`e<0`) is not free: at the realized rate `r = r*·e^{−e}`,
 an `e=−0.07` offset runs the connection ~7% over its target share rate,
