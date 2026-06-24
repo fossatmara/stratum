@@ -389,8 +389,9 @@ fn render(pts: &[Pt], safe_front: &[&Pt], spm: f32) -> String {
     s.push_str(&format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" font-family="system-ui, sans-serif" font-size="13">
 <rect width="100%" height="100%" fill="#fafafa"/>
-<text x="{cx}" y="30" text-anchor="middle" font-size="16" font-weight="bold">The champion is the SAFE frontier: steady cost vs transient lag</text>
-<text x="{cx}" y="50" text-anchor="middle" font-size="12" fill="#555">Each point a config at spm={spm}. x = steady tracking+effort, y = cold-start+detection lag. Lower-left better. Color = decline-safety (worst over the cross-rate grid). Dashed line = safe-config envelope.</text>
+<text x="{cx}" y="28" text-anchor="middle" font-size="16" font-weight="bold">The champion is the SAFE frontier: steady cost vs transient lag</text>
+<text x="{cx}" y="46" text-anchor="middle" font-size="12" fill="#555">Each point a config at spm={spm}. x = steady tracking+effort, y = cold-start+detection lag. Lower-left better.</text>
+<text x="{cx}" y="62" text-anchor="middle" font-size="12" fill="#555">Color = decline-safety (worst over the cross-rate grid). Dashed line = safe-config envelope.</text>
 "##,
         cx = w / 2
     ));

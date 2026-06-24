@@ -30,15 +30,15 @@ by measurement before they could be published (§8), and the surviving claims ar
 trustworthy precisely because the casualties are named rather than buried.
 
 Scope, stated once and honestly: the *behavioral* layer (counter-age blindness,
-champion-beats-incumbent on a live drop) is confirmed on real hardware for the
-*previous* champion; the present champion is a simulation re-selection under a
-corrected metric, and its decline response is hardware-confirmed *in direction*
-(it eases on the safe side, no rejection runaway) but its settled offset and its
-behavior on a slow *moderate* decline remain simulation results (§9.4). The
-cost-model weights remain a calibrated judgment.
+champion-beats-incumbent on a live drop) is confirmed on real hardware. For the
+present champion specifically, the decline response is hardware-confirmed *in
+direction* — it eases the safe way on a sustained 50% drop, with no rejection
+spike — while its settled over-difficulty figure and its behavior on a slow,
+moderate decline (the regime the safety gate binds on) remain simulation results
+(§9.4). The cost-model weights remain a calibrated judgment.
 
 Convention: *Theorem* and *Lemma* are reserved for results genuinely proved from
-the model (Theorems 1–2, the §4 Lemma, §6(ii)); everything else load-bearing is
+the model (Theorems 1–2, the §4 Lemma); everything else load-bearing is
 an *Argument*, *Rationale*, or *Choice* — our reasoning or our decisions — and
 *Observation* is a fact about particular algorithms established in simulation
 (named inline). Mathematical claims are never "validated numerically": they are
@@ -102,10 +102,12 @@ model can express. It assumes `H` is constant within a window (true over one
 retarget, false across a real ramp, which is why scenarios drive `H(t)`
 explicitly); one worker per connection (real connections pool many workers,
 raising the effective rate and reshaping the noise); retargets that are instant
-and lossless except for the in-flight work the §6 asymmetry already charges for;
-and a continuous difficulty with no floor and no rate limit on how often it can
-change (real pools clamp `D` from below and cap fire cadence). The cadence cap
-and the stale-share channel land on the effort term and are taken up in §7.
+and lossless — which, against this implementation, is exact, not an idealization:
+a retarget rejects no in-flight work (shares validate against a per-job target
+snapshot, §6), so there is no transition cost to model; and a continuous
+difficulty with no floor and no rate limit on how often it can change (real pools
+clamp `D` from below and cap fire cadence). The cadence cap and the churn/usability
+cost land on the effort term and are taken up in §7.
 Anything beyond this list is a coverage gap to declare, not a hole in the
 derivation.
 
@@ -324,23 +326,72 @@ visible measure of what raising `r*` buys.
 
 ## 6. The two directions are not symmetric
 
-**Argument.** *Over-difficulty is worse than under-difficulty, and tightening is
-worse than easing.*
+**Argument.** *Over-difficulty is worse than under-difficulty, and a controller
+should be reluctant to tighten and eager to ease.*
 
-*Why.* (i) `e < 0` (difficulty low): shares run a little fast; all work stays
-valid; cost is mild inefficiency. `e > 0` (difficulty high): the connection is
-starved of valid shares, which inflates both the miner's reward variance and the
-pool's hashrate-estimate variance for it — risking an offline misread — and
-compounds when `H` is genuinely falling. (ii) [proved] A tightening fire (`s>0`)
-invalidates in-flight shares aimed at the old, easier target — fraction `1 −
-e^{−s} > 0` lost; an easing fire leaves prior work valid. ∎
+*Why — the operating-point asymmetry (§6(i)), which is the whole basis.* `e < 0`
+(difficulty low): shares run a little fast; all work stays valid; cost is mild
+inefficiency, and it is the *safe* side. `e > 0` (difficulty high): the connection
+is starved of valid shares, which inflates both the miner's reward variance and
+the pool's hashrate-estimate variance for it — risking an offline misread — and
+compounds when `H` is genuinely falling (the death-spiral, §9). This grounds *both*
+halves of the asymmetry directly, without any appeal to transition cost:
+- **Eager to ease** (`s<0` fires readily) is death-spiral avoidance — the exact
+  mechanism the §9 safety story rests on: when `H` falls, ease fast to follow it
+  down rather than starve the miner.
+- **Reluctant to tighten** (`s>0` requires more evidence) suppresses false
+  excursions to the dangerous over-difficulty side, and when it lags a genuine
+  hashrate *increase*, it lags into *under*-difficulty — the benign, safe-but-
+  slightly-wasteful side. So tighten-reluctance is also a safety bias.
 
-This proves the *direction* of the asymmetry. Its *magnitude* is a judgment.
-**Choice 3:** weight both at `3:1` (over:under and up:down), matching the
-production `tighten_multiplier = 3` (commit `a1d3fa7b`). **Observation
+**Killed premise — the lost-in-flight-work argument (was §6(ii)).** Earlier
+versions justified the tightening penalty with a *proof* that a tightening fire
+invalidates in-flight shares aimed at the old target (fraction `1−e^{−s}` lost).
+**That is false against the implementation and is retracted.** A retarget mutates
+only the channel's current target (`extended.rs:341`); each job snapshots the
+target *at its creation* into `job_id_to_target` (`extended.rs:510/549/668`), and
+shares are validated against that per-job snapshot (`extended.rs:724`), not the
+current target, until the map is cleared on a new prev-hash (`extended.rs:586`).
+So a difficulty change rejects no in-flight work — old jobs stay valid until the
+next block — and it does not even force a job switch (it rides the normal job
+cadence), so there is no pipeline flush to charge for. Moreover, **share value is
+proportional to difficulty**: a share clearing a higher threshold is worth
+proportionally more, and a miner's credited work-rate equals its hashrate
+regardless of the difficulty the pool sets, so even a genuinely rejected
+low-difficulty share is not lost *earnings*. In expectation, churn costs the miner
+**no value at all**. Its only real costs are *variance* (overshoot into transient
+over-difficulty — which is §6(i), the safe-vs-dangerous-side concern, not a
+transition cost) and *usability* (rejections read as errors and muddy monitoring).
+
+**Choice 3 (re-homed and split).** The asymmetry's *existence and direction*
+stand on §6(i) safety, as above — not on lost work and not on simulation fitness.
+But the three "3:1" weights the paper carried were never one thing, and the killed
+premise lands surgically on exactly one of them:
+- **`regret_over:regret_under` (operating-point regret weighting): survives.**
+  Pure §6(i) — over-difficulty is the dangerous side. Unaffected.
+- **`tighten_multiplier` (boundary evidence asymmetry): survives, re-homed.**
+  Directional reactivity for safety (eager-ease / reluctant-tighten, above). The
+  carve-out does not touch it.
+- **`effort_up:effort_down` (the effort-*direction* asymmetry): loses its basis.**
+  This one was justified by lost in-flight work; with churn value-neutral, there
+  is no transition-cost reason to charge an upward step more than a downward one
+  of equal size. Its directional split is retired.
+
+*Magnitude is a tuning judgment, and the finding argues it down.* The `3.0`
+multiplier leaned on a fitness function weighting "stability" — which bundles
+`step_magnitude_safety` (overshoot → over-difficulty; pure §6(i), fully
+justified) with `jitter` (fire frequency). Value-neutrality specifically guts the
+*jitter* half: if firing costs no value, penalizing it heavily rests only on
+usability and minor pool overhead — much softer than a value cost. **Observation
 (`champion-weights`):** the best algorithm is the same for every ratio in `[1:1,
-4:1]`; only an ungrounded `5:1` changes it. So the ranking does not hinge on the
-exact value.
+4:1]`, and under balanced weights `1.5–2.0` ranks at least as well; only an
+ungrounded `5:1` changes the ranking. So the ranking does not hinge on the exact
+value, and the deflated jitter cost argues for the lower end of that range. The
+price of a smaller multiplier is being slower to track a genuine hashrate
+*increase* — but that lag lands on the benign under-difficulty side, so it is a
+price worth paying. The asymmetry's *direction* is safety-load-bearing; its
+*magnitude* is a soft tuning choice, no longer propped up by a transition cost
+that does not exist.
 
 *The under-difficulty side has its own cost, and the metric only partly prices
 it.* Under-difficulty (`e<0`) is not free: at the realized rate `r = r*·e^{−e}`,
@@ -380,15 +431,20 @@ Two things changed from the earlier version, both forced by measurement:
 **detection is no longer in the scalar** (§5 — floor-saturated at production
 rates), and **effort now carries a linear `Σ|s|` term alongside `Σs²`**. The
 linear term closes the dual of §4's blind spot: hold `Σs²` fixed, shrink each
-step's amplitude, and raise the fire frequency, and `Σ|s| → ∞` while `Σs² → 0`.
-Lost work is linear in each step (`1 − e^{−s} ≈ s`, §6(ii)), so cumulative lost
-work scales as `Σ|s|`, which the quadratic term cannot see — high-frequency,
-low-amplitude churn would otherwise score as "gentle." The quadratic term still does its own job
-(penalizing overshoot and concentrated actuation — one large retarget costs more
-than several small ones, `S² > k(S/k)²`). `λ` is anchored on principle (a tighten
-of step `s` loses `≈s` of in-flight work, §6(ii), so `Σ|s|` is cumulative
-lost-work in regret's currency; `λ=1` enters it at face value) and the champion
-is stable across `λ ∈ {0,½,1,2}` (§9).
+step's amplitude, and raise the fire frequency, and `Σ|s| → ∞` while `Σs² → 0` —
+so high-frequency, low-amplitude churn would otherwise score as "gentle," which
+the quadratic term cannot see. That blind spot is real and the linear term still
+closes it. What the term does **not** rest on — and an earlier version wrongly
+claimed it did — is *lost work*: §6 retracts the lost-in-flight-work premise (a
+retarget rejects no in-flight shares, and churn is value-neutral), so `Σ|s|` is
+**not** "cumulative lost work in regret's currency." It is a **churn/usability
+penalty** (frequent retargets read as errors, muddy monitoring, cost minor pool
+overhead) — a real but *soft* cost, not a value cost. Consequently `λ` is **not**
+anchored at `λ=1` "at face value"; it is a soft tuning weight. The quadratic term
+still does its own job (penalizing overshoot and concentrated actuation — one
+large retarget costs more than several small ones, `S² > k(S/k)²`, which is the
+§6(i) variance/over-difficulty concern). The champion is stable across `λ ∈
+{0,½,1,2}` (§9), so the deflation of `λ`'s justification does not move the result.
 
 *Assumption (fire cadence is capped).* Real pools forbid the churn corner with a
 **minimum inter-fire interval**, which the model adopts as an explicit
@@ -604,37 +660,50 @@ and first moved in the *wrong* direction; the champion responded in minutes and
 settled correctly (the §5 detection and §6 wrong-direction claims, outside
 simulation).
 
-**The present champion on iron — what now holds, and what is still owed.** The
-quantitative-mechanics and counter-age tests above were run on the *previous*
-(`s0.3`) champion. The present champion `Ewma360/s1.5` has since been deployed
-**pool-only** (no translator in the difficulty path, so its `VardiffState`
-governs the miner directly) at `r* = 6` and `r* = 30` spm and subjected to a
-sustained −50% step held ~50 min. The decline response reproduced PR #2154's
-result for the new parameters: the difficulty-implied hashrate **eased downward**
-to follow the drop, shares kept flowing, and — the load-bearing tell — the
-**share-rejection rate stayed flat at zero** through the decline. A runaway (the
-classic failure mode) would have pinned difficulty high and starved the miner,
-spiking rejections; their absence is direct evidence the champion eased on the
-safe side rather than into over-difficulty. So the **direction-and-starvation**
-claim — the one that matters most, and the death-spiral the §9 gate exists to
-prevent — now holds on hardware for the present champion, not only in simulation.
+**The hardware re-confirmation — what now holds, and what is still owed.** That
+first hardware test was run on the *previous* (`s0.3`) champion. The present
+champion `Ewma360/s1.5` is a simulation re-selection under the corrected metric
+(detection removed from the scalar, linear effort added, minimax over `r*`,
+decline-gate-as-constraint). What transfers by construction is the **mechanism** —
+counter-age blindness, the runaway direction, the gentleness/safety trade — all
+architectural and rate-driven, not parameter-specific. The specific
+parameterization's live behavior does not transfer, and was tested directly.
 
-Two things the live run does **not** yet license, kept explicitly sim-only.
-*(i) The settled offset.* The dashboards show direction and zero rejections, not
-the implied-H/true-H ratio at settle, and ~50 min at 6 spm is short of the
-120-min settle window (§9.2); so the quantitative `+2.7%` settled-over-difficulty
-figure remains a simulation result. *(ii) The gate-stress decline.* A −50% step
-is the *easy* signal — every reasonable config catches a halving fast (§9.2); the
-slow, *moderate* decline on which the safety gate actually binds (the corner that
-discriminates configs) was not run on iron. So the open hardware tests are: the
-quantitative settle measurement (pool `vardiff=debug` over a longer drop, to
-match `+2.7%`); the slow-moderate sustained decline, champion vs classic
-side-by-side; multi-connection operation (the model assumes one worker per
-connection); and measuring `c` to close the §6 share-volume term. Production runs at `r* ≈ 4–6`
-spm with headroom, and the model supports running *faster* — higher `r*` tightens
-both the detection floor and the estimate at a volume cost the headroom absorbs;
-this is the §8.4 lever, and it is the one recommendation that follows directly
-from the structural finding.
+On a pool-only deployment (so the champion's `VardiffState` governs the miner with
+no translator vardiff in the path), a sustained 50% hashrate drop at 6 and 30 spm
+produced the §9.2 signature on iron: the difficulty-implied hashrate **eased
+downward** to follow the decline — the safe direction, not the death-spiral — with
+shares flowing throughout and **no rejection spike** during the drop (the cleanest
+tell: a runaway would show rejections climbing as difficulty stayed too high for
+the reduced hashrate; there were none). This reproduces for `Ewma360/s1.5` what
+PR #2154 showed for the previous champion: a direction-correct, no-starvation
+response to a sustained loss.
+
+Two parts of the safety claim remain simulation-only, and the distinction matters:
+
+- *The settled figure, not just the direction.* The dashboard shows the implied
+  hashrate easing down and zero rejections — qualitatively safe — but not the
+  settled implied-H/true-H ratio the sim reports as `+2.7%`. The run was also
+  ~48 min, short of the sim's 120-min settle window: what is confirmed is *easing
+  correctly*, not the final settle point. The quantitative match needs
+  per-decision logging (pool `vardiff=debug`) over a longer drop.
+- *The gate-stress decline, not just the easy one.* A 50% drop is the *large, fast*
+  signal — the one every configuration catches quickly (§9.1, the −50% gate was
+  non-binding). The death-spiral risk the gate actually binds on is the *slow,
+  moderate* decline (the 1–40 %/hr sweep, board-shedding magnitudes ≈25–33%), where
+  a sleepy controller lags into over-difficulty. That regime is confirmed in
+  simulation only; the hardware test exercised the easy direction, not the gate's
+  binding corner.
+
+So the scope is precise: *the present champion's decline response is
+hardware-confirmed in direction and starvation-avoidance on a sustained 50% drop;
+its settled over-difficulty and its behavior on a slow moderate decline remain
+simulation results.* The remaining open hardware tests are a slow moderate decline
+on iron with `vardiff=debug` for the settled number, multi-connection operation
+(the model assumes one worker per connection), and measuring `c` to close the §6
+share-volume term. Production runs at `r* ≈ 4–6` spm with headroom, and the model
+supports running faster: a higher `r*` tightens both the detection floor and the
+estimate, at a share-volume cost the headroom absorbs.
 
 ---
 
@@ -686,29 +755,32 @@ data showing a non-trivial tail of connections living at 2–4 spm.
 | Detection not derivable from `e(t)` | Argument | §5 |
 | Detection floor-saturated at production rates → out of scalar | Observation | §5, `detection-control` |
 | Detection EXCESS rises with `r*` (the lever) | Observation | §8, `excess-lever` |
-| Over>under, tighten>ease | Argument (ii proved) | §6 |
-| `3:1` weight; robust over `[1:1,4:1]`; champion robust over `λ` | Choice + obs. | `a1d3fa7b`, `champion-weights` |
-| Linear `Σ\|s\|` effort term closes the churn blind spot | Argument | §7 |
+| Over>under, eager-ease/reluctant-tighten — direction safety-justified (§6(i)) | Argument | §6 |
+| Lost-in-flight-work premise (old §6(ii)) — RETRACTED: retarget rejects no in-flight shares (per-job target snapshot), churn value-neutral | Killed premise | §6, `extended.rs` |
+| `effort_up:effort_down` direction asymmetry retired (rested on lost work) | Killed premise | §6 |
+| `regret_over:regret_under` + `tighten_multiplier` survive on §6(i) safety; magnitude a soft tuning judgment, deflated toward `1.5–2.0` | Choice + obs. | `a1d3fa7b`, `champion-weights` |
+| Linear `Σ\|s\|` effort term closes the churn blind spot — re-homed as churn/usability cost, not lost work | Argument | §7 |
 | Champion = the *safe* frontier (not the cost frontier) | Observation | §8, `steady-transient` |
 | Decline-safety is a τ-valley, floored at the champion's window | Observation | §8, `tau-valley` |
 | Champion selected by minimax over `r*`, safety as constraint | Choice + obs. | §9, `sweep-minimax`, `slow-decline` |
 | Steady under-difficulty offset (`≈−0.67·σ_eff`) is cost-optimal | Observation | §10, `confirm-debias` |
 | Counter-age mechanism on real hardware | Observation (HW) | §9, PR #2154 |
 | *Previous* champion beats classic on a live drop | Observation (HW) | §9, PR #2154 |
-| *Present* champion decline response hardware-confirmed *in direction* (eases safe-side, no rejection runaway) | Observation (HW) | §9.4 |
-| Present champion settled-offset + slow-moderate-decline still simulation | Scope note | §9.4 |
+| *Present* champion: decline *direction* HW-confirmed (50% drop, no rejection spike) | Observation (HW) | §9.4 |
+| *Present* champion: settled-e and slow-moderate-decline gate still sim-only | Scope note | §9.4 |
 | Three hero premises drawn and killed by measurement | Method | §8.1 |
 
 The structural finding — across the operating band the field is flat, the
 residual axis is gentleness-and-safety not agility, detection is floor-limited at
 production rates, and the one lever is `r*` — is proved from Theorems 1–2 and
 confirmed by direct measurement.
-The champion is the existence proof that the safe corner of the frontier is
-occupiable, selected by minimax over `r*` with decline-safety as a hard
-constraint. The behavioral layer is externally confirmed on real hardware for the
-previous champion, and the present champion's decline response is hardware-
-confirmed *in direction* (eases safe-side, no rejection runaway, §9.4); its
-settled offset and its behavior on a slow *moderate* decline remain
-simulation-selected, and the cost-model weights remain a calibrated judgment —
-robust over the grounded range and open to the remaining hardware tests (§9.4)
-and an economic backtest.
+The champion is the existence proof that the safe corner of the frontier can be
+occupied, selected by minimax over `r*` with decline-safety as a hard constraint.
+The behavioral layer — counter-age blindness, the direction-correct response to a
+sustained loss — is externally confirmed on real hardware; for the present
+champion specifically, that decline response is hardware-confirmed in direction
+(a sustained 50% drop, eased the safe way, no rejection spike), while its settled
+over-difficulty figure and its behavior on a slow moderate decline remain
+simulation results, and the cost-model weights remain a calibrated judgment —
+robust over the grounded range and open to those measurements and an economic
+backtest.

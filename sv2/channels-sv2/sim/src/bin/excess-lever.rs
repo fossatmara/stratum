@@ -173,8 +173,9 @@ fn render(champ: &[f64], field: &[Vec<f64>]) -> String {
     s.push_str(&format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" font-family="system-ui, sans-serif" font-size="13">
 <rect width="100%" height="100%" fill="#fafafa"/>
-<text x="{cx}" y="30" text-anchor="middle" font-size="16" font-weight="bold">The lever: raising r* lifts a small drop above the information floor</text>
-<text x="{cx}" y="50" text-anchor="middle" font-size="12" fill="#555">False-alarm-corrected detection EXCESS of a −10% drop (15-min window) vs share rate. At production the drop is at the floor (60-min window: EXCESS=0.00, invisible); the lever is r*.</text>
+<text x="{cx}" y="28" text-anchor="middle" font-size="16" font-weight="bold">The lever: raising r* lifts a small drop above the information floor</text>
+<text x="{cx}" y="46" text-anchor="middle" font-size="12" fill="#555">False-alarm-corrected detection EXCESS of a −10% drop (15-min window) vs share rate.</text>
+<text x="{cx}" y="62" text-anchor="middle" font-size="12" fill="#555">At production the drop is at the floor (60-min window: EXCESS=0.00, invisible); the lever is r*.</text>
 "##,
         cx = w / 2
     ));
@@ -194,9 +195,9 @@ fn render(champ: &[f64], field: &[Vec<f64>]) -> String {
     let yz = ly(0.0);
     s.push_str(&format!(
         r##"<line x1="{ml:.1}" y1="{yz:.1}" x2="{:.1}" y2="{yz:.1}" stroke="#bbb" stroke-width="1.4"/>
-<text x="{:.1}" y="{:.1}" font-size="10" fill="#999">floor (drop invisible in-window)</text>
+<text x="{:.1}" y="{:.1}" text-anchor="end" font-size="10" fill="#999">floor (drop invisible in-window)</text>
 "##,
-        ml + pw, ml + 6.0, yz - 5.0
+        ml + pw, ml + pw, yz - 5.0
     ));
     // x grid (rates)
     for &xg in RATES {
@@ -218,10 +219,14 @@ fn render(champ: &[f64], field: &[Vec<f64>]) -> String {
     let (px0, px1) = (lx(4.0), lx(6.0));
     s.push_str(&format!(
         r##"<rect x="{px0:.1}" y="{mt:.1}" width="{:.1}" height="{ph:.1}" fill="#000" fill-opacity="0.03"/>
-<text x="{:.1}" y="{:.1}" text-anchor="middle" font-size="10" fill="#888">production (floor-limited)</text>
-<text x="{:.1}" y="{:.1}" text-anchor="middle" font-size="9" fill="#999">60-min window: 0.00 (invisible)</text>
+<text x="{:.1}" y="{:.1}" text-anchor="middle" font-size="10" fill="#888">production</text>
+<text x="{:.1}" y="{:.1}" text-anchor="middle" font-size="10" fill="#888">(floor-limited)</text>
+<text x="{:.1}" y="{:.1}" text-anchor="middle" font-size="9" fill="#999">60-min: 0.00</text>
 "##,
-        px1 - px0, (px0 + px1) / 2.0, mt + ph - 8.0, (px0 + px1) / 2.0, mt + ph - 20.0
+        px1 - px0,
+        (px0 + px1) / 2.0, mt + 14.0,
+        (px0 + px1) / 2.0, mt + 27.0,
+        (px0 + px1) / 2.0, mt + 41.0
     ));
     // field lines (faint, the "binds everyone" band)
     for row in field {

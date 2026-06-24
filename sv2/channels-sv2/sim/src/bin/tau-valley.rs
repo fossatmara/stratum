@@ -202,8 +202,9 @@ fn render(grid: &[Vec<f64>]) -> String {
     s.push_str(&format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" font-family="system-ui, sans-serif" font-size="13">
 <rect width="100%" height="100%" fill="#fafafa"/>
-<text x="{cx}" y="30" text-anchor="middle" font-size="16" font-weight="bold">Why the champion is the safe frontier: decline-safety is a valley in τ</text>
-<text x="{cx}" y="50" text-anchor="middle" font-size="12" fill="#555">Worst settled over-difficulty after a sustained decline (over the rate×spm grid) vs estimator window τ. Below the line = safe.</text>
+<text x="{cx}" y="28" text-anchor="middle" font-size="16" font-weight="bold">Why the champion is the safe frontier: decline-safety is a valley in τ</text>
+<text x="{cx}" y="46" text-anchor="middle" font-size="12" fill="#555">Worst settled over-difficulty after a sustained decline (over the rate×spm grid)</text>
+<text x="{cx}" y="62" text-anchor="middle" font-size="12" fill="#555">vs estimator window τ. Below the line = safe.</text>
 "##,
         cx = w / 2
     ));
