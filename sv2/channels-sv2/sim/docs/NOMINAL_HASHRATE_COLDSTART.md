@@ -134,32 +134,103 @@ available immediately. This is the recurring cost the seed could never touch
    correction). The vardiff-internal `new_seeded` constructors are left as
    additive, uncalled dead code; the pool call-site change was reverted.
 
-2. **Path B (runtime fusion of the downward step) is the whole game.** It is
-   where the only payoff the open-target path leaves on the table lives. It
-   requires a trait/channel API change and rests on a provenance guarantee the
-   protocol does not currently provide, so it must be argued on that payoff —
-   with the asymmetry (eager-ease only), provenance, and runtime-guard
-   requirements spelled out.
+2. **Path B (runtime fusion of the downward step) is the whole game — and it
+   does NOT need a trait change.** It is where the only payoff the open-target
+   path leaves on the table lives, and the downward-hint measurement (below)
+   established it as a pool-loop write to the operating-point register the
+   fire-path already owns — no `Vardiff` trait change, hard-set (α=1) the ship
+   form. What it *does* need is a real per-device `UpdateChannel` data source
+   (provenance) and the plausibility guard, both spelled out below. The trait/
+   channel API change is only required for the *upward* leg (recovery), which we
+   declined on safety grounds — so the API argument is scoped to a payoff we are
+   not pursuing.
 
 The honest one-line framing: **the channel already does the safe thing with the
 nominal (sets the operating point, not the belief); the only thing left worth
-doing is easing the operating point on a corroborated downward revision, and
-that needs a new interface.**
+doing is easing the operating point on a plausible downward revision — and that
+is a pool-loop write, not a new interface.**
 
 ---
 
-## What's measured / unmeasured
+## Path B measured: the downward-hint ceiling, and the damped-blend null
 
-**Measured (Path A, falsified):** `seed-rampup.rs`, 400 trials/cell — cold vs
-seeded per-tick `e` over 65 min at spm {6,12,30} × decl {1.0,2.0,0.5}×. Result
-above: redundant at 1.0×, −31…−39% at 2.0×, −6…−10% at 0.5×. Retires the seed.
+**The hint works (perfect-telemetry ceiling).** `downward-hint.rs`, champion
+Ewma360/s1.5. On a mid-run drop the pool eases the operating-point register
+(Ĥ ← declared) before `try_vardiff` — a pool-loop write to the register the
+fire-path already writes, NO `Vardiff` trait change. Decline leg: eliminates
+60–100% of the over-difficulty (starvation) area, largest where the share-only
+controller is slowest (sparse rates). Recovery leg: share-driven in all arms and
+statistically identical — the hint is one-sided, helps the decline, neutral on
+recovery. Steady state: converges across arms — transient-only, champion
+selection / τ-valley / lever / band do not reopen. Q1 (b-vs-c): the estimator
+rescale is a strict precision give-back (discards the EWMA's banked smoothing),
+so the zero-trait-change variant (no rescale) is as good or better — no trait
+hook needed.
 
-**Unmeasured (Path B, pre-registered before any numbers):**
-  - **Corroboration lag / detection-gap saving:** on a downward step with a
-    simultaneous `UpdateChannel`, the over-difficulty regret saved by easing the
-    operating point on the corroborated hint vs. shares-only. This is the number
-    that would justify the API change.
-  - **Upward-revision inertness:** confirm an upward hint changes nothing
-    measurable (it can only corroborate at the current `D`; if shares confirm,
-    shares already own the tighten). If the ablation shows it is pure dead weight,
-    the fuse is downward-only by construction — a smaller, safer API surface.
+**The damped-blend hypothesis was pre-registered and REFUTED.** Proposed
+mechanism (an agent's): hard-set (Ĥ ← declared) over-commits to a possibly-wrong
+declared value, so under telemetry noise a damped blend
+(Ĥ ← (1−α)·Ĥ + α·declared, α<1) should beat hard-set by averaging out the
+misread. Pre-registered as a crossover shape (P1), a noise-vs-lag distinction
+(P2), a gate⟷α substitution (P3), and an spm scaling (P4), each with a stated
+failure condition, locked on the realistic range σ∈[0,0.30] before any numbers.
+Result (`VARDIFF_DH_SWEEP=1`, 400 trials/cell):
+
+- **P1 — FAILED (null).** No interior α CI-separates from α=1 at any σ in the
+  locked range; α=1 (hard-set) is strictly best everywhere, monotone in α.
+- **P2 — REVERSAL (not merely a null).** Damping monotonically *worsens* the lag
+  axis (lower α → higher per-minute bias-rate at every lag/spm). This *disproves*
+  the over-commitment mechanism directly, rather than failing to support it.
+- **P3 — FAILED (null).** Gate and α are independent, not substitutes. The null
+  is meaningful *because* of the floor: observed fire-rate 1.00 against the
+  pre-registered 0.80 exclusion floor — zero cells excluded, so this is a real
+  null, not the fire-collapse case the floor exists to screen out.
+- **P4 — vacuous.** P1(a) never separates in-range, so there is no onset to shift.
+
+**Why hard-set wins — the cost asymmetry (this explains the null, not just
+reports it).** The two errors are not symmetric in *consequence* before any
+magnitude is measured: under-easing leaves you in the *self-reinforcing*
+over-difficulty direction (the blinding, starvation one the whole controller
+exists to escape), while over-committing to a noisy-low value puts you in the
+*self-correcting* under-difficulty direction. So the signs alone say under-easing
+is the worse error — and at realistic noise (σ≤0.30) the magnitudes confirm it:
+the over-difficulty area is large and a 30%-wrong eased value simply doesn't hurt
+as much as easing only partway does. Damping fails for the *same reason* the
+design eases fast and tightens slow — it is the §6 eager-ease/reluctant-tighten
+asymmetry again, not a separate empirical fact.
+
+**Where the crossover actually sits (post-hoc envelope, descriptive — NOT a
+pre-registered test).** Extending σ past the locked range (0.45, 0.60; added
+after the in-range nulls, labeled, changing no verdict): the α=1 advantage
+*narrows* with σ, and the α=1 / α=0.75 CIs first overlap at **σ≈0.60**. So a
+crossover region exists — but at σ≈0.60 the declared value lands below 0.5×
+truth ~20% of the time, which is precisely the plausibility gate's reject
+condition. **The damping knob and the plausibility gate address the same failure
+from opposite ends, and the gate wins: by the time noise is large enough to
+justify damping, it is large enough to reject the hint.** That is the structural
+reason α is not a useful knob — not "it didn't help in our range" but "the regime
+where it could help is the regime the guard already excludes."
+
+**Scope of the recorded claim (and what is NOT claimed):**
+1. Hard-set (α=1) is the ship recommendation in the realistic σ≤0.30 range,
+   dominant on both cost axes (over-diff area, under-diff wobble) across all
+   tested gates and spm.
+2. The α=1 advantage *narrows* with σ; α=1/α=0.75 CIs first overlap at σ≈0.60 —
+   a crossover region outside trustable telemetry noise and inside the gate's
+   reject band.
+3. The universal "damping never helps" claim is explicitly NOT made — the trend
+   is toward convergence past σ≈0.60, just past where the hint is usable. A
+   finite grid cannot establish the universal claim and we do not reach for it.
+
+**Status (sim-only; what closes the open task is specified, not gestured at):**
+The decline trigger is a perfect-telemetry-to-σ0.60 envelope in sim. Hardware
+validation is pending native-sv2 `UpdateChannel` traffic carrying a *real
+mid-run drop* **with per-device channel visibility at the pool** — NOT via the
+translator/shape-proxy aggregate. Native-sv2 miners pointing in is necessary but
+not sufficient: if they arrive *through* the proxy as part of the aggregate, the
+pool still sees one channel and the per-device drop is blurred (the same
+per-worker-carriage gap as the 0x0002 discussion). So the validation is not
+unblocked the moment a native miner connects — it needs per-device carriage. The
+open-time plausibility guard is a *more distant* horizon: sim-demonstrable but
+unfalsifiable on the current topology (one aggregate channel, no per-device open
+declarations). The two halves do not share a validation status.
