@@ -234,6 +234,77 @@ shootout objective must reward escaping the starved region fast, which
 plain symmetric regret under-weights (it integrates `e²`, but the
 *observability* penalty for `e>0` is extra and not captured by `e²`).
 
+### 5.2a A second sensor sidesteps the starvation — in one regime only
+
+§5.2 says the share stream starves exactly when `e>0`. There is a *second*
+sensor that does not: the miner's on-device telemetry, carried in the SV2
+`nominal_hash_rate` field (at open in `OpenChannel`, mid-run in
+`UpdateChannel`). The two sensors are complementary:
+
+- **Sensor 1 — the share stream.** Slow, consistent, unbiased, and
+  precision-floored at `1/√(r*·τ)` (§2). Always present once mining, but
+  its rate `r_obs = r*·e^(−e)` *collapses* in the over-difficulty regime —
+  the §5.2 death loop.
+- **Sensor 2 — device telemetry (`nominal_hash_rate`).** A *direct* report
+  of what the chips are doing, not an inference from share arrivals. Fast,
+  but intermittent, unverified, and frequently missing or misconfigured (one
+  observed deployment declared the sentinel `nominal = 1`).
+
+**This does not contradict §2, and the distinction is load-bearing.** §2's
+floor `Var(ê) ≥ 1/(r*·τ)` is a bound on estimating `H` *from the share
+stream* — it is a property of the **Poisson observation channel**, and "no
+estimator beats `1/√(r*·τ)`" quantifies over estimators *of that channel*.
+Sensor 2 is a **different channel the floor was never about**; it does not
+*beat* the share-channel floor, it *sidesteps* it — it carries its own error
+(device-reporting noise, staleness, the sentinel/missing failure modes),
+bounded by a *different* budget, not by `1/√(r*·τ)`. The conservation law
+stands untouched in both directions: Sensor 2 neither beats §2's floor nor is
+free of error, and because its error is *unverified* it must be guarded, not
+trusted as an oracle (the asymmetry below, and the runtime guard the feature
+design specifies). We have simply added an observation the law does not
+govern.
+
+The payoff is **asymmetric across the two starved regimes**, and the
+asymmetry is the whole point:
+
+- **Hashrate degradation (the rescue).** This is exactly the §5.2 death
+  loop: a real drop drives `e>0`, share rate collapses, detection starves.
+  Sensor 2 does *not* pass through the `e^(−e)` collapse, so a downward
+  `UpdateChannel` is available ~immediately — before the share stream
+  reveals the drop — and easing the operating point on it breaks the
+  positive feedback. Measured: this eliminates up to 60–100% of the
+  over-difficulty area *in the perfect-telemetry ceiling* (the realistic
+  noisy/laggy envelope is the pending follow-up)
+  (`sim/docs/NOMINAL_HASHRATE_COLDSTART.md`, Path B; binary
+  `sim/src/bin/downward-hint.rs`).
+- **Cold-start (*not* a rescue — there was nothing to rescue).** The naive
+  expectation is that Sensor 2 should also fix cold-start. It does not,
+  because cold-start is **not starved at the operating-point level**: the
+  channel's *opening difficulty is already derived from the nominal*
+  (`D_open = nominal/r*`), so the operating point begins informed by Sensor 2
+  the moment the channel opens. The remaining cold belief is the EWMA's, and
+  the attempt to also seed *that* from the nominal was tried and **refuted**
+  — it double-counts the nominal the open target already encoded and is
+  net-negative on inaccurate opens (`NOMINAL_HASHRATE_COLDSTART.md`,
+  retraction; binary `seed-rampup.rs`). So Sensor 2 helps in *one* of the two
+  weak regimes; the other was never starved where a second sensor could
+  reach it.
+
+The §6 eager-ease/reluctant-tighten asymmetry carries over directly, now as
+an *information* asymmetry on the hint: act eagerly on a downward revision
+(the safe, self-correcting direction), but **defer an upward revision to the
+share loop** — tightening on the miner's unverified say-so is the spiral
+entry of §5.1, and the protocol carries no field to distinguish a legitimate
+capacity increase from an unbacked claim. That the ease is a *hard set* (not
+a damped blend toward the declared value) and that the upward leg is deferred
+are *measured/decided*, not assumed (`NOMINAL_HASHRATE_COLDSTART.md`: the
+damped-blend hypothesis was pre-registered and refuted; the defer-upward leg
+decided by worst-case survivability).
+
+Scope: this is sim-validated to a telemetry-noise envelope (σ ≤ 0.30) and a
+perfect-telemetry ceiling. Live confirmation awaits native-SV2 per-device
+`UpdateChannel` traffic at the pool.
+
 ### 5.3 The `δ²` cancellation is fragile
 
 §3a assumes (a) an essentially optimal sequential detector, (b) that

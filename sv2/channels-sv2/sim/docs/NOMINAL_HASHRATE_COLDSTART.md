@@ -103,17 +103,44 @@ done as a per-call arg, because the hint arrives on a different clock than the
     with shares before acting). A downward hint is safe (eases) and can act
     faster. This is the §6 eager-ease/reluctant-tighten rule applied to the hint
     channel — but now at the granularity of individual `UpdateChannel` messages.
+  - **The topology-vs-say-so discriminator is NOT on the wire (corrected).** An
+    earlier design pass proposed splitting upward revisions three ways using
+    `aggregated_device_count` (count changed → real devices attached → honor the
+    tighten; count unchanged + nominal up → a per-device *claim* → defer). Reading
+    the actual `UpdateChannel` struct refuted it: its only three fields are
+    `channel_id`, `nominal_hash_rate`, `maximum_target` — there is no device
+    count, on this message or anywhere in channel state. So the pool CANNOT
+    distinguish a legitimate aggregate-attach upward revision from a say-so
+    upward claim; they arrive identically. The three-way classifier is
+    unbuildable, and the upward leg collapses to **defer** (below). This is the
+    same gap as the 0x0002 per-worker-carriage limitation, one layer down:
+    `UpdateChannel` carries no provenance marker *at all*, so the attach-vs-say-so
+    ambiguity persists even with per-device native-sv2 channels.
   - **Provenance decides coherence.** Fusion is only sound if the nominal is
     *device telemetry* (an independent measurement) — not a re-derivation of the
     share rate (circular) or a static config echo (stale). We have direct
     evidence this varies per deployment: of four observed slots, two carried
-    telemetry-shaped nominals and one carried the `nominal = 1` sentinel. There
-    is no protocol field that asserts provenance; `aggregated_device_count` is a
-    weak discriminator at best. A fusion that trusts a config-echo as telemetry
-    is worse than no fusion.
+    telemetry-shaped nominals and one carried the `nominal = 1` sentinel. No
+    protocol field asserts provenance. A fusion that trusts a config-echo as
+    telemetry is worse than no fusion.
   - **Runtime plausibility guard.** The same garbage declarations that the
     cold-start gate rejects once at open must be rejected *continuously* for
     fusion, including reconnect/re-open collisions.
+
+**The upward leg: DEFER (decided by worst-case survivability under the missing
+discriminator).** Since the pool cannot tell attach-upward from say-so-upward,
+whatever rule it picks is applied blind to both. Defer's worst case (a real
+attach → the channel runs under-difficulty for ~τ until the share-driven loop
+tightens — a bounded burst of cheap shares, self-correcting, safe direction) is
+survivable; honor's worst case (a say-so claim → over-difficulty injection, the
+self-reinforcing spiral entry) is the failure the whole controller exists to
+avoid. Pick the survivable worst case → **defer all nominal-driven tightening to
+the share loop.** The loss on the good case is small: on a real attach the share
+loop sees the new devices' shares immediately and tightens fast (rising
+share-rate is the self-healing direction), so the hint would have tightened only
+a few ticks sooner. (NB: a `maximum_target` *shrink* in the same `UpdateChannel`
+is still mandatory to honor per spec — defer drops the nominal-driven tighten,
+NOT a max_target shrink; they are separable.)
 
 **What it buys that the open-target path does NOT already solve:** the
 downward-step detection gap. The open target is set *once* at open and moves
@@ -149,6 +176,180 @@ The honest one-line framing: **the channel already does the safe thing with the
 nominal (sets the operating point, not the belief); the only thing left worth
 doing is easing the operating point on a plausible downward revision — and that
 is a pool-loop write, not a new interface.**
+
+---
+
+## The guard, as it will ship (handler-local, zero library change)
+
+A safety fix to the EXISTING `handle_update_channel` path, which today calls
+`update_channel` on every revision — meaning it currently *tightens on the
+miner's say-so*, the unguarded-upward injection the design forbids. The guard
+replaces that with:
+
+1. **Static plausibility floor** (no rate, no warmth signal): reject if the
+   declared nominal is non-finite, below an absolute floor (`nominal=1` sentinel
+   dies here), or carries a `max_target` that fails its own sanity check.
+2. **Plausible-downward → eager-ease**, hard-set (α=1, the σ-sweep ship form),
+   clamped to **both** the miner's `max_target` *and* the pool's floor — pass
+   `requested_max = miner_max.min(pool_max_target)` so `update_channel`'s
+   existing `target.min(requested_max)` (extended.rs:431) respects whichever
+   ceiling is harder. (Target-space: higher target = lower difficulty, so a
+   difficulty floor IS a target ceiling and `.min` picks the harder one — the
+   clamp is in the right space by construction.) **CONFIG GAP, stated here at
+   the clamp so it can't be misread:** `pool_max_target` has no real operand
+   today — the only pool floor is vardiff's `DEFAULT_MIN_HASHRATE = 1.0`, which
+   never bites. So *as shipped the second clamp is wired but bounded only by the
+   non-biting default; the ease is effectively clamped by the miner's `max_target`
+   alone until an operator sets a real pool difficulty band.* Do not read
+   "clamped to the pool's floor" as a live protection — it is wired-and-ready,
+   not active (full rationale below, "The pool-floor operand").
+3. **Plausible-upward → defer** to the share-driven loop (no nominal-driven
+   tighten). Decided by worst-case survivability under the missing discriminator
+   (above): defer's worst case is a bounded self-correcting share-burst; honor's
+   is the spiral.
+4. **`max_target` shrink honored in ALL branches** (spec-mandatory) — defer/
+   reject drop the nominal-driven tighten, NOT a shrink. BUT in the *reject*
+   branch the shrink-honor is gated on the `max_target`'s OWN sanity: a message
+   judged untrustworthy on its nominal does not get its `max_target` trusted
+   blindly (a sentinel-tight shrink is a ceiling-slam DoS, mirror of the
+   floor-slam). Sanity-gate the shrink, don't just check `is_shrink`.
+
+**The observable-keyed warm plausibility test was DROPPED — as clamp-redundant,
+not as wrong.** An earlier pass specified a warm test (reject a downward nominal
+implying `< 5%·r*` share-rate at the current target), keyed to estimator
+maturity. It is dropped, and the reasoning must be recorded precisely because it
+is *reversible*:
+  - On the only **acting** leg (downward), the harm the warm test prevented
+    (over-easing into a share-flood) is bounded by the **pool-floor clamp** —
+    *once a real floor is configured*: an ease cannot pass the pool's own floor,
+    and any ease above it is within the band the pool already sanctioned (worst
+    case = benign self-correcting under-difficulty). So the warm test prevents no
+    harm the clamp does not — **conditional on the floor existing.** Until the
+    operator sets a real band, the clamp is vacuous (config gap, item 2), so the
+    over-low-downward case ships bounded only by the *absolute* static floor and
+    the miner's `max_target` — an OPEN gap recorded next to the over-declared-open
+    hole, not a closed one. The redundancy that justified dropping the warm test
+    is therefore *conditional*, which the reversibility condition below makes
+    explicit.
+  - The warm test's *broader* original job was gating an **acting upward** leg
+    (in the three-way classifier). That leg became a flat **defer** when the
+    `aggregated_device_count` discriminator turned out to be off the wire — and
+    you don't gate what you don't act on. So the warm test lost its upward job to
+    a structural decision, not to being wrong.
+  - **Reversibility condition (for a future contributor):** the
+    "observable-keyed plausibility survives hardware generations" rationale was
+    NOT refuted — it was made *currently-unnecessary* by two facts: (a)
+    defer-upward and (b) the two-clamp pool floor. But (b) is itself only
+    *wired*, not active (the floor has no operand yet), so the over-low-downward
+    case is currently un-bounded by the clamp — the warm test would be the
+    interim guard for it. Restore the warm test if EITHER: a real pool floor is
+    *not* going to be configured soon (so the over-low case needs interim
+    cover), OR a future native-sv2 provenance marker resurrects an *acting*
+    upward leg (the warm test's original job). It was shelved for the leg
+    structure plus an assumed-coming floor, not discarded as unsound.
+
+**Net:** no `n_ticks`, no warmth signal, no cold-state seam (the design no longer
+*has* a cold case — there is no rate-keyed test to be cold or warm), no library
+or `Vardiff` trait change. Pure handler-local guard. Dormant on the current
+translator-aggregate topology (no `UpdateChannel` traffic); it makes the existing
+path safe and ready, payoff gated on native-sv2 + per-device carriage.
+
+---
+
+## The two-sensor feature: routing, home, and the OSS path
+
+This section places the guard above into the larger question of *where the
+two-sensor fusion should live* — and is careful to keep two registers visibly
+apart: **[DECIDED]** items are measured or settled (the guard spec above);
+**[PROPOSED — gated on live data]** items are directions for a future round and
+the upstream maintainer conversation, deliberately *not* designed at full
+resolution. A reader should be able to tell which is which at a glance; do not
+promote a [PROPOSED] item to [DECIDED] without the live data that gates it.
+
+### The architecture fork
+
+The fusion can live in one of two homes:
+
+- **Home A — pool-local guard [DECIDED, this is what ships].** The guard above,
+  in `handle_update_channel` (sv2-apps `mining_message_handler.rs`), before the
+  existing `update_channel` call. Zero `channels_sv2` change; reuses the
+  channel's existing `update_channel` / `get_nominal_hashrate` / `get_target`.
+  It also *fixes a live bug*: today's handler tightens on the miner's say-so
+  unconditionally (the unguarded-upward spiral hazard), so shipping the guard is
+  a safety fix regardless of the fusion payoff.
+
+- **Home B — stratum library abstraction [PROPOSED — gated on live data; pointer
+  fidelity only].** Make the fusion a first-class, reusable part of
+  `channels_sv2` so every SRI consumer inherits the safe behavior instead of
+  each pool reimplementing the guard. *Direction* (not a finished API): split
+  the conflated `nominal_hashrate` field (`server/extended.rs`, parallel in
+  `standard.rs`) into declared-vs-operating, and add a channel method (sketch
+  name `apply_hint(declared)`) encapsulating plausibility + direction-asymmetry +
+  clamp. The **`Vardiff` trait stays untouched — this part is [DECIDED]**, not
+  proposed: the trait is stateless re: belief and takes the operating point as
+  an argument, so fusion is an operating-point policy *upstream* of the trait,
+  not an estimator concern. The API *shape* is deliberately left open: it should
+  be designed with live data in hand for the upstream proposal, because
+  committing a sim-only policy to a core library's public surface is the
+  premature-abstraction trap (library API churn is the expensive kind).
+
+### Resolution: hybrid, sequenced [DECIDED]
+
+Ship Home A now (validate live, fix the live bug); propose Home B upstream once
+live data confirms the payoff. Rationale: Home A's guard logic *is* the literal
+spec for Home B's `apply_hint`, so A is not throwaway; and "here is live data"
+beats "here is a sim" for SRI reviewers — the data-confirmed contribution is both
+more accommodating to the OSS community and more likely accepted than a
+speculative one.
+
+### The pool-floor operand (the config gap, full statement) [DECIDED to ship non-biting]
+
+The downward-ease clamp needs a pool difficulty floor, and **none exists in pool
+config today** — only vardiff's `DEFAULT_MIN_HASHRATE = 1.0`, which never bites.
+This is a **pre-existing whole-pool policy gap, not guard scope**: the vardiff
+loop itself already runs against the same non-biting 1.0. Ship decision: wire the
+clamp to a non-biting default so it **cannot perturb the slots-3/4 reference
+baseline** (the same baseline-protection discipline that drove the seed
+rollback). Activating real protection requires an operator-set pool difficulty
+band `[min, max]` — flagged as a separate policy decision, **[PROPOSED]** for the
+operator, explicitly *not* a free default (a biting band would change live
+vardiff behavior on the reference baseline and must be chosen deliberately).
+
+### The OSS-upstreaming path for Home B [PROPOSED — gated on live data]
+
+What Home B buys the ecosystem: every implementation linking `channels_sv2`
+(pool, and any proxy/JDC opening server-side channels) inherits safe two-sensor
+fusion instead of reimplementing the guard, and the declared-vs-operating field
+split fixes a real design smell (one register conflating the miner's declaration
+with the controller's belief). The gate is live data first; the maintainer
+conversation starts from Home A's confirmed guard logic plus measured payoff, not
+from this doc's sim numbers alone.
+
+### Test strategy [route 1 DECIDED as the validation; route 2 PROPOSED enabler]
+
+Two routes to exercise the guard:
+
+1. **marafw 10%-drop reports [DECIDED — the load-bearing validation].** Real
+   native-SV2 `UpdateChannel` traffic from firmware reporting genuine hashrate
+   drops. This is the validation that gates Home B. **Open dependency:** needs
+   per-device channel visibility at the pool — on the current
+   sv1→translator→shape-proxy→pool topology the pool sees one aggregate channel,
+   so a native miner connecting is necessary-but-not-sufficient; per-device
+   carriage is the recorded blocker (the same gap as the 0x0002 discussion).
+
+2. **shape-proxy synthetic injection [PROPOSED — integration-test enabler, not
+   designed here].** For *integration* testing before/independent of real
+   firmware drops. The shape-proxy is a full SV2 upstream node but does **not**
+   currently emit `UpdateChannel` (confirmed: its message handling forwards/
+   shapes the share stream only). It *would* need a new endpoint (sketch
+   `POST /channels/{id}/send-update`) that builds and sends an `UpdateChannel`
+   upstream via its existing upstream writer, driven by its existing
+   `RateProfile` / HTTP-API surface, wired through hashrate-gardener's existing
+   curl-based control. Named as the next-round enabler; **not designed or built
+   here.** Note: synthetic injection tests the *guard's response*, not the
+   detection question — telemetry reports physical hashing, which dropping
+   share-accepts does not perturb, so the share-shaping the proxy does today
+   cannot itself produce a hint; the hint must be *supplied*.
 
 ---
 
