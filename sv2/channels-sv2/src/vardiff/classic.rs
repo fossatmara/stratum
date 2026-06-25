@@ -52,6 +52,41 @@ impl VardiffState {
             )),
         })
     }
+
+    /// Creates a `VardiffState` whose estimator is SEEDED from the channel's
+    /// declared `nominal_hash_rate` at open, collapsing the cold-start ramp
+    /// (see [`composed::champion_composed_seeded`]). `shares_per_minute` is the
+    /// target rate the open-time difficulty was set against.
+    ///
+    /// Drop-in for [`Self::new`] at the open-channel handler — the nominal and
+    /// spm are already in scope there, so this needs no channel/protocol API
+    /// change. Falls back to a cold start (use [`Self::new`]) if no plausible
+    /// nominal is available.
+    pub fn new_seeded(shares_per_minute: f32, prior_ticks: u32) -> Result<Self, VardiffError> {
+        Self::new_seeded_with_clock(
+            DEFAULT_MIN_HASHRATE,
+            shares_per_minute,
+            prior_ticks,
+            Arc::new(SystemClock),
+        )
+    }
+
+    /// As [`Self::new_seeded`] with a custom clock (simulation/testing).
+    pub fn new_seeded_with_clock(
+        min_allowed_hashrate: f32,
+        shares_per_minute: f32,
+        prior_ticks: u32,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self, VardiffError> {
+        Ok(VardiffState {
+            inner: Box::new(crate::vardiff::composed::champion_composed_seeded(
+                min_allowed_hashrate,
+                shares_per_minute as f64,
+                prior_ticks,
+                clock,
+            )),
+        })
+    }
 }
 
 impl Vardiff for VardiffState {

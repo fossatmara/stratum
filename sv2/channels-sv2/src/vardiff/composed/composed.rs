@@ -270,3 +270,39 @@ pub fn champion_composed(min_hashrate: f32, clock: Arc<dyn Clock>) -> ChampionCo
         clock,
     )
 }
+
+/// The champion, but with its estimator SEEDED from the channel's declared
+/// `nominal_hash_rate` at open — collapsing the §8.5 cold-start ramp.
+///
+/// At channel open the difficulty is set from the declared nominal
+/// (`D = nominal/r*`), so an accurate declaration produces ≈ `r*` shares/min at
+/// that difficulty; seeding the EWMA to that rate makes the controller believe
+/// ≈ the declared nominal from cycle one instead of climbing from the floor.
+///
+/// `shares_per_minute` is the target `r*` the difficulty was set against;
+/// `prior_ticks` is the seed's weight (small ⇒ shares overwrite it within ~τ;
+/// see [`EwmaEstimator::new_seeded`] for the safety rationale — the seed is a
+/// clamped, overwritable prior, not blind trust). The estimator is the ONLY
+/// stage that changes; boundary and update rule are identical to the champion,
+/// so a seeded channel and an unseeded one converge to the same steady state.
+///
+/// This needs NO channel/protocol API change: the caller (the pool's
+/// open-channel handler) already has `nominal_hash_rate` and `shares_per_minute`
+/// in scope when it builds the vardiff.
+pub fn champion_composed_seeded(
+    min_hashrate: f32,
+    shares_per_minute: f64,
+    prior_ticks: u32,
+    clock: Arc<dyn Clock>,
+) -> ChampionComposed {
+    Composed::new(
+        EwmaEstimator::new_seeded(360, shares_per_minute, prior_ticks),
+        AdaptiveSignPersist::sign_persist(
+            SignPersistenceCusumBoundary::new(1.5, 0.05, 8.0, 0.06, 0.6),
+            6,
+        ),
+        AcceleratingPartialRetarget::new(0.2, 0.6, 0.05),
+        min_hashrate,
+        clock,
+    )
+}

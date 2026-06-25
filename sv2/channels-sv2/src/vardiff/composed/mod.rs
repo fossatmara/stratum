@@ -43,7 +43,8 @@ pub use boundary::{
     WarmupBoundary,
 };
 pub use composed::{
-    champion_composed, classic_composed, ChampionComposed, ClassicComposed, Composed,
+    champion_composed, champion_composed_seeded, classic_composed, ChampionComposed,
+    ClassicComposed, Composed,
 };
 pub use decision::DecisionRecord;
 pub use estimator::Uncertainty;

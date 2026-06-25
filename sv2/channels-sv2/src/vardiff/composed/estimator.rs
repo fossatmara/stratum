@@ -260,6 +260,52 @@ impl EwmaEstimator {
         }
     }
 
+    /// Constructs an EWMA already seeded to a known share rate — the
+    /// cold-start hint from the channel's declared `nominal_hash_rate`.
+    ///
+    /// The default `new()` starts cold (`rate=0`, `n_ticks=0`) and must climb
+    /// from the floor on real shares — the ~65-min cold-start ramp (§8.5). At
+    /// channel open the miner *declares* a nominal hashrate, and the channel's
+    /// difficulty is set from it (`D = nominal/r*`); if the declaration is
+    /// accurate the miner therefore produces ≈ `r*` shares/min at that
+    /// difficulty. Seeding the EWMA's rate to `seed_spm·tick/60` makes the very
+    /// first `snapshot` believe ≈ the declared nominal, collapsing the ramp.
+    ///
+    /// SAFETY / why this is bounded, not blind trust:
+    ///   - The seed is a TIGHTEN-from-the-floor (the cold-start belief is below
+    ///     truth, §8.5), i.e. the dangerous over-difficulty direction. It is
+    ///     safe ONLY because (a) the channel clamps difficulty by the miner's
+    ///     own declared `max_target` (an inflated seed cannot push past the
+    ///     floor the miner accepted), and (b) `prior_ticks` is SMALL, so the
+    ///     first window of real shares overwrites the seed via the EWMA — the
+    ///     seed is a prior, not a commitment.
+    ///   - A larger `prior_ticks` trusts the hint longer (faster ramp collapse,
+    ///     slower correction of a bad hint); a smaller one is more cautious.
+    ///     `prior_ticks = 1` gives the seed roughly one tick's worth of weight.
+    ///
+    /// `seed_spm` is the share rate the declaration implies at the open-time
+    /// difficulty — i.e. the target `r*` (`shares_per_minute`) when the
+    /// declared nominal was used to set that difficulty. Callers that cannot
+    /// establish a plausible seed should use [`Self::new`] (cold).
+    pub fn new_seeded(tau_secs: u64, seed_spm: f64, prior_ticks: u32) -> Self {
+        use std::sync::atomic::AtomicU32;
+        use std::sync::atomic::AtomicU64;
+        let tick_secs = 60u64;
+        // rate is in shares-per-tick; seed_spm is shares-per-minute.
+        let seed_rate = seed_spm.max(0.0) * (tick_secs as f64 / 60.0);
+        Self {
+            tau_secs,
+            tick_secs,
+            rate_bits: AtomicU64::new(seed_rate.to_bits()),
+            pending_shares: AtomicU32::new(0),
+            // n_ticks>0 marks the EWMA as already-initialized, so the first
+            // real observation BLENDS with the seed (alpha·seed + (1-alpha)·obs)
+            // rather than replacing it — but with small prior_ticks the seed
+            // decays out within ~τ as designed.
+            n_ticks: AtomicU32::new(prior_ticks),
+        }
+    }
+
     /// Decay factor per tick: `exp(-tick_secs / tau_secs)`.
     fn alpha(&self) -> f64 {
         (-(self.tick_secs as f64) / (self.tau_secs as f64)).exp()
@@ -1568,6 +1614,35 @@ mod tests {
             ewma_tick(&mut e, 12);
         }
         assert!((e.rate_per_tick() - 12.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ewma_seeded_starts_at_declared_rate_not_zero() {
+        // Cold start believes nothing (rate 0 → 65-min ramp). A seed from the
+        // declared nominal makes the rate ≈ the seed spm from cycle zero, before
+        // any shares are observed. seed_spm=12, tick=60s → seed_rate=12/tick.
+        let cold = EwmaEstimator::new(360);
+        assert_eq!(cold.rate_per_tick(), 0.0);
+        let seeded = EwmaEstimator::new_seeded(360, 12.0, 1);
+        assert!((seeded.rate_per_tick() - 12.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ewma_seed_is_overwritten_by_shares_within_tau() {
+        // The seed is a prior, not a commitment: with small prior_ticks, a
+        // wrong seed (declared 2× truth) is pulled toward the true share rate as
+        // real observations arrive — converging to the same steady state a cold
+        // start would reach. After ~τ of on-truth shares it must sit at truth.
+        let mut e = EwmaEstimator::new_seeded(120, 24.0, 1); // seeded at 2× truth
+        assert!((e.rate_per_tick() - 24.0).abs() < 1e-9);
+        for _ in 0..200 {
+            ewma_tick(&mut e, 12); // truth is 12 spm
+        }
+        assert!(
+            (e.rate_per_tick() - 12.0).abs() < 1e-6,
+            "seed not overwritten: {}",
+            e.rate_per_tick()
+        );
     }
 
     #[test]
