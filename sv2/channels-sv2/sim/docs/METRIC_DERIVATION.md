@@ -563,6 +563,85 @@ confound: the floor sits at the champion's window at *every* fixed sensitivity).
 This converts "we picked this window" from a selection outcome into a visible
 physical reason.
 
+**Flagged — the safe window is a minimax over rate; the per-rate optimum moves
+(τ\*∝1/r, MEASURED), and the fixed window is the two-primitive balance, not a
+rate-invariant optimum.** Keep the *result* and the *interpretation* separate:
+the first is permanent, the second is the constraint-not-cost call.
+
+*The minimax vs the per-rate question.* The U above is `worst-settled-e` over the
+*worst cell of the whole rate×spm grid* (`tau-valley.rs`: minimax over rate), so
+its minimum is the single window safe across the *whole band* — the right object
+for an **admissibility** claim, and that claim is solid: fixed `tau_secs=360`
+stays decline-safe everywhere (worst settled **+2.7%** vs the 5% gate). What the
+minimax collapses, by construction, is whether the *per-rate* optimum moves.
+THEORY eq. (2) predicts it does (`T_d ∝ 1/(r*·δ²)` ⇒ `τ* ∝ 1/r`), and the
+champion is fixed `tau_secs=360`, **time-indexed and unscheduled** (source:
+`α = exp(−tick_secs/tau_secs)`).
+
+*RESULT (durable, measured — `tau-family.rs`).* Keeping the rate axis the minimax
+discards, the per-rate over-difficulty-area valley minimum **slides monotonically
+with rate**: argmin `τ*` = 240 → 150 → 45 → 30 across spm 2 → 30 (bracketed after
+extending τ down to the 30 s tick floor; a first pass railed at the grid edge).
+This is `τ*∝1/r` made literal. It is robust to both confounds: to the
+clamp-magnitude confound because it reads argmin *positions*, not depths; and to
+the `spm_threshold=6` guard switch because the slide holds *within* each control
+regime and *across* it. This is the result a future reader should treat as
+permanent — it survives every narrowing below.
+
+*INTERPRETATION (what the slide licenses about the champion — a two-primitive
+trade, not a one-axis verdict).* `τ*` minimizes *one* primitive (over-difficulty
+area, the escape-speed cost). The champion was selected on the gate *plus both
+primitives*. The admissibility check (`tau-family-safety.rs`) is decisive: at the
+per-rate optimum `τ*=30`, every high-spm cell **passes** the decline-safety gate
+(worst settled-e negative) — but carries **2–3× the under-difficulty wobble** of
+the champion (−14…−23 % vs −6…−8 %). So the fixed 360 is **over-damped on the
+over-difficulty axis and correctly-damped on the wobble axis** — it is the
+two-primitive balance, not a mistake. (`tau_family.svg`, two panels: short τ wins
+the left/over-difficulty axis, loses the right/wobble axis.)
+
+*The asymmetry the trade runs along (a structural fact, not a weighting).* The
+two axes are **not symmetric**, and this is the spine of the whole paper (§6,
+§9.2): over-difficulty is the self-reinforcing, spiral-direction cost the
+controller exists to bound; wobble is self-healing under-difficulty (more shares
+→ fast correction). So moving to shorter τ at high rate trades the **dangerous**
+axis *down* for the **safe** axis *up* — the same direction the
+eager-ease/reluctant-tighten asymmetry already commits the design to. The
+constraint-not-cost discipline refuses to fix a *scalar weighting* between the two
+costs, so we do **not** assert the trade is net-positive at any rate; but the
+directional asymmetry is structural, not a weighting, so we *can* state that it is
+a **favorable direction to trade — favorable precisely because it moves the
+dangerous (spiral) axis down and the safe (self-healing) axis up, which is what
+eager-ease already does** — with a bounded, self-correcting downside (the wobble
+is safe-side, so its tolerability is the kind of thing an operator can judge
+per-deployment, whereas the over-difficulty it relieves is not something to leave
+on the table).
+
+*But where on the band is the trade worth taking? — opposite to the raw ratio.*
+The over-difficulty magnitude is ≈10× at spm30 (1060 vs 81 e-min at τ=360 vs
+τ=30) — real, though partially clamp-confounded, so *indicative of scale*, not a
+pinned number. Critically, that ratio is **largest where the absolute stakes are
+smallest**: at high spm the absolute over-difficulty is already tiny (area 0–36
+at τ=30), so the 10× is 10× of not-much, bought with a *large* (2–3×) wobble
+increase — the *worst* place to take the trade. Where shaving over-difficulty
+actually matters is the sparse, low-rate, spiral-prone regime, where the absolute
+over-difficulty is large — but that is below the `spm_threshold=6` guard switch, a
+different controller. So the trade's *attractiveness* is itself rate-dependent and
+runs **opposite to the raw ratio**: a reader who sees "10× at spm30" must not
+conclude high rate is where share-indexing pays — it is the regime where the trade
+is least worth its wobble.
+
+**Net status:** §8.3's "safe window floored at the champion's window" is correct
+as an **admissibility/minimax** statement and stands. But the *gentlest* window is
+**rate-dependent (τ\*∝1/r, measured)**, and the fixed 360 is the balance of a real
+two-primitive trade — over-damped for over-difficulty, correctly-damped for
+wobble. A **share-indexed** span (a window in shares, not seconds) is the natural
+rate-aware **rebalancing** (not a *fix* — 360 is the balance, not a defect) that
+makes `τ*` rate-invariant in the unit that matters; adopting it would move toward
+the favorable (dangerous-axis-down) direction at a safe-side wobble cost whose net
+value is weighting-dependent and therefore deliberately not asserted here. This is no longer "weakly observed" — the slide and the trade are
+both measured (`tau-family.rs`, `tau-family-safety.rs`); what remains open is only
+the *weighting call*, which the constraint-not-cost discipline leaves to policy.
+
 ![Worst settled over-difficulty (over the cross-rate decline grid) versus
 estimator window τ. The curve is a U floored at the champion's window (τ=360,
 ringed): both flanks — sleepy long windows that lag a sustained decline, twitchy
@@ -570,6 +649,19 @@ short windows that overshoot it — rise above the +5% runaway gate (dashed). Th
 green band is the safe region. The valley is sensitivity-invariant (identical to
 0.1% across boundary sensitivities s0.3–s2), so it is a genuine window effect, not
 a window×threshold confound.](tau_valley.svg)
+
+The minimax-U above carries the *admissibility* half (one window safe across the
+whole band). The per-rate *family* below carries the other half the flag
+distinguishes — the slide and its trade. **LEFT (over-difficulty area, the
+dangerous/spiral axis):** one U-curve per share rate r\*; the ringed minimum
+slides left (`argmin τ*` 240→150→45→30) as r\* rises — `τ*∝1/r` measured. **RIGHT
+(wobble, the safe/self-healing axis):** the *same* short τ\* that wins the left
+panel *loses* here (the champion's 360 sits at 2–3× lower wobble). The two axes
+are **not symmetric** — over-difficulty self-reinforces (the spiral the controller
+exists to bound), wobble self-heals — so short τ trades the dangerous axis down
+for the safe one: a favorable *direction*, net value left to policy. Log-τ axis;
+spm<6 vs ≥6 differ by the guard switch. Generated by `tau-family.rs` /
+`tau-family-safety.rs`.](tau_family.svg)
 
 ### 8.4 The lever: raising `r*` buys agility (EXCESS vs `r*`)
 
