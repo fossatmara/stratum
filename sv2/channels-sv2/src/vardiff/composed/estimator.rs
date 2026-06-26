@@ -422,6 +422,169 @@ impl Estimator for EwmaEstimator {
     }
 }
 
+/// SHARE-INDEXED estimator — a rate-aware window, the contestant in the
+/// fixed-vs-rate-aware study (`sim/src/bin/tau-share-indexed.rs`,
+/// pre-registered). Identical to [`EwmaEstimator`] EXCEPT the decay weight is
+/// per-SHARE, not per-tick: `alpha = exp(-pending_shares / n_span)` instead of
+/// `exp(-tick_secs / tau_secs)`.
+///
+/// WHY (the theory, §5.2a / Theorem 2): a constant-shares window holds per-window
+/// precision `1/√(r*·τ_eff)` CONSTANT across rate by construction — its effective
+/// time-window `n_span/r*` shrinks as `r*` rises (jumpier high, sleepier low),
+/// tracking the per-rate optimum that a fixed-time window rides off at the band
+/// edges. No `r*` is ever computed (which would put the noisy rate estimate in
+/// the feedback path); the rate-awareness is implicit in counting shares.
+///
+/// `n_span` is GROUNDED, not chosen: `n_span = r_ref · τ_eff` so that this and
+/// the fixed champion COINCIDE at the reference rate `r_ref` (same shares-in-
+/// window ⇒ same precision and lag there) — making the comparison a clean test
+/// of *rate-awareness* rather than of window-size. At `r_ref=12 spm`, champion
+/// `τ=360s=6min` ⇒ `n_span = 12·6 = 72` shares. The coincidence is EXACT, not
+/// approximate: `exp(-pending/n_span) = exp(-tick/τ)` precisely when
+/// `pending = r_ref·tick` and `n_span = r_ref·τ`. (`r_ref` is itself a grounding
+/// choice and a sweepable axis, like the gate's k and δ_clock.)
+///
+/// Emergent rate-awareness, as a property of the rule: on an empty tick (no
+/// shares — low rate) `alpha = exp(0) = 1`, so the estimate is HELD (no shares =
+/// no information), where the time-EWMA would decay toward zero on the same empty
+/// tick. The window stretches itself when shares are sparse.
+#[derive(Debug)]
+pub struct ShareIndexedEstimator {
+    /// Window span in SHARES (the share-indexed analogue of `tau_secs`).
+    pub n_span: f64,
+    /// Tick interval in seconds (for the shares-per-min conversion at snapshot;
+    /// the decay does NOT use it — that is the whole point).
+    pub tick_secs: u64,
+    /// Current rate estimate in shares-per-tick. Bits via AtomicU64 for Send+Sync.
+    rate_bits: std::sync::atomic::AtomicU64,
+    /// Shares accumulated since last snapshot.
+    pending_shares: std::sync::atomic::AtomicU32,
+    /// Snapshots since last reset (0 ⇒ first observation sets the rate directly).
+    n_ticks: std::sync::atomic::AtomicU32,
+}
+
+impl ShareIndexedEstimator {
+    /// Construct with an explicit share-window span.
+    pub fn new(n_span: f64) -> Self {
+        use std::sync::atomic::{AtomicU32, AtomicU64};
+        Self {
+            n_span: n_span.max(1.0),
+            tick_secs: 60,
+            rate_bits: AtomicU64::new(0.0f64.to_bits()),
+            pending_shares: AtomicU32::new(0),
+            n_ticks: AtomicU32::new(0),
+        }
+    }
+
+    /// Construct by the GROUNDING rule: coincide with a time-EWMA of `tau_secs`
+    /// at reference rate `r_ref_spm`. `n_span = r_ref · (tau_secs/60)` shares.
+    /// This is how the study builds it (champion τ=360, r_ref=12 ⇒ n_span=72).
+    pub fn new_grounded(tau_secs: u64, r_ref_spm: f64) -> Self {
+        Self::new(r_ref_spm * (tau_secs as f64 / 60.0))
+    }
+
+    fn get_rate(&self) -> f64 {
+        f64::from_bits(self.rate_bits.load(std::sync::atomic::Ordering::Relaxed))
+    }
+    fn set_rate(&self, rate: f64) {
+        self.rate_bits
+            .store(rate.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+    /// Per-SHARE decay factor for a window observing `pending` shares this tick:
+    /// `exp(-pending / n_span)`. (The rate-aware analogue of `EwmaEstimator::alpha`.)
+    fn alpha_for(&self, pending: u32) -> f64 {
+        (-(pending as f64) / self.n_span).exp()
+    }
+    /// Current smoothed rate (shares per tick). For testing.
+    pub fn rate_per_tick(&self) -> f64 {
+        self.get_rate()
+    }
+}
+
+impl Estimator for ShareIndexedEstimator {
+    fn observe(&mut self, n_shares: u32) {
+        *self.pending_shares.get_mut() = self.pending_shares.get_mut().saturating_add(n_shares);
+    }
+
+    fn on_fire(&mut self, new_hashrate: f32, old_hashrate: f32) {
+        let pending = *self.pending_shares.get_mut();
+        let n_ticks = *self.n_ticks.get_mut();
+        // Flush pending into the rate with the PER-SHARE decay weight.
+        if pending > 0 {
+            let n = pending as f64;
+            let rate = if n_ticks == 0 {
+                n
+            } else {
+                let alpha = self.alpha_for(pending);
+                alpha * self.get_rate() + (1.0 - alpha) * n
+            };
+            self.set_rate(rate);
+            *self.n_ticks.get_mut() = n_ticks + 1;
+            *self.pending_shares.get_mut() = 0;
+        }
+        if old_hashrate <= 0.0 || new_hashrate <= 0.0 {
+            self.set_rate(0.0);
+            *self.n_ticks.get_mut() = 0;
+            return;
+        }
+        let ratio = new_hashrate as f64 / old_hashrate as f64;
+        if ratio > 0.0 && ratio.is_finite() {
+            self.set_rate(self.get_rate() / ratio);
+        } else {
+            self.set_rate(0.0);
+            *self.n_ticks.get_mut() = 0;
+        }
+    }
+
+    fn shares_count(&self) -> u32 {
+        self.pending_shares
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn code(&self) -> String {
+        format!("ShareIdx{}", self.n_span as u64)
+    }
+
+    fn snapshot(&self, dt_secs: u64, ctx: &EstimatorContext) -> EstimatorSnapshot {
+        let pending = self
+            .pending_shares
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let n_ticks = self.n_ticks.load(std::sync::atomic::Ordering::Relaxed);
+        let n = pending as f64;
+        // PER-SHARE decay: alpha = exp(-pending/n_span). On an empty tick
+        // (pending=0) alpha=1 ⇒ rate HELD (no shares = no information), the
+        // emergent window-stretch at low rate.
+        let rate = if n_ticks == 0 {
+            n
+        } else {
+            let alpha = self.alpha_for(pending);
+            alpha * self.get_rate() + (1.0 - alpha) * n
+        };
+        self.set_rate(rate);
+        self.n_ticks
+            .store(n_ticks + 1, std::sync::atomic::Ordering::Relaxed);
+        self.pending_shares
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+
+        // rate→h_estimate path IDENTICAL to EwmaEstimator (only the decay differs).
+        let realized_share_per_min = rate * (60.0 / self.tick_secs as f64);
+        let h_estimate = match hash_rate_from_target(
+            ctx.current_target.to_le_bytes().into(),
+            realized_share_per_min,
+        ) {
+            Ok(h) => h as f32,
+            Err(_) => ctx.current_hashrate * realized_share_per_min as f32 / ctx.shares_per_minute,
+        };
+        EstimatorSnapshot {
+            h_estimate,
+            realized_share_per_min,
+            n_shares: pending,
+            dt_secs,
+            uncertainty: None,
+        }
+    }
+}
+
 /// SPM-ratio estimator: EWMA-smoothed share rate, converted to a
 /// hashrate estimate purely via linear SPM-ratio scaling.
 ///
@@ -1614,6 +1777,97 @@ mod tests {
             ewma_tick(&mut e, 12);
         }
         assert!((e.rate_per_tick() - 12.0).abs() < 1e-6);
+    }
+
+    // ===================================================================
+    // ShareIndexedEstimator — P1 CONSTRUCTION CHECK (Stage 1 of the
+    // pre-registered study). These verify STEADY-STATE construction only:
+    // (does it track the optimum / coincide with the time-EWMA at r_ref).
+    // They DO NOT validate TRANSIENT behavior — the per-share window
+    // CONTRACTS at a rate spike (pending jumps → alpha shrinks → jumpier),
+    // which is the mechanism the sweep grades and which steady-state ticks
+    // never exercise. A clean pass here means "correctly built," NOT
+    // "behaves as expected under the sweep" — that is Stage 2 (transient
+    // trace), deliberately separate.
+    // ===================================================================
+    fn si_tick(e: &mut ShareIndexedEstimator, n_shares: u32) {
+        e.observe(n_shares);
+        let target = Target::MAX;
+        let ctx = EstimatorContext {
+            current_hashrate: 1.0e15,
+            current_target: &target,
+            shares_per_minute: 12.0,
+        };
+        e.snapshot(60, &ctx);
+    }
+
+    #[test]
+    fn share_indexed_first_observation_sets_rate_directly() {
+        let mut e = ShareIndexedEstimator::new(72.0);
+        si_tick(&mut e, 12);
+        assert!((e.rate_per_tick() - 12.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn share_indexed_converges_to_steady_input() {
+        // Tracks a steady share rate — the basic construction check.
+        let mut e = ShareIndexedEstimator::new(72.0);
+        for _ in 0..400 {
+            si_tick(&mut e, 12);
+        }
+        assert!((e.rate_per_tick() - 12.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn share_indexed_coincides_with_time_ewma_at_reference_rate() {
+        // THE GROUNDING-CORRECTNESS CHECK (load-bearing). At r_ref the two arms
+        // must be IDENTICAL: n_span = r_ref·(tau/60). With tau=360s, r_ref=12 spm,
+        // tick=60s → n_span=72, and each tick observes r_ref·tick/60 = 12 shares.
+        // Then share-indexed alpha = exp(-12/72) must equal EWMA alpha =
+        // exp(-60/360); both are exp(-1/6). Feed BOTH 12 shares/tick from the same
+        // start and they must track to floating-point agreement — confirming the
+        // grounding makes them the same controller at r_ref (so any later
+        // difference is rate-awareness, not a window-size confound).
+        let mut si = ShareIndexedEstimator::new_grounded(360, 12.0);
+        let mut ew = EwmaEstimator::new(360);
+        for _ in 0..200 {
+            si_tick(&mut si, 12);
+            ewma_tick(&mut ew, 12);
+        }
+        assert!(
+            (si.rate_per_tick() - ew.rate_per_tick()).abs() < 1e-9,
+            "share-indexed ({}) must coincide with time-EWMA ({}) at r_ref",
+            si.rate_per_tick(),
+            ew.rate_per_tick()
+        );
+        // and the grounded n_span is exactly 72.
+        assert!((si.n_span - 72.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn share_indexed_holds_estimate_on_empty_tick() {
+        // Emergent rate-awareness: on an empty tick (no shares) alpha=exp(0)=1,
+        // so the estimate is HELD — where a time-EWMA decays toward 0 on the same
+        // empty tick. Establish a rate, then feed one empty tick; share-indexed
+        // must be unchanged, EWMA must have decayed.
+        let mut si = ShareIndexedEstimator::new(72.0);
+        let mut ew = EwmaEstimator::new(360);
+        for _ in 0..50 {
+            si_tick(&mut si, 12);
+            ewma_tick(&mut ew, 12);
+        }
+        let si_before = si.rate_per_tick();
+        let ew_before = ew.rate_per_tick();
+        si_tick(&mut si, 0); // empty tick
+        ewma_tick(&mut ew, 0);
+        assert!(
+            (si.rate_per_tick() - si_before).abs() < 1e-12,
+            "share-indexed must HOLD on an empty tick (no shares = no info)"
+        );
+        assert!(
+            ew.rate_per_tick() < ew_before - 1e-6,
+            "time-EWMA must DECAY on an empty tick (the difference under test)"
+        );
     }
 
     #[test]

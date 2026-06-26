@@ -238,11 +238,6 @@
 //! Usage: cargo run --release --bin tau-share-indexed
 //! Env: VARDIFF_SI_TRIALS (default 80 base, CI-scaled), VARDIFF_SI_OUT.
 //!
-//! STATUS: SPEC ONLY — the ShareIndexedEstimator and the sweep are not yet
-//! written. This header locks the framing (tradeoff not payoff; P1/P2/P3/P4/P4b;
-//! admissibility is the gate, wobble is a measured output not a verdict) before
-//! any number exists. Implement against this; do not relax it to a "payoff."
-//!
 //! THE HEADLINE (the answer to "how hard to build and settle"): the build is
 //! HOURS (estimator) plus a DAY-PLUS (the jumpy-overshoot scenario + its
 //! trough-gate calibrated against the champion baseline — that calibration is
@@ -255,8 +250,175 @@
 //! cleared against the right failure mode" — i.e. CHARACTERIZED — and no
 //! further. That ceiling is a property of the QUESTION and the DEPLOYMENT, not
 //! the effort: it is a day from CHARACTERIZED, never a day from SETTLED.
+//!
+//! ===========================================================================
+//! RESULT — the study ran its PREMISE-CHECK stage and the chain TERMINATED there,
+//! at the right place. The ShareIndexedEstimator is BUILT (estimator.rs, P1
+//! construction-check passes: first-obs-sets-rate, converges-to-steady-input,
+//! coincides-with-time-EWMA at the reference rate to <1e-9, holds-on-empty-tick).
+//! Before building the graded sweep (P2/P3/P4), the single premise the whole
+//! feature rests on — τ*∝1/r, "the per-rate optimum is a constant share count" —
+//! was measured. It does NOT hold, and that collapses the reason to build further.
+//! ===========================================================================
+//!
+//! WHAT WAS MEASURED (three probes; each refuted a premise this study assumed):
+//!  1. τ*∝1/r is REFUTED AS AN EXACT FORM — the optimum still SLIDES, just gentler
+//!     than 1/r (NOT "the optimum is rate-invariant"; the slide is real and
+//!     confirmed). `tau-optimum-fit.rs` (fine short-τ-weighted grid, per-rate argmin
+//!     WITH valley-sharpness error bars): the per-rate optimum expressed IN SHARES is
+//!     NOT constant — spm6 band [2.4,5.6] vs spm30 band [12,12] are DISJOINT (the
+//!     slope exceeds the bars). τ* slides GENTLER than 1/r. The earlier coarse-grid
+//!     "4.5→15" was confirmed REAL curvature (not one-grid-step quantization) by the
+//!     error-bar refinement. CAVEAT recorded by the binary itself: spm12/20/30
+//!     argmins RAILED at the grid edge τ=24 — off-grid lower bounds.
+//!     RECONCILES WITH §8.3 (required — both artifacts describe this optimum and must
+//!     not appear to disagree): §8.3's DURABLE content is the DIRECTIONAL slide (the
+//!     minimax hides a per-rate optimum that MOVES with rate, sleepier-when-sparse) —
+//!     CONFIRMED, stands. What this REFUTES is §8.3's EXACT-PROPORTIONALITY LABEL,
+//!     "τ*∝1/r made literal," which §8.3 attached on a grid IT ITSELF flagged "railed
+//!     at the grid edge / coarse." The refutation is the REFINEMENT'S OWN clean
+//!     evidence — the WITHIN-BOUNDARY-REGIME disjoint bands (spm6 [2.4,5.6] vs spm30
+//!     [12,12], one controller, no guard switch) — NOT a re-reading of §8.3's
+//!     argmins. (Do NOT cite the spm2→spm30 shares-opt "8→15 rising" as corroboration:
+//!     that pair CROSSES the spm<6/≥6 guard switch — two stitched regimes, not one
+//!     curve — exactly the cross-switch artifact flagged as unreadable-as-a-slope.
+//!     §8.3's coarse, guard-fractured argmins are too crude to have "hinted" the
+//!     within-regime slope; the refinement ESTABLISHED it.) So: §8.3's directional
+//!     slide stands; the ∝1/r label was the coarse-grid overreach, refuted by the
+//!     refinement on its own within-regime evidence. "REFUTED" scopes to the EXACT
+//!     proportionality, NOT to the slide.
+//!  2. The high-rate optimum is REAL and SUB-TICK, not estimator degeneracy.
+//!     `tick-floor-probe.rs`: the over-difficulty curve is SMOOTH-monotone toward
+//!     short τ in BOTH arms straddling the 60s tick (no erraticism below the tick)
+//!     — so the railing at τ=24 is a true optimum BELOW the tick floor, not the
+//!     scan landing on noise past a resolution edge. The high-rate optimum wants a
+//!     window the 60s sim tick cannot represent.
+//!  3. "share-indexed worse on declines" is REFUTED as a matched-window ARTIFACT.
+//!     `decline-window-trace.rs` at the GROUNDED n_span=72: α_share≈0.66 < champion
+//!     0.846 throughout the decline — share-indexed runs a SHORTER window (jumpier),
+//!     and carries LESS over-difficulty (area 899 < 1156), not more. The probe's
+//!     "worse" was matched-to-LONG-τ (a longer window lags more — a property of the
+//!     window length, not of share-indexing). The "holds-on-empty-ticks stretches
+//!     the window on a decline" mechanism I had hypothesized does NOT occur at the
+//!     grounded config. No decline liability.
+//!
+//! THE STRUCTURAL FINDING (what the surviving measurement supports — a DIRECTION,
+//! never a value, and SCOPED TO ONE AXIS): the OVER-DIFFICULTY-optimal rate-coupling
+//! is INTERMEDIATE — window ∝ 1/r^p with p<1. Relative to the OVER-DIFFICULTY
+//! optimum, the fixed champion (p=0, window rate-independent) is too sleepy at high
+//! rate and constant-share indexing (p=1, window ∝ 1/r exactly) OVER-couples (slides
+//! the window harder than the over-difficulty optimum slides, hence too jumpy at
+//! high rate). On THAT axis the over-difficulty-optimal form couples window-to-rate
+//! LESS than proportionally — both endpoints are off it, for opposite reasons.
+//!
+//! THE DEPLOYMENT CLAUSE (do NOT read the above as a ship-this verdict — it is a
+//! one-axis result, and the project's whole discipline is not letting one axis
+//! stand in for the two-axis balance). The τ*-slope is the rate-dependence of the
+//! OVER-DIFFICULTY optimum — where the GATE's preferred coupling sits. But the
+//! DEPLOYED coupling (the champion's analogue: gentlest-admissible, ORDERED by
+//! wobble within the gate-admissible set) has a DIFFERENT rate-dependence — a slope
+//! this study did NOT measure. So:
+//!   · "p<1 is over-difficulty-optimal" is ESTABLISHED (the surviving slope).
+//!   · "p<1 is the DEPLOYMENT-optimal coupling" is UNMEASURED. Measuring it needs
+//!     the WOBBLE axis swept ACROSS RATE — the Stage-3 study deliberately NOT run.
+//!     Wobble pulls the deployment target away from the over-difficulty optimum
+//!     (§8.3); whether it pulls toward LESS coupling or MORE is exactly what the
+//!     unrun sweep would say. p=1-over-couples-on-over-difficulty does NOT establish
+//!     p=1-is-the-wrong-deployment-coupling.
+//!   · RECONCILIATION WITH THE COMMITTED §8.3 FLAG (required — both this record and
+//!     the flag describe the champion's coupling and must not appear to disagree):
+//!     §8.3 says the champion (p=0, fixed-τ) sits SLEEPER than the over-difficulty
+//!     optimum DELIBERATELY, because wobble pulls it there — "360 is the balance,
+//!     not a mistake." THAT VERDICT STANDS and this finding does NOT contradict it:
+//!     they concern DIFFERENT optima. p=0 being over-difficulty-suboptimal-toward-
+//!     sleepy is EXACTLY what trading toward the safe wobble axis looks like; calling
+//!     p=0 "wrong" would be wrong, because it is correctly placed on the BALANCE
+//!     while being off the over-difficulty optimum. This finding is about the
+//!     over-difficulty optimum; §8.3 is about the balance. No conflict.
+//!
+//! HONEST SCOPE — this rests on ONE measurement, not two, and supports a DIRECTION
+//! not a VALUE:
+//!  - It rests on ONE measurement: the τ*-slope (#1). The grounded-trace finding
+//!    (#3-corrected: constant-share is short/jumpy at high rate) is that slope's
+//!    CONSEQUENCE, not independent corroboration. "Constant-share is too jumpy" =
+//!    "its window is shorter than the optimum" = "the optimum slid gentler than
+//!    1/r" = the slope, restated. One finding in two presentations — NOT two
+//!    convergent confirmations. p<1 is exactly as well-supported as the slope is,
+//!    and no better. (Independence check, demanded before this was made durable:
+//!    confirmed NOT independent — same measurement twice.)
+//!  - p is a DIRECTION, not a fittable VALUE on this rig. Three contaminants, each
+//!    of the very slope you would fit p from: (a) the high-rate optima are RAILED
+//!    (off-grid lower bounds, #1 caveat) — biasing a fitted p TOO LOW (too-long
+//!    railed optima make the slope look gentler than it is); (b) the spm<6/≥6 guard
+//!    switch FRACTURES the slope (two different controllers — a single p across them
+//!    is meaningless); (c) the high-rate optimum is SUB-TICK (#2), so p would be fit
+//!    partly where the optimal window is UNREPRESENTABLE at 60s. Clean p-fittable
+//!    data is a NARROW mid-rate slice (~spm6–8: two located points plus three
+//!    railed) — too little to pin p, biased where it isn't. Fitting p would extract
+//!    a NUMBER from data that supports only a DIRECTION — the exact error this arc
+//!    kept catching, one level deeper.
+//!
+//! WHY NO FURTHER BUILD (the chain terminated correctly, not for fatigue):
+//!  - DON'T fit p and build the 1/r^p estimator: p is biased (railing) and
+//!    unsupported where it matters (sub-tick) — building on it repeats the
+//!    coarse-grid τ*∝1/r mistake one level down.
+//!  - DON'T build the plain p=1 (constant-share) graded sweep: the analysis just
+//!    identified p=1 as a WRONG ENDPOINT (over-coupled); characterizing it in
+//!    isolation characterizes a known-suboptimal config.
+//!  - The design finding (intermediate coupling; both endpoints wrong for opposite
+//!    reasons) IS the deliverable, reached analytically from the refined τ*(r) plus
+//!    the traces. P2/P3/P4/P4b stand as the spec they always were — NOT run,
+//!    because the premise that motivated them did not survive its own check.
+//!
+//! THE COMPLETE CEILING — FIVE WALLS, distinguished by WHY each is a wall (three
+//! resolution walls, one not-run, one policy — the honest end-state):
+//!   • SHAPE of the over-difficulty answer: KNOWN — over-difficulty-optimal coupling
+//!     is intermediate, p<1, both extremes off it for opposite reasons.
+//!   • VALUE of p: UNRESOLVABLE on this rig — railed + guard-fractured + sub-tick
+//!     (sim-tick resolution wall, for the parameter).
+//!   • the high-rate OPTIMUM itself: SUB-TICK — below the 60s clock (sim-tick
+//!     resolution wall, for the optimum).
+//!   • DEPLOYMENT coupling (is the gate-plus-wobble BALANCE also p<1, and what is
+//!     its p): UNMEASURED — NOT RUN, distinct from sub-resolution. It needs the
+//!     WOBBLE axis swept across rate (the Stage-3 study deliberately not built); the
+//!     over-difficulty slope measured here does not determine it. This is precisely
+//!     what stopping at the design finding leaves open: the over-difficulty axis's
+//!     coupling shape is in hand; the deployment axis's coupling is the thing not
+//!     built. (Consistent with §8.3: the champion is balanced on this axis, p=0.)
+//!   • NET VALUE ("is it better"): OPEN — the over-diff/wobble weighting the
+//!     project refuses to fix (policy, not measurement).
+//!   • HARDWARE validation: UNREACHABLE — a second-order effect below sample
+//!     resolution; even the first-order champion claims came back sim-only.
+//!   We know the STRUCTURE of the over-difficulty answer and the PRECISE reason each
+//!   deeper level is unreachable — three resolution walls, one not-run, one policy.
+//!   That is the chain terminating where it should.
+//!
+//! STATUS: estimator BUILT (estimator.rs, P1 passes); premise MEASURED and REFUTED
+//! (tau-optimum-fit, tick-floor-probe, decline-window-trace); structural finding
+//! ESTABLISHED (over-difficulty-optimal coupling is p<1 — a direction, ONE axis);
+//! deployment coupling UNMEASURED (needs the unrun wobble-across-rate sweep); graded
+//! sweep DELIBERATELY NOT BUILT (p sub-resolution; building it fits a biased number
+//! or characterizes a known-wrong-on-over-difficulty endpoint). Characterized,
+//! never settled — by the QUESTION, not the effort.
 
 fn main() {
-    eprintln!("tau-share-indexed: SPEC ONLY — pre-registration locked, estimator + sweep not yet built.");
-    eprintln!("See the module header for the tradeoff framing and P1/P2/P3 before implementing.");
+    eprintln!("tau-share-indexed: premise MEASURED, chain TERMINATED at the structural finding.");
+    eprintln!("Estimator BUILT (estimator.rs P1 passes); graded sweep deliberately NOT built.");
+    eprintln!();
+    eprintln!("FINDING (ONE axis — over-difficulty): the OVER-DIFFICULTY-optimal rate-coupling is");
+    eprintln!("  INTERMEDIATE — window ∝ 1/r^p, p<1. Relative to the over-difficulty optimum, fixed");
+    eprintln!("  champion (p=0) is too sleepy at high rate; constant-share (p=1) over-couples (too jumpy).");
+    eprintln!();
+    eprintln!("DEPLOYMENT CLAUSE: this is NOT a ship-this verdict. The DEPLOYED coupling is the");
+    eprintln!("  gate-plus-WOBBLE balance (the champion's criterion), a DIFFERENT slope NOT measured here.");
+    eprintln!("  §8.3 stands: champion (p=0) is correctly BALANCED, not a mistake — different optimum.");
+    eprintln!();
+    eprintln!("EVIDENCE (one measurement + its consequence, NOT two independent confirmations):");
+    eprintln!("  - tau-optimum-fit:      τ*∝1/r REFUTED — shares-opt spm6 [2.4,5.6] vs spm30 [12,12] DISJOINT.");
+    eprintln!("  - tick-floor-probe:     high-rate optimum is REAL + SUB-TICK (smooth curves both arms).");
+    eprintln!("  - decline-window-trace: 'share-indexed worse on declines' REFUTED — matched-window artifact.");
+    eprintln!();
+    eprintln!("CEILING (5 walls): over-diff shape KNOWN; p UNRESOLVABLE (railed+guard-fractured+sub-tick);");
+    eprintln!("  DEPLOYMENT coupling UNMEASURED (unrun wobble-across-rate); net value OPEN (refused");
+    eprintln!("  weighting); hardware UNREACHABLE (second-order). See the module header.");
 }

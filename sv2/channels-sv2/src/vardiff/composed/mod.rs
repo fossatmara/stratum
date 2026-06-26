@@ -50,8 +50,8 @@ pub use decision::DecisionRecord;
 pub use estimator::Uncertainty;
 pub use estimator::{
     BayesianEstimator, CkpoolEstimator, CumulativeCounter, DebiasEstimator, Estimator,
-    EstimatorContext, EstimatorSnapshot, EwmaEstimator, KalmanEstimator, SlidingWindowEstimator,
-    SpmRatioEstimator, TimeBiasEwmaEstimator,
+    EstimatorContext, EstimatorSnapshot, EwmaEstimator, KalmanEstimator, ShareIndexedEstimator,
+    SlidingWindowEstimator, SpmRatioEstimator, TimeBiasEwmaEstimator,
 };
 pub use update::{
     AcceleratingPartialRetarget, AdaptivePartialRetarget, CkpoolRetarget, FullRetargetNoClamp,
