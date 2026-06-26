@@ -54,23 +54,81 @@
 //!       Without that, P3's "admissible at every cell" is scoped to the wrong
 //!       failure mode and is not a real pass. This is the load-bearing addition.
 //!
-//!       TROUGH-GATE DEFINITION (pin BEFORE numbers — the symmetric trap). "Gate
-//!       on the trough" has a free parameter the settled-e gate didn't: the
-//!       WINDOW over which the trough is measured. Too short → catches single-tick
-//!       Poisson noise (every jumpy window "fails" on one unlucky sample — false
-//!       fail); too long → re-averages the trough back toward settled-e and
-//!       misses the transient again (the original disease). So the trough gate
-//!       must pre-register: (window) the worst over-difficulty `e` SUSTAINED over
-//!       a rolling W-minute window (W tied to operational meaning, NOT to what
-//!       makes the comparison clean — e.g. the duration of over-difficulty that
-//!       actually risks the starvation spiral or materially starves the miner;
-//!       the settled-e gate's own +5%/120-min recovery is the precedent to set W
-//!       and the threshold commensurately); (threshold) the over-difficulty `e`
-//!       level that counts as a breach, chosen so the gate expresses the SAME
-//!       admissibility criterion as the settled-e gate (don't sit over-difficulty
-//!       dangerously), measured for the transient rather than the steady state —
-//!       NOT a stricter or looser bar. An uncalibrated W or threshold makes the
-//!       pass/fail an artifact of the pick, as arbitrary as a fabricated heatmap.
+//!       TROUGH-GATE DEFINITION — FULLY GROUNDED, zero chosen parameters (pinned
+//!       BEFORE numbers; reached by reading the clock expression recursively
+//!       until no controller parameter remained — see "the recursion" below).
+//!       The gate has TWO δ's that measure DIFFERENT things and never touch:
+//!
+//!         BREACH:  over-difficulty `e > δ_threshold`, δ_threshold = 0.05.
+//!           INHERITED from the settled-e gate — commensurate on WHAT COUNTS as
+//!           over-difficulty (a LEVEL; 5% is the admissibility line). The breach
+//!           test NEVER uses δ_clock. δ_threshold is the ONLY fixed parameter, and
+//!           it is correctly fixed (it is the inherited admissibility level, not a
+//!           soft mechanism crossover).
+//!
+//!         WINDOW:  a breach must be SUSTAINED ≥ W(r*) to count. W is the
+//!           floor-limited spiral-onset time — how long ANY floor-limited
+//!           estimator would take to detect an excursion of spiral-risk depth at
+//!           the COLLAPSED rate (the best anyone could do → arm-independent):
+//!             W(r*) = k · z² · e^(δ_clock) / (r* · δ_clock²)
+//!           term by term, every one channel/floor/mechanism/swept:
+//!             · 1/δ_clock²  — the Fisher/information floor (Var ≥ 1/(r*·τ_eff) ⇒
+//!               resolving δ needs τ_eff ≥ z²/(r*·δ²) shares-worth-of-time);
+//!             · e^(δ_clock) — the `e^(−e)` collapse factor at the spiral-risk
+//!               depth (the mechanism that drives the spiral), so r_obs = r*·e^(−δ);
+//!             · r*          — the rate (independent variable);
+//!             · z²          — the detection-CONFIDENCE constant (how many σ of
+//!               separation counts as "detected"; "resolve δ" means δ ≥ z·SE).
+//!               This is the FLOOR-ANALOGUE OF THE α we dropped — a confidence
+//!               knob hiding inside "detection time." It is O(1) and a pure
+//!               MULTIPLIER on W, so it FOLDS INTO the swept k (k·z² is one
+//!               relabeled swept constant; a 1σ-vs-2σ choice is within the
+//!               k-sweep's span). NOT a separate fixed knob — verified, not assumed.
+//!             · α, τ        — ABSENT. The SPRT 2·log(1/α) (controller confidence
+//!               overhead, back-door τ) was dropped; no controller window appears.
+//!
+//!         THE TWO δ's, why different and why both right:
+//!           δ_threshold (5%) is a LEVEL — correct for "is this over-difficulty
+//!             unacceptable," inherited so both gates agree on what counts.
+//!           δ_clock is a TIMESCALE-SETTING DEPTH — must be where `e^(−e)`
+//!             MATERIALLY collapses the stream (~0.5: e^(−0.5)≈0.6, a 40% collapse,
+//!             genuine spiral territory), NOT 5% (e^(−0.05)≈0.95, no collapse —
+//!             grounding the CLOCK there gave the implausibly-long ~17–133min W,
+//!             the gate reporting it measured the wrong quantity). At δ_clock=0.5
+//!             W ≈ k·6.6/r* — a genuine TRANSIENT window, ~60× shorter, cleanly
+//!             separated from the 120-min settle window, which is what lets the
+//!             gate catch a short deep jumpy spike as transient.
+//!
+//!         TWO SWEPT SENSITIVITY AXES (neither chosen; both reported as curves):
+//!           k       ∈ {0.5, 1, 2, 4}  — soft crossover multiplier (spiral-onset
+//!             is a soft threshold, not sharp; absorbs z²).
+//!           δ_clock — swept WIDE, [0.1, 0.9] (or until the boundaries appear),
+//!             NOT pre-narrowed to [0.3,0.7]. The band edges are NOT waste: at low
+//!             δ_clock the clock is so slow both arms PASS (confirms "too shallow
+//!             ⇒ vacuous gate"); at high δ_clock so fast both arms FAIL (confirms
+//!             "too deep ⇒ impossibly strict"); the differential, if real, lives
+//!             BETWEEN those boundaries and is LOCATED by them — seeing all three
+//!             (low-both-pass, middle-differential, high-both-fail) is what proves
+//!             the differential is not a windowing artifact. Pre-narrowing to
+//!             [0.3,0.7] would define the band by the answer expected (excluding
+//!             the regions where the result is predicted) — the last smuggled
+//!             choice; sweeping wide turns the boundaries into the calibration.
+//!
+//!       So: breach at δ_threshold (level, fixed, inherited), window at δ_clock
+//!       (depth, swept wide), k swept (absorbs the confidence constant), r* the
+//!       independent variable, α/τ absent. ZERO chosen parameters; two reported
+//!       sensitivity axes; the differential located against its own boundaries.
+//!
+//!       THE RECURSION (why this is now actually closed). "Read the rig before
+//!       trusting it" applied recursively, four levels, each the same shape — a
+//!       parameter of the thing-being-judged hiding in the judge, caught by
+//!       reading the actual expression not the clean-looking form: (1) slow-decline
+//!       probed sleepy-lag not jumpy-overshoot (wrong failure mode); (2) W grounded
+//!       in τ (the controller's window — circular); (3) T_d carried α (controller
+//!       confidence — back-door τ); (4) "resolve δ" carried z² (the floor-analogue
+//!       confidence constant — folds into k). The recursion TERMINATES here: every
+//!       term is provably channel/floor/mechanism/swept, nothing controller-specific
+//!       remains. That termination IS what "fully grounded" means.
 //!
 //!       CHAMPION AS BASELINE ON THE NEW SCENARIO (the control — non-optional).
 //!       The fixed champion cleared the SETTLED-e gate; it was NEVER tested for
