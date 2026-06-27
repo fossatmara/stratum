@@ -715,4 +715,58 @@ scenario = "stable_1ph"
             panic!("Regression detected:{}", msg);
         }
     }
+
+    /// The shipped-champion grid regression. Mirrors the classic anchor test,
+    /// but builds `champion_composed` (the production constructor) via
+    /// `run_baseline_with`, so it pins the SHIPPED algorithm's typical-behavior
+    /// grid — NOT a re-spelled copy of its parameters.
+    ///
+    /// Scope: cold-start/stable/step (the `default_cells` grid). This does NOT
+    /// cover the decline-safety margin — the champion's actual selection
+    /// criterion — which is guarded by
+    /// `decline_safety::tests::champion_clears_decline_gate`. The two are
+    /// complementary: this catches gross typical-behavior drift; that guards
+    /// the load-bearing admissibility claim.
+    #[test]
+    #[ignore = "slow regression test; run with `cargo test --release -- --ignored`"]
+    fn champion_algorithm_no_regression() {
+        use crate::baseline::run_baseline_with;
+        use channels_sv2::vardiff::composed::champion_composed;
+
+        let baseline_str = include_str!("../baseline_champion.toml");
+        let baseline = parse_baseline_toml(baseline_str).expect("baseline parses");
+
+        let cells = default_cells();
+        let current = run_baseline_with(
+            &cells,
+            baseline.meta.trial_count,
+            baseline.meta.base_seed,
+            |clock| champion_composed(1.0, clock),
+        );
+
+        let report = compare_to_baseline(&current, &baseline);
+
+        if !report.is_clean() {
+            let mut msg = String::new();
+            if !report.failures.is_empty() {
+                msg.push_str(&format!("\n{} tolerance failures:\n", report.failures.len()));
+                for d in &report.failures {
+                    msg.push_str(&format!("  {}\n", d));
+                }
+            }
+            if !report.baseline_cells_not_in_current.is_empty() {
+                msg.push_str("\nbaseline cells not in current:\n");
+                for k in &report.baseline_cells_not_in_current {
+                    msg.push_str(&format!("  {}\n", k));
+                }
+            }
+            if !report.current_cells_not_in_baseline.is_empty() {
+                msg.push_str("\ncurrent cells not in baseline:\n");
+                for k in &report.current_cells_not_in_baseline {
+                    msg.push_str(&format!("  {}\n", k));
+                }
+            }
+            panic!("Champion regression detected:{}", msg);
+        }
+    }
 }

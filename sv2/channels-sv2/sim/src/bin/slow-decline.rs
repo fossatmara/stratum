@@ -71,17 +71,13 @@ use channels_sv2::vardiff::composed::{
     Composed, EwmaEstimator, PoissonCI, SignPersistenceCusumBoundary,
 };
 use channels_sv2::vardiff::MockClock;
-use vardiff_sim::baseline::{Phase, Scenario, DEFAULT_BASELINE_SEED, TRUE_HASHRATE};
+use vardiff_sim::baseline::DEFAULT_BASELINE_SEED;
+use vardiff_sim::decline_safety::{
+    decline_scenario, DECLINE_OBSERVE_MIN as OBSERVE_MIN, DECLINE_SAFETY_GATE_PCT,
+    DECLINE_TICK_SECS as TICK,
+};
 use vardiff_sim::grid::{AlgorithmSpec, VardiffBox};
 use vardiff_sim::trial::{run_trial_observed, TrialConfig};
-
-const TICK: u64 = 60;
-const MATURE_MIN: u64 = 60; // counter matured on-target before the decline
-const OBSERVE_MIN: u64 = 120; // settle window after the decline floor — long
-                              // enough that a 2-spm reaction completes, so
-                              // "settled" is steady state, not residual lag
-const MAX_DECLINE_MIN: u64 = 240; // cap a slow decline at 4h
-const TARGET_DROP: f32 = 0.50; // decline until 50% lost (or the 4h cap)
 
 /// A SignPersist-family config by (tau, sens) — the two axes the minimax-over-
 /// r* band sweep stresses. tighten=8, d0.06, etaMax0.6, accel0.05 fixed.
@@ -174,46 +170,6 @@ fn interim() -> AlgorithmSpec {
             clock,
         )))
     })
-}
-
-/// A sustained decline scenario as a Custom phase list: mature on-target,
-/// then drop at `rate_pct_per_hr` in fine 1-min Hold steps until TARGET_DROP
-/// (capped at MAX_DECLINE_MIN), then hold at the floor. Returns the scenario
-/// and (decline_start, decline_end, trial_end) for the readout — trial_end
-/// is after the post-decline observe window, where we sample the *settled*
-/// error (so a deep-but-recovering lag is not misread as a runaway).
-fn decline_scenario(rate_pct_per_hr: f32) -> (Scenario, u64, u64, u64) {
-    let rate = rate_pct_per_hr / 100.0; // fraction/hr
-    // minutes to reach TARGET_DROP at this rate, capped.
-    let decline_min = ((TARGET_DROP / rate) * 60.0).min(MAX_DECLINE_MIN as f32) as u64;
-    let mut phases = vec![Phase::Hold {
-        secs: MATURE_MIN * 60,
-        h: TRUE_HASHRATE,
-    }];
-    // Fine 1-min declining segments.
-    for m in 0..decline_min {
-        let frac = (rate / 60.0) * (m as f32 + 1.0); // fraction lost by minute m+1
-        let h = TRUE_HASHRATE * (1.0 - frac).max(1.0 - TARGET_DROP);
-        phases.push(Phase::Hold { secs: 60, h });
-    }
-    let floor = TRUE_HASHRATE * (1.0 - (rate / 60.0 * decline_min as f32).min(TARGET_DROP));
-    phases.push(Phase::Hold {
-        secs: OBSERVE_MIN * 60,
-        h: floor,
-    });
-    let start = MATURE_MIN * 60;
-    let end = start + decline_min * 60;
-    let trial_end = end + OBSERVE_MIN * 60;
-    (
-        Scenario::Custom {
-            name: format!("decline_{}pph", rate_pct_per_hr as u32),
-            phases,
-            initial_estimate: None, // start aligned with truth
-        },
-        start,
-        end,
-        trial_end,
-    )
 }
 
 struct Row {
@@ -395,7 +351,7 @@ fn main() {
     let mut fails = 0;
     for r in &rows {
         // A genuine runaway = settled (recovered) e still materially over-difficulty.
-        let runaway = r.settled_e_pct > 5.0;
+        let runaway = r.settled_e_pct > DECLINE_SAFETY_GATE_PCT;
         let flag = if runaway { " ⚠RUNAWAY" } else if r.tighten_fires > 0.05 { " ·wrongdir" } else { "" };
         if runaway { fails += 1; }
         println!(
@@ -404,7 +360,7 @@ fn main() {
             r.max_e_pct, r.settled_e_pct, flag, r.mean_e_pct
         );
     }
-    println!("\nRunaway cells (settled e > 5% over-difficulty): {}.", fails);
+    println!("\nRunaway cells (settled e > {}% over-difficulty): {}.", DECLINE_SAFETY_GATE_PCT, fails);
     // Lag-vs-bias diagnostic for the sub-guard cells: if mid-window e is
     // materially ABOVE end-window e, the offset is still relaxing (residual
     // decline lag, benign); if mid ≈ end, it is a true steady-state offset.

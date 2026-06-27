@@ -73,6 +73,7 @@
 
 pub mod baseline;
 pub mod composed;
+pub mod decline_safety;
 pub mod grid;
 pub mod metrics;
 pub mod naming;

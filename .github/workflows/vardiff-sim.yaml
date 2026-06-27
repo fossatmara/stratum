@@ -48,10 +48,14 @@ jobs:
       - name: Fast unit tests
         run: cargo test --lib --verbose
 
-  # Slow regression check: cargo test --release --lib -- --ignored runs
-  # the full 50-cell × 1000-trial baseline regression. ~15-20s.
-  # The current algorithm's behavior is asserted against the checked-in
-  # baseline_VardiffState.toml with CI-aware tolerance budgets.
+  # Slow regression check: `cargo test --release --lib -- --ignored` runs the
+  # three drift guards (~35s total), each with CI-aware tolerance budgets:
+  #   - classic_algorithm_no_regression  — the classic comparison anchor
+  #     (baseline_classic.toml).
+  #   - champion_algorithm_no_regression  — the SHIPPED champion's typical-
+  #     behavior grid (baseline_champion.toml).
+  #   - champion_clears_decline_gate      — the champion's decline-safety MARGIN
+  #     (its selection criterion; not covered by the grid baselines).
   test-regression:
     name: regression vs checked-in baseline
     runs-on: ubuntu-latest

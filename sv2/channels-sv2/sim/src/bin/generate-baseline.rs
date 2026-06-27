@@ -1,16 +1,29 @@
-//! Runs the default baseline grid against the **classic** algorithm
-//! (`classic_composed`; production `VardiffState` is now the champion) and
-//! writes `baseline_classic.toml` (machine-readable, consumed by regression
-//! assertions) and `baseline_classic.md` (human-readable summary) to the
-//! current working directory.
+//! Generates the tracked **CI regression-fixture** baselines over the default
+//! grid and writes `baseline_<algorithm>.toml` (machine-readable, consumed by
+//! the regression assertions) and `baseline_<algorithm>.md` (human-readable
+//! summary) to the current working directory.
+//!
+//! Two fixtures are generated:
+//!   - `classic`  — `classic_composed`, the comparison anchor ("the algorithm
+//!     we used to run"; not the shipped default).
+//!   - `champion` — `champion_composed`, the SHIPPED production algorithm
+//!     (built from the production constructor directly, so the fixture pins the
+//!     real shipped behavior, not a re-spelled copy of its parameters).
+//!
+//! Note: this grid is cold-start/stable/step only — it does NOT cover the
+//! decline-safety margin (the champion's selection criterion). That margin is
+//! guarded separately by the `decline_safety::champion_clears_decline_gate`
+//! assertion. This fixture catches gross drift in typical behavior.
 //!
 //! ## Usage
 //!
-//! From the sim crate root:
+//! From the sim crate root (generates both fixtures):
 //!
 //! ```text
 //! cargo run --release --bin generate-baseline
 //! ```
+//!
+//! Restrict to one with `VARDIFF_BASELINE_ALGO=classic` (or `champion`).
 //!
 //! ## Configuration via environment
 //!
@@ -32,9 +45,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use channels_sv2::vardiff::composed::{champion_composed, classic_composed};
 use vardiff_sim::baseline::{
-    default_cells, run_baseline, serialize_markdown, serialize_toml, DEFAULT_BASELINE_SEED,
-    DEFAULT_TRIAL_COUNT,
+    default_cells, run_baseline_with, serialize_markdown, serialize_toml, CellResult,
+    DEFAULT_BASELINE_SEED, DEFAULT_TRIAL_COUNT,
 };
 
 fn main() -> std::io::Result<()> {
@@ -43,33 +57,70 @@ fn main() -> std::io::Result<()> {
     let out_dir = env::var("VARDIFF_BASELINE_OUT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."));
+    // `classic`, `champion`, or unset/`all` for both.
+    let only = env::var("VARDIFF_BASELINE_ALGO").ok();
 
     let cells = default_cells();
+    fs::create_dir_all(&out_dir)?;
+
+    let want = |name: &str| only.as_deref().map_or(true, |o| o == name || o == "all");
+
+    if want("classic") {
+        let results = run_one("classic", &cells, trial_count, base_seed, |clock| {
+            classic_composed(1.0, clock)
+        });
+        write_baseline(&out_dir, "classic", &results, trial_count, base_seed)?;
+    }
+    if want("champion") {
+        let results = run_one("champion", &cells, trial_count, base_seed, |clock| {
+            champion_composed(1.0, clock)
+        });
+        write_baseline(&out_dir, "champion", &results, trial_count, base_seed)?;
+    }
+
+    Ok(())
+}
+
+fn run_one<V: channels_sv2::vardiff::Vardiff>(
+    label: &str,
+    cells: &[vardiff_sim::baseline::Cell],
+    trial_count: usize,
+    base_seed: u64,
+    build: impl Fn(std::sync::Arc<channels_sv2::vardiff::MockClock>) -> V + Copy,
+) -> Vec<CellResult> {
     eprintln!(
-        "Running baseline: {} cells × {} trials = {} total trials, base_seed = {:#x}",
+        "Running {} baseline: {} cells × {} trials = {} total trials, base_seed = {:#x}",
+        label,
         cells.len(),
         trial_count,
         cells.len() * trial_count,
         base_seed,
     );
-    eprintln!("Output directory: {}", out_dir.display());
-
     let started = Instant::now();
-    let results = run_baseline(&cells, trial_count, base_seed);
-    let elapsed = started.elapsed();
-    eprintln!("Baseline run complete in {:.2}s", elapsed.as_secs_f64());
+    let results = run_baseline_with(cells, trial_count, base_seed, build);
+    eprintln!(
+        "{} baseline run complete in {:.2}s",
+        label,
+        started.elapsed().as_secs_f64()
+    );
+    results
+}
 
-    let toml = serialize_toml(&results, "classic", trial_count, base_seed);
-    let md = serialize_markdown(&results, "classic", trial_count, base_seed);
-
-    fs::create_dir_all(&out_dir)?;
-    let toml_path = out_dir.join("baseline_classic.toml");
-    let md_path = out_dir.join("baseline_classic.md");
+fn write_baseline(
+    out_dir: &std::path::Path,
+    algorithm: &str,
+    results: &[CellResult],
+    trial_count: usize,
+    base_seed: u64,
+) -> std::io::Result<()> {
+    let toml = serialize_toml(results, algorithm, trial_count, base_seed);
+    let md = serialize_markdown(results, algorithm, trial_count, base_seed);
+    let toml_path = out_dir.join(format!("baseline_{algorithm}.toml"));
+    let md_path = out_dir.join(format!("baseline_{algorithm}.md"));
     fs::write(&toml_path, toml)?;
     fs::write(&md_path, md)?;
     eprintln!("Wrote {}", toml_path.display());
     eprintln!("Wrote {}", md_path.display());
-
     Ok(())
 }
 
