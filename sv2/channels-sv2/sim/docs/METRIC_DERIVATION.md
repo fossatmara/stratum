@@ -738,7 +738,9 @@ a window×threshold confound.](tau_valley.svg)
 
 The minimax-U above carries the *admissibility* half (one window safe across the
 whole band). The per-rate *family* below carries the other half the flag
-distinguishes — the slide and its trade. **LEFT (over-difficulty area, the
+distinguishes — the slide and its trade.
+
+![Per-rate τ-family, two panels. **LEFT (over-difficulty area, the
 dangerous/spiral axis):** one U-curve per share rate r\*; the ringed minimum
 slides left (`argmin τ*` 240→150→45→30) as r\* rises — `τ*∝1/r` measured. **RIGHT
 (wobble, the safe/self-healing axis):** the *same* short τ\* that wins the left
