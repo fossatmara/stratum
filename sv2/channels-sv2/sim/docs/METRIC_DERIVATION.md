@@ -687,16 +687,12 @@ two axes are **not symmetric**, and this is the spine of the whole paper (§6,
 controller exists to bound; wobble is self-healing under-difficulty (more shares
 → fast correction). So moving to shorter τ at high rate trades the **dangerous**
 axis *down* for the **safe** axis *up* — the same direction the
-eager-ease/reluctant-tighten asymmetry already commits the design to. The
-constraint-not-cost discipline refuses to fix a *scalar weighting* between the two
-costs, so we do **not** assert the trade is net-positive at any rate; but the
-directional asymmetry is structural, not a weighting, so we *can* state that it is
-a **favorable direction to trade — favorable precisely because it moves the
-dangerous (spiral) axis down and the safe (self-healing) axis up, which is what
-eager-ease already does** — with a bounded, self-correcting downside (the wobble
-is safe-side, so its tolerability is the kind of thing an operator can judge
-per-deployment, whereas the over-difficulty it relieves is not something to leave
-on the table).
+eager-ease/reluctant-tighten asymmetry already commits the design to, with a
+bounded, self-correcting downside (the wobble is safe-side, so its tolerability is
+the kind of thing an operator can judge per-deployment, whereas the over-difficulty
+it relieves is not something to leave on the table). Whether that **favorable
+direction** is net-positive is the *weighting call* — deliberately not asserted, and
+resolved to policy-only by the rate-aware closure (see Net status).
 
 *But where on the band is the trade worth taking? — opposite to the raw ratio.*
 The over-difficulty magnitude is ≈10× at spm30 (1060 vs 81 e-min at τ=360 vs
@@ -720,9 +716,17 @@ wobble. A **share-indexed** span (a window in shares, not seconds) is the natura
 rate-aware **rebalancing** (not a *fix* — 360 is the balance, not a defect) that
 makes `τ*` rate-invariant in the unit that matters; adopting it would move toward
 the favorable (dangerous-axis-down) direction at a safe-side wobble cost whose net
-value is weighting-dependent and therefore deliberately not asserted here. This is no longer "weakly observed" — the slide and the trade are
-both measured (`tau-family.rs`, `tau-family-safety.rs`); what remains open is only
-the *weighting call*, which the constraint-not-cost discipline leaves to policy.
+value is weighting-dependent and therefore deliberately not asserted here. This is
+no longer "weakly observed" — the slide and the trade are both measured
+(`tau-family.rs`, `tau-family-safety.rs`). What remains open is only the *weighting
+call* — and the **rate-aware closure has since settled that this weighting call is
+the *entirety* of share-indexing's question**: rate-coupling has **no admissibility
+content in either regime** (§6.1; the deployment-coupling and guard-spiral sweeps
+established both regimes self-correct — dense via escape-sub-spiral so no gate binds,
+sparse via the estimator-carried recovery — neither a safety axis). So a
+share-indexed window is a **policy/wobble dial with no safety content**, not a live
+open question; the constraint-not-cost discipline leaves that policy call to the
+operator, and there is **nothing further to *measure***.
 
 ![Worst settled over-difficulty (over the cross-rate decline grid) versus
 estimator window τ. The curve is a U floored at the champion's window (τ=360,
@@ -964,14 +968,31 @@ scored ensemble — a coverage gap to declare, not a soundness error. Three furt
 premises *did* fail and were retired (§8.1); that they were drawn, measured, and
 killed is the mechanism by which the survivors earn trust.
 
-**Declared coverage gap (d): the asymmetry-blind sub-guard.** Below spm6 the
-guard is a symmetric PoissonCI, so it abandons the §6 safety asymmetry exactly
-where data is sparsest — a known, bounded degradation (the offset is inside the §3
-noise band there, σ≈45% at 2 spm), not a soundness error. The named fix
-(`AsymmetricPoissonCI`, in the codebase) is *deferred*: taking it reopens champion
-selection at the margin and owes a spm≥6 re-confirmation, a bad trade for cells
-below the operating range. The trigger that would force it: real connection-rate
-data showing a non-trivial tail of connections living at 2–4 spm.
+**Declared coverage gap (d): the sub-guard boundary is asymmetry-blind — by
+design, and the estimator covers it.** Below spm6 the guard is a symmetric
+PoissonCI, so the *boundary* provides no directional (reluctant-tighten)
+protection where data is sparsest. This is **not** an abandonment of safety: §6.1
+established that at sparse rate the dangerous-direction protection is
+**estimator-carried** (the slow Ewma360 sets fire direction and, via low
+belief-volatility, produces no threshold-clearing self-deepening spike —
+`belief-vs-op.rs`), and §9.2's gate confirms the champion has **zero runaway cells
+including the sub-guard 2–4 spm cells (+2.7%)**. The symmetric boundary
+self-deepens at sparse rate only with a *fast* estimator (`eager-ease-mechanism`:
+4 fires at Ewma30 vs 0 at the champion's Ewma360) — the champion's slow estimator
+is exactly why the sub-guard is safe. What *is* genuinely degraded at sparse rate
+is **accuracy** — the steady-state offset is lost inside the §3 noise band (σ≈45%
+at 2 spm) — but that is an accuracy point, not a safety one, and it stands on a
+2–4 spm tail alone. The named option (`AsymmetricPoissonCI`, in the codebase) is
+therefore **optional hardening / defense-in-depth** — boundary-level directional
+protection, redundant with the estimator's *for the champion's slow estimator*
+(load-bearing only with a faster estimator, the 4-fires case) — **not a safety
+fix**, and it is *deferred*: taking it reopens champion selection at the margin and
+owes a spm≥6 re-confirmation, a bad trade for cells the estimator already covers
+safely. The trigger that would reopen **AsymmetricPoissonCI specifically** (not the
+sub-guard concern generally — the accuracy degradation surfaces on the tail alone):
+real connection-rate data showing a non-trivial tail at 2–4 spm *and* a reason to
+run a faster estimator there, the only regime where boundary-level sparse asymmetry
+would add protection the slow estimator isn't already providing.
 
 ---
 
