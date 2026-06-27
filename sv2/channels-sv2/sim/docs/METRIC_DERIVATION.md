@@ -691,6 +691,20 @@ physical reason.
 > τ-prediction may NOT be extrapolated "to any boundary" — only within the family it
 > was measured in. (The settled-e SIGN even flips across boundary type at fixed τ,
 > which a pure-window-property reading would forbid.)
+>
+> **And the consequence for THIS section's other content — the valley numbers are
+> SignPersist-specific (do not read them as boundary-general).** Everything in §8.3 —
+> the U floored at 360, the +2.7/+3.5/+5.9 settled gradient across 360/240/120, the
+> τ*∝1/r slide — was measured under SignPersistenceCusum. The valley *as measured
+> stands* (it is a SignPersist result, and the champion ships SignPersist), but
+> finding 2 establishes its *quantitative shape is boundary-type-specific*: a
+> different boundary gives a different gradient (the same τ=120 that sits at +5.9%
+> here under SignPersist sits at +1.8% under AdaptivePoissonCusum at spm6–8 — the
+> flank is shifted, the crossing relocated). So the valley's numbers characterize
+> *SignPersist at this window-family*, not a universal τ-cost law. NOTE this does NOT
+> weaken the production selection: Ewma360 ships *with* SignPersist, so the
+> +2.7%-passes result is the right gradient for the shipped controller — it is only
+> the *generality* of the gradient that narrows, not its validity for the champion.
 
 **Flagged — the safe window is a minimax over rate; the per-rate optimum moves
 (τ\*∝1/r, MEASURED), and the fixed window is the two-primitive balance, not a
