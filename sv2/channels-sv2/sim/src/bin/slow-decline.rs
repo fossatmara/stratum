@@ -17,6 +17,50 @@
 //!
 //! Usage: cargo run --release --bin slow-decline
 //! Env: VARDIFF_SD_TRIALS (default 300), VARDIFF_SD_THREADS, VARDIFF_SWEEP_SEED.
+//!
+//! ===========================================================================
+//! CKPOOL-INVESTIGATION GATE TEST — PRE-REGISTRATION (locked before the run; see
+//! plan jazzy-wobbling-dove.md). CKPOOL_INVESTIGATION.md recommends EWMA(120) +
+//! AdaptivePoissonCusum(10) + AccelRetarget(0.2,0.4,0.2), selected by SCALAR FITNESS
+//! on a -50% drop. We run EWMA(120) through THIS gate (slow/moderate decline, the
+//! binding direction) which selected Ewma360. Baselines (METRIC §9.2): champion
+//! worst settled +2.7%; Ewma240 +3.5%; gate 5%. Three configs at tau=120 (NOT a
+//! tau-sweep): testA (champion boundary), isoB (+APC10, champion update), verbB
+//! (+APC10, ckpool update). What's on the stand is OUR theory (360-vs-120; §8.3
+//! invariance), ckpool is the probe.
+//!
+//! MARGIN M is PER-CELL = the rig's worst-settled measurement resolution at that
+//! cell (sub-guard 2-4 spm widest: sigma~45% at 2 spm). Set from the reported
+//! scatter, NOT guessed; the sub-guard cells carry their own (wider) M.
+//!
+//! VALIDITY GATE (gates reading anything): the in-run `corrected` (Ewma360/s1.5)
+//! PER-CELL settled-e profile must reproduce within M at the read cells (esp.
+//! sub-guard), not merely its +2.7% max. If not, the rig drifted — STOP.
+//!
+//! TEST A (Ewma120 under champion boundary) — three pre-registered buckets:
+//!   (i)   worse than +3.5% -> tau-prediction confirmed; if past +5% sub-guard,
+//!         EWMA(120) gate-unsafe under our own boundary.
+//!   (ii)  between +2.7% and +3.5% -> WRONG IN MAGNITUDE (flank gentler than the
+//!         240->360 gradient implied) — partial falsifier, report as such.
+//!   (iii) at or below +2.7% -> WRONG IN DIRECTION — shorter window safer
+//!         contradicts the valley's left flank; pressures the tau-valley itself.
+//!
+//! FOUR per-cell comparisons, each isolating ONE difference:
+//!   - sub-guard (spm<6, all run identical PoissonCI guard):
+//!       A vs isoB       = M-CALIBRATION (same boundary+update -> noise floor;
+//!                          disagree>M => M too tight, revisit before reading on)
+//!       isoB vs verbB   = UPDATE-RULE effect UNDER THE GUARD
+//!   - differing-boundary (spm>=6, aggressive arms differ; esp. 6-10):
+//!       isoB vs A       = §8.3 INVARIANCE verdict (<=M broaden §8.3 across boundary
+//!                          type; >M narrow to sensitivity-only, prediction was
+//!                          extrapolated). verbB does NOT feed this (confounded).
+//!       isoB vs verbB   = UPDATE-RULE effect UNDER THE AGGRESSIVE ARM
+//!   (update-rule effect differing guard-vs-aggressive => regime-dependent: a finer
+//!    finding. update rule is plausibly LIVE on a decline — it governs ease-down.)
+//!
+//! Conditional follow-up only: a tau-sweep {120..360} to locate a crossing, IFF a
+//! gate crossing is found at 120. Do not map the flank before a crossing is known.
+//! ===========================================================================
 
 use std::env;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -58,6 +102,52 @@ fn band_cfg(name: &'static str, tau: u64, sens: f64) -> AlgorithmSpec {
 
 /// The single-rate corrected champion (funnel winner at spm 4-6): Ewma360/s1.5.
 fn corrected() -> AlgorithmSpec { band_cfg("corrected(Ewma360/s1.5)", 360, 1.5) }
+
+// ---- ckpool-investigation gate test (see docs/CKPOOL_INVESTIGATION.md ~313-323
+// and plan jazzy-wobbling-dove.md). The CKPOOL writeup recommends EWMA(120) +
+// AdaptivePoissonCusum(10) + AccelRetarget(0.2,0.4,0.2), selected by SCALAR FITNESS
+// on a -50% drop. This runs EWMA(120) through the SAME decline-safety gate that
+// selected Ewma360, to test (1) the tau-valley prediction [120 is left of the 360
+// floor -> worse settled-over-difficulty than Ewma240's +3.5%, plausibly past +5%
+// sub-guard], (2) whether METRIC §8.3's sensitivity-invariance EXTRAPOLATES across
+// boundary TYPE [isolated-B vs testA, boundary-only difference], and (3) the
+// update-rule effect on a decline [verbatim-B vs isolated-B, update-only difference].
+// Three configs at the single window tau=120; NOT a tau-sweep.
+
+/// Test A: EWMA(120) under the CHAMPION boundary + CHAMPION update rule. Differs
+/// from `corrected` in tau ONLY (120 vs 360) -> the clean tau-valley test, within
+/// the regime §8.3's invariance was measured (SignPersistenceCusum).
+fn test_a_ewma120() -> AlgorithmSpec { band_cfg("testA(Ewma120/s1.5)", 120, 1.5) }
+
+/// isolated-B: EWMA(120) + AdaptivePoissonCusum(10) + CHAMPION update (0.2,0.6,0.05).
+/// Differs from Test A in BOUNDARY ONLY -> the clean §8.3 invariance-across-boundary-
+/// type test. (NOT the ckpool config verbatim — that also changes the update rule.)
+fn isolated_b() -> AlgorithmSpec {
+    AlgorithmSpec::new("isoB(Ewma120/APC10/upd.6.05)", |clock| {
+        VardiffBox(Box::new(Composed::new(
+            EwmaEstimator::new(120),
+            AdaptivePoissonCusum::new(10),
+            AcceleratingPartialRetarget::new(0.2, 0.6, 0.05), // champion update
+            1.0,
+            clock,
+        )))
+    })
+}
+
+/// verbatim-B: the ckpool recommendation AS SHIPPED — EWMA(120) +
+/// AdaptivePoissonCusum(10) + AccelRetarget(0.2,0.4,0.2). Differs from isolated-B in
+/// UPDATE RULE ONLY -> isolates the accelerating-retarget effect on a decline.
+fn verbatim_b() -> AlgorithmSpec {
+    AlgorithmSpec::new("verbB(Ewma120/APC10/upd.4.2)", |clock| {
+        VardiffBox(Box::new(Composed::new(
+            EwmaEstimator::new(120),
+            AdaptivePoissonCusum::new(10),
+            AcceleratingPartialRetarget::new(0.2, 0.4, 0.2), // ckpool update
+            1.0,
+            clock,
+        )))
+    })
+}
 
 /// The minimax-over-r* band cluster (λ-robust over λ∈{0.5,1,2}, all ~1.12
 /// worst-rate ratio). The band-optimal cost drifts INTO the sleepy corner as
@@ -185,6 +275,11 @@ fn main() {
         ("rcl150s03".into(), Box::new(|| band_cfg("rcl(Ewma150/s0.3)",150, 0.3))),
         ("champion".into(), Box::new(AlgorithmSpec::champion)), // old s0.3, for contrast
         ("classic".into(), Box::new(AlgorithmSpec::classic_composed)),
+        // CKPOOL-INVESTIGATION GATE TEST (3 configs at tau=120; see fns above +
+        // plan). corrected (above) is the champion control / +2.7% validity gate.
+        ("testA".into(), Box::new(test_a_ewma120)),   // Ewma120 + champion boundary (tau-only vs corrected)
+        ("isoB".into(), Box::new(isolated_b)),         // + AdaptivePoissonCusum(10), champion update (boundary-only vs testA)
+        ("verbB".into(), Box::new(verbatim_b)),        // + ckpool update 0.2,0.4,0.2 (update-only vs isoB)
     ];
     let _ = (interim, band_720_s2, band_480_s2, band_480_s15);
 
@@ -198,9 +293,10 @@ fn main() {
     };
 
     // Flatten the work into (rate, spm, algo_idx) jobs.
+    let n_algos = algos.len();
     let jobs: Vec<(f32, f32, usize)> = rates
         .iter()
-        .flat_map(|&r| spms.iter().flat_map(move |&s| (0..12).map(move |a| (r, s, a))))
+        .flat_map(|&r| spms.iter().flat_map(move |&s| (0..n_algos).map(move |a| (r, s, a))))
         .collect();
     eprintln!(
         "slow-decline: {} cells, base {} trials (sparse cells oversampled up to {}×), {} threads",
@@ -322,7 +418,7 @@ fn main() {
         );
     }
     println!("Per-algo summary (worst over rates/spm):");
-    for algo in ["corrected", "rcl720s2", "rcl240s15", "rcl150s1", "rcl150s03", "dom720s03", "dom720s06", "dom480s1", "dom480s06", "dom480s03", "champion", "classic"] {
+    for algo in ["corrected", "testA", "isoB", "verbB", "rcl720s2", "rcl240s15", "rcl150s1", "rcl150s03", "dom720s03", "dom720s06", "dom480s1", "dom480s06", "dom480s03", "champion", "classic"] {
         let sub: Vec<&Row> = rows.iter().filter(|r| r.algo == algo).collect();
         let worst_max = sub.iter().map(|r| r.max_e_pct).fold(f64::MIN, f64::max);
         let worst_settled = sub.iter().map(|r| r.settled_e_pct).fold(f64::MIN, f64::max);
@@ -334,4 +430,42 @@ fn main() {
             algo, worst_max, worst_settled, worst_guard, worst_wd
         );
     }
+
+    // ====================================================================
+    // CKPOOL-INVESTIGATION GATE TEST — per-cell readout for the four
+    // pre-registered comparisons (see the module header). settled-e% per cell
+    // for corrected / testA / isoB / verbB, with the four isolated diffs.
+    // M is NOT auto-derived (the rig reports medians, not CIs here) — read it
+    // off the spread; the table prints the raw per-cell settled-e so the
+    // per-cell M call is made on the visible numbers, not a baked threshold.
+    // ====================================================================
+    println!("\n## CKPOOL GATE TEST — settled-e% per cell (the four pre-registered comparisons).");
+    println!("Guard regime: spm<6 (all four run the IDENTICAL PoissonCI guard). Differing-boundary: spm>=6.");
+    println!("Validity gate: `corrected` must reproduce its known per-cell profile (worst +2.7%) — check first.\n");
+    let get = |algo: &str, rate: f32, spm: f32| -> Option<f64> {
+        rows.iter().find(|r| r.algo == algo && r.rate == rate && r.spm == spm).map(|r| r.settled_e_pct)
+    };
+    println!("| rate | spm | regime | corrected | testA | isoB | verbB | A−corr(τ) | isoB−A(bndry/INVAR) | verbB−isoB(update) |");
+    println!("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |");
+    for &rate in &rates {
+        for &spm in &spms {
+            let (c, a, ib, vb) = (get("corrected", rate, spm), get("testA", rate, spm),
+                                  get("isoB", rate, spm), get("verbB", rate, spm));
+            if let (Some(c), Some(a), Some(ib), Some(vb)) = (c, a, ib, vb) {
+                let regime = if spm < 6.0 { "guard" } else { "diff-bnd" };
+                // sub-guard: isoB−A is the M-calibration check (identical boundary);
+                // diff-bnd: isoB−A is the INVARIANCE verdict.
+                println!(
+                    "| {} | {} | {} | {:+.1} | {:+.1} | {:+.1} | {:+.1} | {:+.1} | {:+.1} | {:+.1} |",
+                    rate as u32, spm as u32, regime, c, a, ib, vb,
+                    a - c, ib - a, vb - ib
+                );
+            }
+        }
+    }
+    println!("\nREAD (per pre-registration): testA vs corrected = τ-valley (buckets: testA worst-settled vs +3.5%/+5%).");
+    println!("  sub-guard isoB−A ≈ 0 (within M) = M-calibration OK (identical boundary+update there).");
+    println!("  sub-guard verbB−isoB = update-rule effect UNDER THE GUARD; diff-bnd verbB−isoB = under the AGGRESSIVE arm.");
+    println!("  diff-bnd isoB−A = §8.3 INVARIANCE verdict (≈0 broaden across boundary type; large = narrow to sensitivity-only).");
+    println!("  (verbB does NOT feed the invariance verdict — it differs from A on two axes. M is read per-cell off the spread.)");
 }

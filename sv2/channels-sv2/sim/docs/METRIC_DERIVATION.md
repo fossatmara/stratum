@@ -680,6 +680,18 @@ confound: the floor sits at the champion's window at *every* fixed sensitivity).
 This converts "we picked this window" from a selection outcome into a visible
 physical reason.
 
+> **Scope correction (measured — `slow-decline.rs` ckpool gate test; see
+> CKPOOL_INVESTIGATION.md gate-test addendum).** This invariance is across
+> *sensitivities of one boundary family* (SignPersistenceCusum, s∈{0.3..2}); it does
+> **NOT** extrapolate across boundary *type*. At τ=120, spm6–8, settled-e is **−13%
+> under SignPersistenceCusum** but **+1.8% under AdaptivePoissonCusum** — a ~15pp
+> boundary-type effect. So "worst-settled is an estimator-window property" holds
+> *within a boundary family* (the claim above stands as stated, scoped to it), but
+> the property is **sensitivity-general, not boundary-type-general**. Consequence: a
+> τ-prediction may NOT be extrapolated "to any boundary" — only within the family it
+> was measured in. (The settled-e SIGN even flips across boundary type at fixed τ,
+> which a pure-window-property reading would forbid.)
+
 **Flagged — the safe window is a minimax over rate; the per-rate optimum moves
 (τ\*∝1/r, MEASURED), and the fixed window is the two-primitive balance, not a
 rate-invariant optimum.** Keep the *result* and the *interpretation* separate:

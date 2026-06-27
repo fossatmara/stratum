@@ -325,6 +325,48 @@ Composed::new(
 The `CkpoolEstimator` is preserved in the codebase for reference and as
 a benchmark contender in the simulation grid.
 
+### Gate-test addendum — `EwmaEstimator::new(120)` is decline-gate-UNSAFE (do not ship as-is)
+
+> **The recommendation above was selected by SCALAR FITNESS on a −50% drop.** That
+> is the *easy, non-binding* decline direction (METRIC_DERIVATION §9.1 — every config
+> catches a large fast drop). The binding test is the **slow/moderate decline gate**
+> (the 1–40 %/hr sweep, `slow-decline.rs`) that selected the `Ewma360` champion, and
+> it was never run here. Running EWMA(120) through that gate (pre-registered, three
+> configs at τ=120; see `slow-decline.rs` header + plan) is decisive:
+
+- **`EWMA(120)` fails the gate: worst settled +5.9% at the sub-guard 2-spm cell, over
+  the +5% runaway line** — vs the champion `Ewma360` at **+2.7%** (passes) and
+  `Ewma240` at **+3.5%** (passes). The gradient 360→240→120 = +2.7→+3.5→+5.9 is the
+  §8.3 τ-valley's left (twitchy) flank; the gate crossing is **between 240 and 120**.
+  The scalar-fitness selection rewarded 120's responsiveness while tolerating the
+  over-difficulty the gate refuses — the gate-vs-fitness gap, dimensioned.
+- **The failure is the WINDOW, not the boundary.** At the sub-guard cells all configs
+  run the *identical* PoissonCI guard; EWMA(120) fails there (+5.9%) whether paired
+  with the champion's `AdaptiveSignPersist` OR ckpool's `AdaptivePoissonCusum(10)` —
+  bit-identical at sub-guard. So swapping the boundary (this doc's other rec) does
+  **not** rescue it; the validity problem is the 120 window at sparse rate, full stop.
+- **The update-rule difference is gate-immaterial.** ckpool's
+  `AccelRetarget(0.2,0.4,0.2)` vs the champion's `(0.2,0.6,0.05)`, boundary held,
+  moves settled-e by < 1pp on the decline (both guard and aggressive regimes). So the
+  rec's update rule is fine; the estimator window is the problem.
+- **Caveat this addendum, honestly:** the run also NARROWED a claim in *our own* doc —
+  METRIC §8.3's sensitivity-invariance ("worst-settled is an estimator-window
+  property, ~boundary-independent") was measured only across SignPersistenceCusum
+  *sensitivities*; this run shows it does **not** extrapolate across boundary *type*
+  (at spm6–8, the same τ=120 sits at −13% under SignPersist vs +1.8% under
+  PoissonCusum — a ~15pp boundary-type effect). So "120 is left of the valley → worse
+  under *any* boundary" was an over-extrapolation; 120's gate-failure is specifically
+  a sub-guard-regime + short-window effect, not a universal-boundary one. Recorded as
+  a scope-correction to §8.3 (see METRIC §8.3), not buried.
+
+**Net: keep this doc's architecture finding (rate-fixed estimator + rate-adaptive
+boundary) and the update-rule and hysteresis verdicts — but the specific
+`EwmaEstimator::new(120)` value is gate-unsafe at the sub-guard cells; ship `Ewma360`
+(or, if a shorter window is wanted, gate-test it — the crossing is between 240 and
+120, so 240 is the shortest gate-passing window measured).** The scalar-fitness
+ranking here is correct on the axis it tested (−50% drop responsiveness); the gate is
+the axis it didn't, and decline-safety is a constraint, not a fitness term (§9.3).
+
 ## Files Added
 
 ### Production components (`src/vardiff/composed/`)
