@@ -5,6 +5,41 @@
        steady_transient*.svg, ... which are emitted by their sim binaries),
        this is a conceptual diagram of the two forces. No measured points.
        ============================================================ -->
+  <!-- ============================================================
+       SUPERSEDED FRAMING (do NOT reuse as-is in the technical paper —
+       needs RESTRUCTURE, not relabel). Recorded so this figure is not
+       picked up clean-looking-but-stale. NOT "wrong" — correct for the
+       theory as drawn; the FRAMING was superseded by the item-1 finding
+       (stratum commit 9518f3bf, corrected a6ccec7f; see
+       sim/src/bin/eager-ease-* + cellA-mechanism + which-boundary).
+
+       What's superseded:
+       - The VERTICAL AXIS here is "direction bias (eager-ease/symmetric/
+         eager-tighten)" and the WALL is "ASYMMETRY (safety)". The closed
+         theory says validity lives on DANGEROUS-DIRECTION PROTECTION;
+         eager-ease/asymmetry is only ONE MECHANISM for it — the DENSE-rate
+         one (SignPersistenceCusum's reluctant-tighten). At SPARSE rate the
+         ESTIMATOR carries the protection entirely (sets fire direction +
+         doesn't present up-spikes) and the boundary asymmetry is SWITCHED
+         OFF (the spm_threshold=6 guard runs PoissonCI, symmetric, no
+         tighten_multiplier). So "asymmetry = the validity axis" is the
+         pre-item-1 labeling.
+       - The plane is 2D (bias x responsiveness); the post-item-1 content is
+         3-part (the protection axis + two regime-mechanisms + the REGIME
+         dimension), which this geometry cannot hold — hence RESTRUCTURE.
+
+       What's still reusable: the GEOMETRY (a hard binary wall bounding an
+       admissible region + a floor/gradient orienting to the gentlest
+       interior point; champion = wall x gradient intersection) is
+       structurally fine. The rebuild keeps that shape but: (1) relabels the
+       validity axis as dangerous-direction protection, (2) adds a rate/regime
+       dimension showing the estimator carrying sparse protection and the
+       boundary-reluctance the dense, (3) demotes asymmetry from "the axis"
+       to "the dense-regime mechanism."
+       (tau_tradeoff.svg, by contrast, is CONSISTENT with the closed theory —
+       reusable with one ADDITIVE extension: rate-awareness as wobble-half
+       motion that never reaches the gate wall. See FIGURES-STATUS.md.)
+       ============================================================ -->
   <style>
     .ax    { stroke:#222; stroke-width:1.5; }
     .axlbl { fill:#222; font-weight:bold; }
