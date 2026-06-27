@@ -1,5 +1,17 @@
 # Ckpool Vardiff Investigation
 
+> **Re-validated against current upstream (2026-06-27) — HELD VERBATIM, zero drift.**
+> Every mechanism this doc rests on was re-checked against current
+> `ckolivas/ckpool` source and matches exactly: `decay_time` (`libckpool.c:2051` —
+> `fprop = 1 − e^(−fsecs/interval)`, the formula quoted below); the five per-client
+> EMAs (1m/5m/1h/1d/1w); the `ssdc≥72` dual-window switch (1m vs 5m EMA), the
+> 72-shares-OR-240s gate, the drr `(0.15, 0.4)` hysteresis band around the 0.3
+> product, `optimal = dsps×3.33`, and the `ssdc==1` oscillation guard — all in
+> `stratifier.c:5778–5859`. No content change needed; recorded so the revalidation is
+> on file and not re-litigated unless the source moves. (Companion: the DMND/PID pool
+> was re-validated the same pass and DID drift — see `PID_INVESTIGATION.md` dead-zone §
+> — making this verbatim-hold the contrast case.)
+
 ## Background
 
 [ckpool](https://github.com/ckolivas/ckpool) is a mature Stratum V1 pool

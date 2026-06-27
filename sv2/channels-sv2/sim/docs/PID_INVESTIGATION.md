@@ -56,6 +56,45 @@ With Kp = -0.01 × diff:
 At SPM target of 10, realized SPM must exceed ~51 or drop to ~0 to trigger
 a retarget. This means **hashrate changes of ≤5× go undetected**.
 
+> **Re-validated against live DMND source (2026-06-25) — confirmed, strengthened,
+> and one claim sharpened.** When written, this doc described "a common open-source
+> pattern" — pattern-inferred, unpinned. Checked against current
+> `dmnd-pool/dmnd-client/src/translator/downstream/diff_management.rs`:
+>
+> - **pow2 is IN THE CONTROL LAW (hedge removed — pattern-inferred → source-verified).**
+>   `update_difficulty_and_hashrate` (the production retarget path) computes a PID
+>   delta (`pid.next_control_output(realized_share_per_min)`, :267), rounds the
+>   *operating* difficulty via `quantize_downstream_difficulty` → `nearest_power_of_2`
+>   (:268/:415/:389), and **stores the quantized value back as controller state,
+>   rebuilding the PID around it** (:286–287). The quantized value FEEDS BACK — so the
+>   dead zone is source-verified on shipping code, not inferred. (Contrast SV1-SRI's
+>   pow2, which is at the wire / no feedback / benign — see the SV2-SRI handoff: DMND
+>   and SRI are the two branches of the control-law-vs-wire fork.)
+> - **The severity headline STANDS on the production gain, and is gain-specific —
+>   here is the structure so it stays re-checkable.** `deadband = 0.414/Kp`. DMND's
+>   **sole production gain is `Kp = −diff×0.01`** (:281, in the only non-test retarget
+>   path) → `deadband = 0.414/0.01 = 41.4 SPM` → the headline holds. The `−diff×0.05`
+>   and `0.0` gains elsewhere in the file are **test fixtures inside `#[cfg(test)]`
+>   (begins :425), NOT shipped regimes.** IF DMND ever productionizes a different gain,
+>   the deadband scales inversely (the `−0.05` fixture would give `0.414/0.05 = 8.3
+>   SPM`, ~5× smaller) — detectable against this dated record. The dead-zone
+>   *geometry* (√2 threshold, `log2().round()` at :389) is gain-independent and stands
+>   regardless; only the *SPM severity* scales with the production Kp, which is `−0.01`
+>   today.
+> - **The decline side is not merely deadened — it is UNREACHABLE (the sharpest, and
+>   most dangerous-in-our-terms, form of the headline).** Around setpoint 10 the
+>   deadband is ±41.4 SPM: the *upper* crossing is 10+41.4 ≈ 51 (reachable — a 5×
+>   hashrate rise), but the *lower* crossing is 10−41.4 = **−31.4 SPM, below zero and
+>   therefore UNREACHABLE.** A falling miner can drop to literally **zero** hashrate
+>   and the PID still will not ease, because clearing the deadband downward would
+>   require negative realized SPM. So "reaction 0.000 on drops" is **structural, not
+>   sluggish** — the controller *cannot follow a decline down* at this gain/setpoint.
+>   **In our terms this is the dangerous-direction failure the decline-safety gate
+>   exists to catch, in its maximal form:** not "lags the decline into over-difficulty"
+>   (the champion's worst case, bounded) but "literally cannot react to the decline" —
+>   over-difficulty with no path back. The pow2-in-loop dead zone doesn't just risk
+>   the spiral; on the decline side it removes the controller's ability to avoid it.
+
 ### Simulation Results
 
 Across all 50 cells (5 SPM × 10 scenarios), Pow2-PID:
