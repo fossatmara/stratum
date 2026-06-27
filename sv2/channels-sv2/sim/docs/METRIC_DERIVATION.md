@@ -622,6 +622,16 @@ state the casualties first, then the survivors.
   cross-rate decline gate. The champion is the *safe* frontier, not the cost
   frontier — a weaker and more honest claim.
 
+These three are the **figure-level** premises this paper killed in drawing its own
+figures. The full **theory-level** derivation and falsification trail — the
+conservation-law derivation (plant identity → information floor), and the
+model-level dead ends this paper compresses out, e.g. the magnitude-cancellation
+result and the refuted synthesis attempt — live in `THEORY.md`, the
+derivation-and-falsification notebook. This paper states the surviving conclusions;
+that notebook records how they were reached and what was tried and killed. (The two
+kill-lists are *distinct*: these three are figure premises; THEORY's are model-level
+premises — not the same set.)
+
 Each premise died to the same discipline: render the measured points before
 writing the caption. The figures that survived did so because they were checked
 the same way.

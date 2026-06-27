@@ -1,9 +1,36 @@
 # A conservation-law theory of vardiff quality
 
-*Status: design note / proposal. No code in this crate implements the
-metrics below yet. The intent is to decide whether this framing should
-replace the six-axis `EqualWeightFitness` radar and the maximin sort
-that currently drive the algorithm shootout.*
+> **Status: this is the derivation-and-falsification NOTEBOOK, dated to its
+> mid-arc state** (≈ the §5.8 validation pass and the Q4–Q9 refinements of §8–§9).
+> Read this for **how the theory was derived and what was tried and killed**; read
+> `METRIC_DERIVATION.md` for **what is true and decided**. Four things this banner
+> fixes, honestly:
+>
+> 1. **Current truth is in METRIC_DERIVATION.** Where this notebook frames something
+>    pre-closure — the asymmetry (§5.1) and the death-spiral mechanism (§5.2/§5.2a),
+>    the rate-aware question, the regime mechanism — the authoritative *closed*
+>    version is METRIC §6.1 (the asymmetry-as-mechanism / regime-split), §8.3 (the
+>    rate-aware closure: rate-coupling is policy, no admissibility content), and
+>    §10(d) (the sub-guard reconciliation). This notebook is **not** updated to those
+>    closures, by design — see (2).
+> 2. **The derivation and the falsification trail are authoritative HERE, and are
+>    NOT superseded.** This doc is where the dead ends are recorded — §3a
+>    (magnitude-cancellation, REFUTED), §8.4 (synthesis attempt, REFUTED), the Q6/Q7
+>    surprises (§9.1/§9.2) — and that record *is the doc's purpose*: it is what METRIC
+>    compresses to "premises drawn and killed" and points back to. The conclusions
+>    are dated; the kill-record is live. **Do not read "dated" as "wholly
+>    superseded"** — half of this doc (the derivation and the trail) exists nowhere
+>    else.
+> 3. **The opening proposal was decided.** This notebook was written in the future
+>    tense of an open proposal ("decide whether this framing should replace the
+>    radar"). It *was* decided: the linear sign-split reframe **replaced** the
+>    six-axis radar, and the champion ships (current truth: METRIC). That tense is
+>    resolved — the question is not open.
+> 4. **…but not every proposal here was adopted.** The *core reframe* was adopted;
+>    the specific premises this notebook explores **include ones tried and killed**
+>    (§3a, §8.4 above). "The proposal was adopted" is true of the core reframe, **not**
+>    of every claim drawn here — the killed ones are preserved as the method record,
+>    not as live proposals.
 
 This note (1) derives what vardiff is mathematically trying to do from
 the plant model, (2) states the conservation law that the model
