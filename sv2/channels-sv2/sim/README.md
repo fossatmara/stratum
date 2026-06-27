@@ -2,25 +2,37 @@
 
 Deterministic in-process simulation framework for characterizing the
 behavioral attributes of any [`Vardiff`](../src/vardiff/mod.rs)
-implementation. The framework decomposes a vardiff algorithm into four
-orthogonal axes (Estimator, Statistic, Boundary, UpdateRule) and lets
-each be characterized in isolation, so a metric change can be
-attributed to the specific axis that changed.
+implementation. The framework decomposes a vardiff algorithm into three
+orthogonal stages (Estimator, Boundary, UpdateRule) and lets each be
+characterized in isolation, so a metric change can be attributed to the
+specific stage that changed.
 
 ## Docs
 
+The theory spine reads top-down — notebook → paper → design → findings —
+each at a different altitude; read the one for the question you have.
+
+- [`docs/THEORY.md`](./docs/THEORY.md) — the derivation-and-falsification
+  **notebook**: how the theory was derived and what was tried and killed.
+  Reasoning-in-progress; not every claim here survived (see its banner).
+  For *what is true and decided*, read METRIC_DERIVATION.
+- [`docs/METRIC_DERIVATION.md`](./docs/METRIC_DERIVATION.md) — the
+  **paper**: the closed theory (information-floor framing, death-spiral
+  mechanism, the decline-safety selection criterion) and the metric it
+  implies. Each result is labelled theory / simulation-only / hardware.
 - [`docs/DESIGN.md`](./docs/DESIGN.md) — architectural reference. The
-  four-axis decomposition, the trait surface, the `Composed<E, S, B,
-  U>` adapter, the algorithm registry, the trial-recording model, the
-  scenario DSL, the Grid, the Metric trait, the recommended production
-  composition, and the production migration plan.
+  three-stage decomposition, the trait surface, the `Composed<E, B, U>`
+  adapter, the algorithm registry, the trial-recording model, the
+  scenario DSL, the Grid, and the Metric trait.
 - [`docs/FINDINGS.md`](./docs/FINDINGS.md) — what the framework has
-  measured about the algorithm registry: the cross-algorithm
-  decoupling Pareto, the SPM=6 cold-start cascade mechanism, the
-  composition argument (no single axis closes the cascade — the right
-  composition does), the FullRemedy validation, the EWMA τ
-  Pareto, the asymmetric step-response analysis, the U256 precision
-  fix to `channels_sv2::target`.
+  measured: the cross-algorithm decoupling Pareto, the SPM=6 cold-start
+  cascade mechanism, the composition argument (no single stage closes
+  the cascade — the right composition does), the EWMA τ Pareto, and the
+  asymmetric step-response analysis.
+- Investigations & supporting records: `CKPOOL_INVESTIGATION.md`,
+  `PID_INVESTIGATION.md`, `NOMINAL_HASHRATE_COLDSTART.md`,
+  `SLOW_DECLINE_TEST.md`, `FIGURES-STATUS.md`. Each carries a status
+  banner pinning its scope and currency.
 
 ## What the framework measures
 
@@ -47,23 +59,33 @@ variance-vs-detection trade-off in one number per share rate.
 
 ## Algorithms shipped
 
-The eight algorithms in the registry are accessible via
-`AlgorithmSpec` factories in `sim/src/grid.rs`:
+The algorithms in the registry are accessible via `AlgorithmSpec`
+factories in `sim/src/grid.rs`. Each is a three-stage
+`Composed<Estimator, Boundary, UpdateRule>`:
 
-| Factory | Composition | Role |
-|---------|-------------|------|
-| `classic_vardiff_state()` | (production reference, not introspectable) | the existing production algorithm |
-| `classic_composed()` | `CumulativeCounter + AbsoluteRatio + StepFunction(classic) + FullRetargetWithClamp` | fire-for-fire equivalent four-axis representation of `VardiffState`; introspectable |
-| `parametric()` | `… + PoissonCI(z=2.576) + …` | classic with rate-aware threshold |
-| `parametric_strict()` | `… + PoissonCI(z=3.0) + …` | parametric with 99.7% CI |
-| `ewma_60s()` / `ewma(τ)` | `EwmaEstimator(τ) + … + PartialRetarget(0.5)` | smoothed estimator |
-| `sliding_window(n)` | `SlidingWindowEstimator(n) + … + FullRetargetNoClamp` | last-n-ticks averaging |
-| `classic_partial_retarget(η)` | `… + PartialRetarget(η)` | classic with damped update |
-| `full_remedy()` | `EwmaEstimator(120s) + AbsoluteRatio + PoissonCI + PartialRetarget(0.3)` | **production recommendation** |
+| Factory | Composition (Estimator / Boundary / Update) | Role |
+|---------|---------------------------------------------|------|
+| `classic_vardiff_state()` | classic triple, introspection-blind (`AsObservable`) | the classic comparison anchor — "the algorithm we used to run"; not the shipped default |
+| `classic_composed()` | `CumulativeCounter / StepFunction(classic) / FullRetargetWithClamp` | fire-for-fire equivalent of the classic monolith; introspectable |
+| `parametric()` | `CumulativeCounter / PoissonCI(z=2.576) / FullRetargetWithClamp` | classic with rate-aware threshold |
+| `parametric_strict()` | `CumulativeCounter / PoissonCI(z=3.0) / FullRetargetWithClamp` | parametric with 99.7% CI |
+| `ewma_60s()` / `ewma(τ)` | `EwmaEstimator(τ) / PoissonCI(z=2.576) / PartialRetarget(0.5)` | smoothed estimator |
+| `sliding_window(n)` | `SlidingWindowEstimator(n) / PoissonCI / FullRetargetNoClamp` | last-n-ticks averaging |
+| `classic_partial_retarget(η)` | `CumulativeCounter / StepFunction(classic) / PartialRetarget(η)` | classic with damped update |
+| `full_remedy()` | `EwmaEstimator(120s) / PoissonCI / PartialRetarget(0.2)` | a strong mid-arc contender; superseded as the recommendation (see below) |
 
-`FullRemedy` dominates every other algorithm on every operationally
-meaningful metric — see [`docs/FINDINGS.md`](./docs/FINDINGS.md) for
-the case.
+**The shipped production algorithm is the champion**,
+`composed::champion_composed` (wired as the default behind
+[`VardiffState`](../src/vardiff/classic.rs)):
+`EwmaEstimator(360s) / AdaptiveSignPersist(spm_threshold=6) /
+AcceleratingPartialRetarget(0.2, 0.6, 0.05)`. It was selected by minimax
+over the target share rate under a **decline-safety constraint** — the
+gentlest configuration that stays decline-safe across the rate band. The
+earlier `full_remedy` recommendation was a scalar-fitness pick on a fast
+drop; it does not clear the slow-decline gate. See
+[`docs/METRIC_DERIVATION.md`](./docs/METRIC_DERIVATION.md) for the
+selection criterion and [`docs/CKPOOL_INVESTIGATION.md`](./docs/CKPOOL_INVESTIGATION.md)
+for why the fitness pick and the gate pick diverge.
 
 ## Running
 
@@ -77,21 +99,68 @@ cargo test --lib
 # Slow regression test against the committed baseline (~5–15 seconds)
 cargo test --release --lib -- --ignored
 
-# Generate a fresh single-algorithm baseline
+# Regenerate the tracked CI fixtures (classic anchor + shipped champion)
 cargo run --release --bin generate-baseline
 
-# Generate cross-algorithm comparison baselines (~2–3 minutes for 8 algorithms × 50 cells × 1000 trials)
+# Generate cross-algorithm comparison baselines (~2–3 minutes; not tracked)
 cargo run --release --bin compare-algorithms
 
-# EWMA τ Pareto sweep (~90 seconds for 5 τ values × 50 cells × 1000 trials)
-cargo run --release --bin sweep-ewma-tau
-
 # Trace one trial for a chosen (algorithm, scenario, SPM, seed)
-cargo run --release --bin trace-trial -- -a full_remedy -s cold_start --spm 6 --seed 0xCAFE
+cargo run --release --bin trace-trial -- -a vardiff_state -s cold_start --spm 6 --seed 0xCAFE
 
 # Find worst-case seeds via overshoot-scan
 cargo run --release --bin trace-trial -- -a vardiff_state -s cold_start --spm 6 --scan-overshoot 100
 ```
+
+(`-a vardiff_state` traces the shipped production algorithm — `VardiffState`,
+which delegates to the champion; `-a classic_composed` traces the classic
+comparison anchor. See `trace-trial.rs` for the full key list.)
+
+## Reproducing the claims
+
+Every quantitative claim in the theory traces to a command here. The surface
+is **two-tier**, by design:
+
+**Tier 1 — CI-guarded gates.** The claims the production selection *rests on*
+are guarded by runnable assertions that re-derive the value each run and fail
+on drift (so the docs cite the *guard*, not a frozen number that could drift
+from the code). One command runs all three:
+
+```bash
+cargo test --release --lib -- --ignored
+```
+
+| Guard (test name) | What it pins |
+|-------------------|--------------|
+| `decline_safety::…::champion_clears_decline_gate` | the shipped champion clears the **decline-safety gate** — its selection criterion (`METRIC_DERIVATION.md` §9.2). The gate threshold lives once, in `decline_safety::DECLINE_SAFETY_GATE_PCT`. |
+| `regression::…::champion_algorithm_no_regression` | the shipped champion's typical-behavior grid (cold-start/stable/step) has not drifted from `baseline_champion.toml`. |
+| `regression::…::classic_algorithm_no_regression` | the classic comparison anchor has not drifted from `baseline_classic.toml`. |
+
+**Tier 2 — pointer index.** Everything else is characterization: the command
+below *regenerates* the figure or number, which you read against the prose
+claim (the index points at the command without restating the value, so it
+cannot fall out of sync with the code). Run from `sv2/channels-sv2/sim/`:
+
+| Claim (see `docs/METRIC_DERIVATION.md` §) | Regenerate with |
+|-------------------------------------------|-----------------|
+| Information floor `1/√(r*τ)`, the field is pinned to it (§3, §8) | `cargo run --release --bin sweep-minimax` |
+| The τ-valley: worst-settled over-difficulty is U-shaped in the window, floor at 360 (§8.3) | `cargo run --release --bin tau-valley` |
+| Per-rate optimum slides with rate, `τ*` sleepier when sparse (§8.3) | `cargo run --release --bin tau-family` |
+| …and stays decline-admissible across the band (§8.3) | `cargo run --release --bin tau-family-safety` |
+| The selection figure: champion is the gentlest point in the doubly-walled admissible island (§9) | `cargo run --release --bin tau-tradeoff` |
+| Detection EXCESS climbs with `r*` — the one lever on the floor (§8.4) | `cargo run --release --bin excess-lever` |
+| Steady-vs-transient safe frontier (§8.2) | `cargo run --release --bin steady-transient` |
+| Dangerous-direction protection is regime-split (estimator sparse, boundary dense) (§6.1) | `cargo run --release --bin eager-ease-strength` and `--bin which-boundary` |
+| Conservation-law falsification pass (regret ∝ δ², the death-spiral asymmetry) (§5.8) | `cargo run --release --bin regret-effort` |
+| The full slow-decline safety sweep across rate × spm (the gate, in detail) | `cargo run --release --bin slow-decline` |
+| Plain-language trajectory (estimate vs truth over time) | `cargo run --release --bin trajectory-plot` |
+
+All binaries are deterministic given their seed (default base seed
+`0xDEADBEEFCAFEF00D`); see **Determinism** below. The remaining binaries in
+`src/bin/` are the **exploration record** — the search that produced these
+results — and are not part of the reproduction surface; they compile (CI builds
+them) so the search stays runnable, but a reviewer validating the result needs
+only the commands above.
 
 The slow regression test is `#[ignore]`-d by default so `cargo test`
 stays fast. CI workflows that want full regression coverage should
@@ -104,11 +173,15 @@ decoupling-score table per share rate. For cross-algorithm
 comparison:
 
 ```bash
-diff baseline_VardiffState.md baseline_FullRemedy.md
+diff baseline_classic.md baseline_champion.md
 ```
 
 The `baseline_*.toml` files are the machine-readable form consumed
-by the regression comparator.
+by the regression comparator. Two are tracked as CI regression
+fixtures: `baseline_classic` (the classic comparison anchor) and
+`baseline_champion` (the shipped algorithm). Cross-algorithm
+comparison baselines are not tracked — regenerate them with
+`cargo run --release --bin compare-algorithms`.
 
 ## Updating the baseline
 
@@ -136,19 +209,18 @@ is the gate.
 ## Adding a new algorithm
 
 Any implementor of the [`Vardiff`](../src/vardiff/mod.rs) trait can be
-plugged into the simulation harness. The four-axis decomposition makes
+plugged into the simulation harness. The three-stage decomposition makes
 this especially cheap: an algorithm that fits the
-`Estimator/Statistic/Boundary/UpdateRule` shape is one
-`Composed<E, S, B, U>` construction and one `AlgorithmSpec` factory.
+`Estimator/Boundary/UpdateRule` shape is one `Composed<E, B, U>`
+construction and one `AlgorithmSpec` factory.
 
 ```rust
-use vardiff_sim::{AlgorithmSpec, Composed, EwmaEstimator, AbsoluteRatio,
+use vardiff_sim::{AlgorithmSpec, Composed, EwmaEstimator,
                   PoissonCI, PartialRetarget};
 
 let spec = AlgorithmSpec::new("MyAlgo", |clock| {
     let v = Composed::new(
         EwmaEstimator::new(90),
-        AbsoluteRatio,
         PoissonCI::default_parametric(),
         PartialRetarget::new(0.4),
         /* min_h */ 1.0,
@@ -162,8 +234,8 @@ To characterize the new algorithm against the rest of the registry,
 add it to the `algorithms` list in `bin/compare-algorithms.rs` (or
 your own binary) and re-run the sweep.
 
-For algorithms outside the four-axis decomposition (no
-`Estimator/Statistic/Boundary/Update` shape), implement `Vardiff`
+For algorithms outside the three-stage decomposition (no
+`Estimator/Boundary/Update` shape), implement `Vardiff`
 directly and wrap with `AsObservable<V>` so the grid's dispatch path
 accepts it; introspection-only metrics will gracefully degrade to
 `None` for that algorithm. See `AlgorithmSpec::classic_vardiff_state`
@@ -222,30 +294,28 @@ sim/
 ├── Cargo.toml              # crate manifest + [workspace] declaration
 ├── Cargo.lock              # copy of parent workspace's lockfile (see above)
 ├── README.md               # this file
-├── docs/
-│   ├── DESIGN.md           # architectural reference
-│   └── FINDINGS.md         # characterization results
-├── baseline_*.{toml,md}    # per-algorithm baselines
-├── ewma_tau_sweep.md       # τ Pareto report
+├── docs/                    # theory spine (THEORY/METRIC_DERIVATION/
+│                            #   DESIGN/FINDINGS) + investigations + figures
+├── baseline_classic.{toml,md}   # CI regression fixture: classic anchor
+├── baseline_champion.{toml,md}  # CI regression fixture: shipped champion
 └── src/
     ├── lib.rs              # module declarations + re-exports
     ├── rng.rs              # XorShift64 + Poisson / exponential samplers
     ├── schedule.rs         # HashrateSchedule for trial scenarios
     ├── trial.rs            # run_trial + TickRecord + Observable
-    ├── metrics.rs          # Metric trait + registry + 8 metrics + bootstrap CI
+    ├── metrics.rs          # Metric trait + registry + bootstrap CI
     ├── baseline.rs         # Cell / CellResult / Scenario / Phase DSL / serializers
     ├── regression.rs       # baseline-parsing + tolerance assertions
     ├── grid.rs             # Grid + AlgorithmSpec + VardiffBox + run_paired
-    ├── composed/
-    │   ├── mod.rs
-    │   ├── estimator.rs    # Cumulative / EWMA / SlidingWindow
-    │   ├── statistic.rs    # AbsoluteRatio
-    │   ├── boundary.rs     # StepFunction (classic) + PoissonCI
-    │   ├── update.rs       # FullRetargetWithClamp + PartialRetarget + FullRetargetNoClamp
-    │   └── composed.rs     # Composed<E,S,B,U> + classic_composed equivalence tests
-    └── bin/
-        ├── generate-baseline.rs    # single-algorithm baseline
+    ├── composed.rs         # Observable extension for Composed<E,B,U>
+    └── bin/                # canonical entry points + exploration archive
+        ├── generate-baseline.rs    # regression-fixture baseline(s)
         ├── compare-algorithms.rs   # cross-algorithm sweep
-        ├── sweep-ewma-tau.rs       # τ Pareto sweep
-        └── trace-trial.rs          # single-trial tick-by-tick trace
+        ├── slow-decline.rs         # the decline-safety gate (champion selection)
+        ├── trace-trial.rs          # single-trial tick-by-tick trace
+        └── …                       # see the reproduction index below
 ```
+
+The production three-stage algorithm itself lives in the parent crate at
+[`../src/vardiff/composed/`](../src/vardiff/composed/) (`estimator.rs`,
+`boundary.rs`, `update.rs`, `composed.rs`); the sim crate consumes it.

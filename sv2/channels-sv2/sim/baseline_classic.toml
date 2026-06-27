@@ -1,5 +1,6 @@
 # Vardiff baseline characterization. Regenerate with
 # `cargo run --release --bin generate-baseline` from the sim crate.
+# CI regression fixture (.github/workflows/vardiff-sim.yaml asserts no drift). Pins the CLASSIC comparison anchor (classic_composed) — the "algorithm we used to run" that diagnostics compare against — NOT the shipped champion. See sim/src/grid.rs classic_vardiff_state for why the anchor stays classic after VardiffState became the champion.
 
 [meta]
 algorithm = "classic"

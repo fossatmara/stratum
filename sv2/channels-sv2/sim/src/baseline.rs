@@ -28,7 +28,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use channels_sv2::vardiff::MockClock;
+use channels_sv2::vardiff::{MockClock, Vardiff};
 
 use crate::metrics::{self, MetricValues};
 use crate::schedule::HashrateSchedule;
@@ -450,6 +450,35 @@ impl CellResult {
 /// a [`CellResult`]. Metric impls in [`crate::metrics::registry`]
 /// decide which cells they apply to.
 pub fn run_cell(cell: &Cell, trial_count: usize, base_seed: u64, cell_index: u64) -> CellResult {
+    // The default anchor is the CLASSIC algorithm. Build classic_composed
+    // directly: production VardiffState now delegates to the champion, but the
+    // classic-anchor baseline must stay the classic reference (its frozen TOML
+    // and every "vs. classic" comparison depend on it). classic_composed is
+    // fire-for-fire identical to the pre-champion VardiffState, so the frozen
+    // baseline numbers are unchanged.
+    run_cell_with(
+        cell,
+        trial_count,
+        base_seed,
+        cell_index,
+        |clock| channels_sv2::vardiff::composed::classic_composed(1.0, clock),
+    )
+}
+
+/// As [`run_cell`], but builds the algorithm under test from `build`. Lets a
+/// caller characterize a *specific* algorithm (e.g. the shipped champion via
+/// `champion_composed`) over the same grid and seed-derivation as the classic
+/// anchor, so the two baselines are directly comparable and the champion's
+/// tracked baseline pins the *actual production constructor*, not a re-spelled
+/// copy of its parameters. The build closure runs once per trial with that
+/// trial's clock.
+pub fn run_cell_with<V: Vardiff>(
+    cell: &Cell,
+    trial_count: usize,
+    base_seed: u64,
+    cell_index: u64,
+    build: impl Fn(Arc<MockClock>) -> V,
+) -> CellResult {
     let (config, schedule) = cell.scenario.build(cell.shares_per_minute);
 
     let mut trials: Vec<Trial> = Vec::with_capacity(trial_count);
@@ -458,13 +487,7 @@ pub fn run_cell(cell: &Cell, trial_count: usize, base_seed: u64, cell_index: u64
             .wrapping_add(cell_index.wrapping_shl(20))
             .wrapping_add(trial_index as u64);
         let clock = Arc::new(MockClock::new(0));
-        // The baseline anchor is the CLASSIC algorithm. Build classic_composed
-        // directly: production VardiffState now delegates to the champion, but
-        // run_baseline must stay the classic reference (its frozen baseline
-        // TOML and every "vs. classic" comparison depend on it). classic_composed
-        // is fire-for-fire identical to the pre-champion VardiffState, so the
-        // frozen baseline numbers are unchanged.
-        let vardiff = channels_sv2::vardiff::composed::classic_composed(1.0, clock.clone());
+        let vardiff = build(clock.clone());
         let trial = run_trial(vardiff, clock, config.clone(), &schedule, seed);
         trials.push(trial);
     }
@@ -504,13 +527,30 @@ pub fn default_cells() -> Vec<Cell> {
     cells
 }
 
-/// Runs every cell in `cells` against the classic [`VardiffState`]
-/// algorithm. Sequential; rayon parallelism is a future optimization.
+/// Runs every cell in `cells` against the classic algorithm
+/// (`classic_composed`, the comparison anchor). Sequential; rayon parallelism
+/// is a future optimization.
 pub fn run_baseline(cells: &[Cell], trial_count: usize, base_seed: u64) -> Vec<CellResult> {
     cells
         .iter()
         .enumerate()
         .map(|(idx, cell)| run_cell(cell, trial_count, base_seed, idx as u64))
+        .collect()
+}
+
+/// As [`run_baseline`], but builds the algorithm under test from `build` (e.g.
+/// the shipped champion). Used to generate the champion regression-anchor
+/// baseline over the same grid as the classic anchor.
+pub fn run_baseline_with<V: Vardiff>(
+    cells: &[Cell],
+    trial_count: usize,
+    base_seed: u64,
+    build: impl Fn(Arc<MockClock>) -> V + Copy,
+) -> Vec<CellResult> {
+    cells
+        .iter()
+        .enumerate()
+        .map(|(idx, cell)| run_cell_with(cell, trial_count, base_seed, idx as u64, build))
         .collect()
 }
 
@@ -523,6 +563,36 @@ pub fn run_baseline(cells: &[Cell], trial_count: usize, base_seed: u64) -> Vec<C
 /// matches the metric impl's insertion order. The output ordering is
 /// stable across runs given the same registry and the same algorithm
 /// — relevant when diffing baselines.
+/// One-line description of what a baseline file is FOR, keyed off the
+/// `meta_algorithm` name. Emitted into the generated header so the
+/// guard a file earns its tracking by is legible *at the artifact* —
+/// a reader opening the TOML sees "this is a CI drift tripwire, and for
+/// which algorithm" without spelunking the CI workflow. Generated, not
+/// hand-edited, so it cannot drift from the data the way a manual
+/// header would on the next regeneration.
+fn baseline_role_line(meta_algorithm: &str) -> &'static str {
+    match meta_algorithm {
+        "classic" => {
+            "CI regression fixture (.github/workflows/vardiff-sim.yaml asserts no \
+             drift). Pins the CLASSIC comparison anchor (classic_composed) — the \
+             \"algorithm we used to run\" that diagnostics compare against — NOT the \
+             shipped champion. See sim/src/grid.rs classic_vardiff_state for why the \
+             anchor stays classic after VardiffState became the champion."
+        }
+        "champion" => {
+            "CI regression fixture (.github/workflows/vardiff-sim.yaml asserts no \
+             drift). Pins the SHIPPED champion's typical-behavior grid \
+             (cold-start/stable/step). The decline-safety MARGIN — the champion's \
+             actual selection criterion — is guarded separately by the slow-decline \
+             margin assertion; this grid does not cover the decline scenario."
+        }
+        _ => {
+            "Cross-algorithm comparison baseline — NOT a tracked CI fixture; \
+             regenerate via `cargo run --release --bin compare-algorithms`."
+        }
+    }
+}
+
 pub fn serialize_toml(
     results: &[CellResult],
     meta_algorithm: &str,
@@ -532,7 +602,8 @@ pub fn serialize_toml(
     let mut out = String::new();
 
     out.push_str("# Vardiff baseline characterization. Regenerate with\n");
-    out.push_str("# `cargo run --release --bin generate-baseline` from the sim crate.\n\n");
+    out.push_str("# `cargo run --release --bin generate-baseline` from the sim crate.\n");
+    out.push_str(&format!("# {}\n\n", baseline_role_line(meta_algorithm)));
 
     out.push_str("[meta]\n");
     out.push_str(&format!("algorithm = \"{}\"\n", meta_algorithm));
@@ -634,6 +705,7 @@ pub fn serialize_markdown(
         vardiff_sim crate. {} trials per cell, base seed `{:#x}`.*\n\n",
         trial_count, base_seed
     ));
+    out.push_str(&format!("> {}\n\n", baseline_role_line(meta_algorithm)));
 
     render_summary(results, &mut out);
 
