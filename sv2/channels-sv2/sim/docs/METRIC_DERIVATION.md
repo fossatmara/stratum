@@ -465,11 +465,19 @@ all (this is why the low-SPM guard exists — SignPersistenceCusum collapses at 
 So at sparse rate the boundary gives *no* dangerous-direction protection; it is a
 symmetric magnitude *trigger* whose threshold falls as inter-fire time accumulates.
 
-**So the protection is regime-split, and the champion carries two mechanisms because
-each covers a regime the other cannot:**
-- **Dense rate:** the boundary's reluctant-tighten refuses weak-evidence tighten-fires
-  by direction. This is the §6 mechanism, correctly described — *for this regime*.
-- **Sparse rate:** the *estimator* carries the protection. It sets the fire direction
+**So the protection is regime-split — and the split is ASYMMETRIC, not two
+symmetric complements** (verified by the strength sweep, `eager-ease-strength.rs`):
+- **Dense rate:** the boundary's reluctant-tighten is the *active/default* protector
+  — it refuses weak-evidence tighten-fires by direction (the §6 mechanism, correctly
+  described *for this regime*). But it is **substitutable**: a slow-enough estimator
+  covers dense too (sweeping the estimator window τ 360→2880 at dense drives the
+  self-deepening fires 5→0). So the champion uses reluctant-tighten at dense because
+  it is the *wobble-cheap* way to protect there, **not because it is the only way**.
+- **Sparse rate:** the *estimator* is the **SOLE NECESSARY** protector — and here the
+  asymmetry bites: boundary reluctance at *any* strength cannot substitute (sweeping
+  the tighten-multiplier tm 8→1024× at sparse leaves the self-deepening fires flat at
+  4 — regime-locked, the boundary categorically cannot cover sparse). The estimator
+  carries the protection. It sets the fire direction
   (during over-difficulty the belief is *predominantly* below the stale-high operating
   point, so fires ease) and, being slow (Ewma360), has **low belief volatility** — ~8×
   lower per-tick than a fast Ewma30 (`belief-vs-op.rs`) — so it produces no large
@@ -1015,6 +1023,7 @@ would add protection the slow estimator isn't already providing.
 | Fire DIRECTION = sign(h_estimate − OP) (estimator's), threshold is direction-blind magnitude | Source-verified | §6.1, `composed.rs` |
 | Reluctant-tighten is the DENSE-rate protector; switched OFF at sparse (PoissonCI, symmetric, via spm6 guard) | Source-verified | §6.1, `which-boundary.rs` |
 | Sparse dangerous-direction protection is the ESTIMATOR's: direction-setting + low belief-volatility (no threshold-clearing spike); NOT "belief stays below OP" (false, above ~36%) | Verified (controlled) | §6.1, `belief-vs-op.rs` |
+| The regime split is ASYMMETRIC: estimator is SOLE-NECESSARY at sparse (reluctance any-strength can't substitute, tm 8→1024× flat); boundary is ACTIVE-but-SUBSTITUTABLE at dense (slow estimator covers it, τ 360→2880 drives fires 5→0) — NOT symmetric "each covers a regime the other can't" | Verified (strength sweep) | §6.1, `eager-ease-strength.rs` |
 | Three superseded sparse-mechanism stories (ease-branch / persistence-discount / stays-below-OP) — each plausible, each refuted by tracing dynamics, corrected to verified | Method | §6.1, `which-boundary` + `belief-vs-op` |
 | Lost-in-flight-work premise (old §6(ii)) — RETRACTED: retarget rejects no in-flight shares (per-job target snapshot), churn value-neutral | Killed premise | §6, `extended.rs` |
 | `effort_up:effort_down` direction asymmetry retired (rested on lost work) | Killed premise | §6 |
