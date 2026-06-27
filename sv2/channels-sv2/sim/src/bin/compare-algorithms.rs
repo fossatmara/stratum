@@ -60,12 +60,16 @@
 //! variance / overshoot show real values; for `VardiffState` they're
 //! omitted (the algorithm doesn't expose introspection).
 //!
-//! For Pareto comparison, diff the per-algorithm `.md` files:
+//! For Pareto comparison, diff the per-algorithm `.md` files this writes,
+//! e.g.:
 //!
 //! ```text
-//! diff baseline_VardiffState.md baseline_FullRemedy.md | less
-//! diff baseline_Parametric.md baseline_FullRemedy.md | less
+//! diff baseline_classic.md baseline_FullRemedy.md | less
 //! ```
+//!
+//! These comparison baselines are regenerated on demand and not tracked
+//! (only `baseline_classic` and `baseline_champion` are tracked, as CI
+//! regression fixtures); this binary IS their archive.
 
 use std::collections::HashMap;
 use std::env;
