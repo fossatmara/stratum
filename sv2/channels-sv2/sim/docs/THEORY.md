@@ -190,6 +190,16 @@ wrong or incomplete.
 
 ### 5.1 The cost is asymmetric — symmetric `e²` is the biggest error
 
+> **Framing refined (not rewritten) — see `METRIC_DERIVATION.md` §6.1.** This
+> section (and §6 below) treats the eager-ease/reluctant-tighten asymmetry as *the*
+> load-bearing safety property. A later mechanism study refines this: the validity
+> invariant is *dangerous-direction protection*, and the asymmetry is *one mechanism*
+> for it — the *dense-rate* one (the boundary's reluctant-tighten), switched OFF at
+> sparse rate where the *estimator* carries the protection (PoissonCI, the sparse
+> boundary, is a symmetric trigger). This higher-altitude section is left as-is; the
+> mechanism-level correction lives in METRIC_DERIVATION §6.1. Not stale-and-clean —
+> flagged.
+
 The single most important hole. Commit `a1d3fa7b` (AsymmetricCusum) and
 `5d871ed3` ("never surprise the miner") establish that the two
 directions of error are *not* equally costly:

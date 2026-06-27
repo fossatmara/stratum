@@ -430,6 +430,88 @@ clean way to settle it is one measured number — marginal cost `c` per extra sh
 from share-accounting telemetry — added as `c·r*·max(0,−e)`; this is left as the
 one external-economics input the simulation cannot supply.
 
+### 6.1 The asymmetry is one *mechanism* for the real invariant, and it is regime-limited
+
+§6 frames eager-ease/reluctant-tighten as *the* safety asymmetry. A later study (the
+eager-ease mechanism work; commits `9518f3bf`→`a6ccec7f`, rigs `eager-ease-*`,
+`cellA-mechanism`, `which-boundary`, `belief-vs-op`) refines this — and the refinement
+matters because §6's framing makes the asymmetry the *validity axis* when it is really
+*one mechanism on it*. §6's argument is **correct for its regime** (dense rate); what
+follows is the mechanism-level completion, not a contradiction.
+
+**The validity axis is dangerous-direction protection, not asymmetry.** What an
+admissible controller must do is suppress *self-deepening* fires during an
+over-difficulty escape — fires that raise difficulty (raise the belief) while already
+over-difficult, which the `e^{−e}` collapse turns into a spiral. Eager-ease/
+reluctant-tighten is one *implementation* of that suppression, not the thing itself; a
+controller can provide the protection by other means, and at low rate it must.
+
+**Fire *direction* is set by the estimator, not the boundary** (verified from source,
+`composed.rs`). The deviation statistic is a magnitude (`delta = |h_estimate/hashrate −
+1|`, direction-blind); the boundary returns a magnitude threshold; on a fire the update
+moves the operating point *toward* `h_estimate`. So every fire's direction is
+`sign(h_estimate − OP)` — set entirely by where the estimator's belief sits relative to
+the operating point. The threshold decides *whether* a fire happens (magnitude); the
+belief-position decides *which way* (direction). These are two separate things — keep
+them separate.
+
+**The asymmetry mechanism is the DENSE-rate protector, switched OFF at sparse rate**
+(verified, `which-boundary.rs`, exact-equality). The reluctant-tighten bias lives in the
+boundary's `tighten_multiplier`, which scales only the `would_tighten` branch
+(`SignPersistenceCusumBoundary`). But the production boundary is `AdaptiveSignPersist`,
+which switches on the configured rate (`spm_threshold = 6`): **below spm 6 it runs
+PoissonCI**, which is *symmetric* — no `tighten_multiplier`, no directional refusal at
+all (this is why the low-SPM guard exists — SignPersistenceCusum collapses at low SPM).
+So at sparse rate the boundary gives *no* dangerous-direction protection; it is a
+symmetric magnitude *trigger* whose threshold falls as inter-fire time accumulates.
+
+**So the protection is regime-split, and the champion carries two mechanisms because
+each covers a regime the other cannot:**
+- **Dense rate:** the boundary's reluctant-tighten refuses weak-evidence tighten-fires
+  by direction. This is the §6 mechanism, correctly described — *for this regime*.
+- **Sparse rate:** the *estimator* carries the protection. It sets the fire direction
+  (during over-difficulty the belief is *predominantly* below the stale-high operating
+  point, so fires ease) and, being slow (Ewma360), has **low belief volatility** — ~8×
+  lower per-tick than a fast Ewma30 (`belief-vs-op.rs`) — so it produces no large
+  belief-*jumps* that clear the magnitude threshold (so even when the belief is above
+  the operating point — the tighten configuration — the margin is too small and too
+  slowly-changing to fire). Verified controlled comparison: at sparse rate the champion
+  and a fast-estimator arm run the *same* symmetric boundary (PoissonCI, below the spm6
+  switch) at *comparable* operating-point levels (median OP/true ≈ 0.31 vs 0.33), yet
+  the fast arm produces self-deepening fires (4) and the slow one none (0) — the
+  difference is belief volatility, not the boundary and not the operating-point level.
+  *(Mechanism stated precisely, against a plausible-but-wrong version: the slow belief
+  is still ABOVE the operating point ~36% of escape ticks — as often as the fast one —
+  so the protection is NOT "the belief stays below the operating point" (false); it is
+  "the low-volatility belief produces no threshold-clearing spike, even when above." The
+  flip-above-OP enables the tighten direction but is not sufficient; the spike that
+  clears the magnitude threshold is the second condition, and the slow estimator denies
+  it. Recorded so this is not re-derived as the wrong "stays below" version.)*
+
+This is the mechanism-level completion of §6: the asymmetry's *direction and existence*
+stand (§6(i)), but it is **the dense-regime mechanism for a more general invariant —
+dangerous-direction protection — with the estimator carrying that invariant at sparse
+rate where the boundary asymmetry is structurally absent.** It also explains,
+mechanistically, why rate-awareness has no admissibility content (it is a window-*size*
+dial; the protection lives in the suppression mechanisms — direction-setting and
+belief-volatility — not in the window length), the result §9 and the rate-aware closure
+establish empirically.
+
+*Three superseded mechanism stories, documented (the carry-forward).* The sparse-rate
+mechanism was mis-stated three times, each refuted by tracing the actual dynamics, each
+corrected to the verified version before going durable: (1) "tm absent via the ease
+branch of SignPersistenceCusum" — wrong, that boundary is switched OFF at sparse
+(`which-boundary.rs`); (2) "persistence-discount anti-spiral" (the guard regime) —
+wrong, the guard runs PoissonCI which has no persistence-discount, the falling threshold
+is PoissonCI's dt-accumulation; (3) "the slow belief stays below the operating point" —
+wrong, it is above ~36% of the time, the protection is low belief-volatility not
+OP-position (`belief-vs-op.rs`). Each was *plausible* and read clean; each was wrong in
+its specifics. The lesson, thoroughly earned on the hardest part of the arc (the
+sparse-rate mechanism, where both instrument resolution and mechanism subtlety are
+worst): a mechanism that reads clean is not verified until you trace the dynamics it
+claims, and the durable record should carry the verified mechanism with the
+plausible-but-wrong ones explicitly marked — so the correction is not made a fourth time.
+
 ---
 
 ## 7. The metric
@@ -768,6 +850,14 @@ rates, NOT "τ=30 is bad" — per-rate it is *optimal* at high spm, the slide §
 `tau_family.svg` shows. This figure is the fixed-window (minimax) half; that one
 is the per-rate half.
 
+`tau_tradeoff.svg` (this figure) is **consistent** with the closed theory — the
+gate-walls-the-island / wobble-orders-within / champion-as-gentlest-admissible
+geometry survived the arc (see `FIGURES-STATUS.md`). The *other* structural figure,
+`constraint_space.svg` (the validity plane), carries **superseded framing** — it
+makes asymmetry the validity axis, which §6.1 refines (validity is dangerous-direction
+protection; asymmetry is the dense-regime mechanism for it). Flagged in the SVG source
+and `FIGURES-STATUS.md`; not reused as-is.
+
 ### 9.3 The gate is a constraint, not a weighted objective
 
 Decline-safety enters as a **hard constraint satisfied across all plausible
@@ -898,6 +988,11 @@ data showing a non-trivial tail of connections living at 2–4 spm.
 | Detection floor-saturated at production rates → out of scalar | Observation | §5, `detection-control` |
 | Detection EXCESS rises with `r*` (the lever) | Observation | §8, `excess-lever` |
 | Over>under, eager-ease/reluctant-tighten — direction safety-justified (§6(i)) | Argument | §6 |
+| Validity axis is DANGEROUS-DIRECTION PROTECTION, not asymmetry; asymmetry is one mechanism for it | Reframe (item 1) | §6.1, `eager-ease-*` |
+| Fire DIRECTION = sign(h_estimate − OP) (estimator's), threshold is direction-blind magnitude | Source-verified | §6.1, `composed.rs` |
+| Reluctant-tighten is the DENSE-rate protector; switched OFF at sparse (PoissonCI, symmetric, via spm6 guard) | Source-verified | §6.1, `which-boundary.rs` |
+| Sparse dangerous-direction protection is the ESTIMATOR's: direction-setting + low belief-volatility (no threshold-clearing spike); NOT "belief stays below OP" (false, above ~36%) | Verified (controlled) | §6.1, `belief-vs-op.rs` |
+| Three superseded sparse-mechanism stories (ease-branch / persistence-discount / stays-below-OP) — each plausible, each refuted by tracing dynamics, corrected to verified | Method | §6.1, `which-boundary` + `belief-vs-op` |
 | Lost-in-flight-work premise (old §6(ii)) — RETRACTED: retarget rejects no in-flight shares (per-job target snapshot), churn value-neutral | Killed premise | §6, `extended.rs` |
 | `effort_up:effort_down` direction asymmetry retired (rested on lost work) | Killed premise | §6 |
 | `regret_over:regret_under` + `tighten_multiplier` survive on §6(i) safety; magnitude a soft tuning judgment, deflated toward `1.5–2.0` | Choice + obs. | `a1d3fa7b`, `champion-weights` |
