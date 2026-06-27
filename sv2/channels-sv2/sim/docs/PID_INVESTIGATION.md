@@ -1,5 +1,26 @@
 # PID Vardiff Investigation
 
+> **Status: the EARLIEST of the three vardiff investigation docs (PID predates the
+> ckpool port, the champion selection, and item 1) — most-stale, dated to its
+> mid-arc state.** Its **method is exactly right** — decomposing into stages so each
+> idea is evaluated on its own axis without confounding (the "Meta-observation"
+> below) is the spine the whole arc validated. But its **verdicts are dated**;
+> current truth is `METRIC_DERIVATION.md` (the champion + the closed theory).
+> Re-scored against the closed theory:
+> - ① the `SignPersistenceCusumBoundary` **"discarded" verdict is SUPERSEDED** — the
+>   component ships in the champion's dense-rate arm (corrected in place at §3,
+>   "Sub-threshold Persistence");
+> - ② **"acceleration=0.2 optimal" is superseded** — the champion uses 0.05 (flag at
+>   §1, "Integral Term");
+> - ③ the **production pointer is STALE** ("Proposed Composition" — it points at a
+>   since-gate-failed ckpool rec);
+> - ④ the **"optimized independently" thesis is over-claimed** (sharpened in place — it
+>   contradicts the doc's own Meta-observation).
+>
+> The standing verdicts (AcceleratingPartialRetarget transferred, SpmRatioEstimator
+> discarded, the pow2 dead-zone analysis) HOLD. Flagged-as-dated, NOT rewritten —
+> same discipline as `THEORY.md`.
+
 ## Background
 
 Some open-source pool implementations use a PID controller for variable
@@ -85,6 +106,20 @@ schedule (an estimator parameter). Tuning one axis shifts the others.
 The three-stage pipeline makes these interactions explicit and allows
 each to be optimized independently.
 
+> **Refined (the doc is its own witness — this contradicts the "Meta-observation"
+> at the end of "What We Learned From PID" below).** "Optimized independently"
+> overstates: the stages **interact** — the arc found two couplings: (a)
+> dangerous-direction protection is **regime-dependent** (`METRIC_DERIVATION.md`
+> §6.1 — estimator protects at sparse, boundary at dense); (b) settled-e **depends
+> on boundary type** (a ~15pp sign-flip at spm6–8 — the ckpool gate-test, recorded
+> in `CKPOOL_INVESTIGATION.md`'s gate-test addendum and `METRIC_DERIVATION.md` §8.3's
+> scope-correction). Separation does **not** make the stages independent. What it
+> does — and what the Meta-observation correctly states — is make the interactions
+> **isolable and diagnosable** (vary one axis to *measure* the coupling). That value
+> is real and large (it is the arc's whole method); it is *diagnosability-of-
+> interaction*, not *independence*. Read "optimized independently" as the looser
+> "exercisable on its own axis" the Meta-observation states.
+
 ## What We Learned From PID
 
 Despite the broken quantization, the PID *concept* revealed gaps in our
@@ -105,6 +140,17 @@ fires.
 - `acceleration=0.2, eta_max=0.6` is optimal
 - Convergence improved 9-40% across SPM=6-30
 - Jitter: zero cost (identical to baseline)
+
+> **Superseded:** the champion uses `acceleration=0.05`, not 0.2
+> (`AcceleratingPartialRetarget::new(0.2, 0.6, 0.05)`, `METRIC_DERIVATION.md` §6.1/§9).
+> This sweep optimized acceleration on *convergence alone*; the ckpool investigation
+> found fast acceleration **overshoots at cold-start** (ramps η while the estimator is
+> still noisy), and the slow-decline gate test found acceleration **gate-immaterial**
+> — so it is a convergence lever on the *safe* axis, not a safety lever, and the
+> champion backed off to gentle 0.05 to avoid the cold-start overshoot a
+> convergence-only sweep can't see. "Jitter: zero cost" is the convergence-only view;
+> the full picture includes the cold-start cost. (η_base=0.2 and η_max=0.6 are
+> unchanged — only the *acceleration* param moved 0.2→0.05.)
 
 This idea transferred cleanly because it addresses a concern within a
 single stage (update-rule magnitude over time). No cross-stage calibration
@@ -139,6 +185,21 @@ the full grid; tuning attempts could not move the Pareto frontier. The
 component is retained for reference but is **not** part of any production
 composition.
 
+> **SUPERSEDED (see banner) — the component SHIPS; it was not discarded.** This
+> rejection of `SignPersistenceCusumBoundary` as a **standalone, all-rates** boundary
+> is **correct**: standalone it is genuinely too jittery — because it **collapses at
+> low SPM** (`METRIC_DERIVATION.md` §6.1). The +23% jitter measured here is that
+> sparse-rate collapse. But the arc did **not** discard the component — it wrapped it
+> in `AdaptiveBoundary`'s regime-switch (`AdaptiveSignPersist`: PoissonCI guards
+> **below** spm6, this boundary runs **above**), and it is the **champion's
+> DENSE-RATE aggressive arm** — item 1's **dense-rate** dangerous-direction protector
+> (the `tighten_multiplier`, which §6.1 establishes is **switched OFF at sparse rate**,
+> where the *estimator* carries the protection instead — NOT an all-rates protector).
+> So: rejected for the role tested (**standalone, all-rates**), kept for the role the
+> champion uses (**dense-rate** arm of a regime-split). Same struct — one definition
+> (`boundary.rs:460`), and `AdaptiveSignPersist` wraps exactly it — two roles.
+> "Discarded" is stale and reader-misleading: the champion ships it.
+
 ### Meta-observation
 
 Decomposition into three stages is what *made the failure modes visible*.
@@ -172,6 +233,16 @@ this composition was abandoned. The production recommendation lives in
 `PoissonCI` + `PartialRetarget(η=0.2)`. `AcceleratingPartialRetarget`
 remains available for ad-hoc composition where extra cold-start
 aggression is desired.
+
+> **STALE (doubly).** (a) That referenced `CKPOOL_INVESTIGATION.md` rec
+> (`EwmaEstimator(120)` + ...) is **itself superseded** — EWMA(120) is
+> decline-gate-UNSAFE (slow-decline gate: +5.9% settled at the 2-spm cell, over the
+> 5% gate; see that doc's gate-test addendum). (b) It says production uses plain
+> `PartialRetarget(η=0.2)` with `AcceleratingPartialRetarget` "ad-hoc" — but the
+> **champion's production update rule IS `AcceleratingPartialRetarget`** (the very
+> component §1 says "transferred"). Current production:
+> `Ewma360` + `AdaptiveSignPersist` + `AcceleratingPartialRetarget(0.2,0.6,0.05)`
+> (`METRIC_DERIVATION.md` §6.1/§9).
 
 ## Files Added
 
