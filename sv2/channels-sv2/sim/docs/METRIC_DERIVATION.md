@@ -505,6 +505,23 @@ dial; the protection lives in the suppression mechanisms — direction-setting a
 belief-volatility — not in the window length), the result §9 and the rate-aware closure
 establish empirically.
 
+![The §6.1 structural map: which mechanism carries the dangerous-direction protection
+in each rate regime, and the **asymmetry** between them. Two regimes split at the spm6
+boundary switch. **SPARSE (spm<6):** the boundary is a symmetric PoissonCI — a magnitude
+*trigger* with no directional content — so the *estimator* (slow Ewma360) is the **sole
+necessary** protector (sets fire direction + low belief-volatility); it is regime-locked,
+boundary reluctance at *any* strength (tm 8→1024×) cannot substitute. **DENSE (spm≥6):**
+the boundary's reluctant-tighten is the *active/default* protector, but it is
+**substitutable** — a slow-enough estimator (τ 360→2880) covers dense too (fires 5→0), so
+the boundary is the wobble-cheap way, not the only way. The asymmetry is the point: sparse
+has a sole-necessary protector, dense has a default-with-a-substitute — NOT a symmetric
+"each covers a regime the other cannot." This is a **structural map** (what-protects-where),
+deliberately distinct from `tau_tradeoff.svg`'s selection plane (where the champion sits in
+the admissible set). It makes no per-mechanism-curve claim — the mechanism detail (how each
+protects, the categorical-vs-weak and volatility-not-OP-position precision) stays in the
+prose above, where three corrections pinned it. Verified by `eager-ease-strength.rs`;
+schematic, hand-authored.](dangerous_direction_protection.svg)
+
 *Three superseded mechanism stories, documented (the carry-forward).* The sparse-rate
 mechanism was mis-stated three times, each refuted by tracing the actual dynamics, each
 corrected to the verified version before going durable: (1) "tm absent via the ease
