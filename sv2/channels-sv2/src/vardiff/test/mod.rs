@@ -2,6 +2,14 @@
 /// providing methods to verify the correctness of any specific implementation.
 use std::{thread, time::Duration};
 
+// The generic `test_try_vardiff_*` harness below asserts the CLASSIC control
+// law's retarget magnitudes; this submodule instantiates it against
+// `classic_composed` (the classic comparison anchor — the algorithm
+// `VardiffState` used to be before it became the champion). See
+// `classic_composed.rs` for why the champion is covered by the sim crate's
+// multi-tick regression instead of this single-shot harness.
+mod classic_composed;
+
 use super::Vardiff;
 use crate::target::hash_rate_to_target;
 use bitcoin::Target;
