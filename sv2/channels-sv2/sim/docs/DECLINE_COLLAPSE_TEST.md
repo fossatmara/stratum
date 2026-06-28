@@ -250,16 +250,28 @@ estimator, not *optimality* of its latency or tracking.
 
 ## 5. Hardware version (shape-proxy)
 
-Per `SLOW_DECLINE_TEST.md` §5, confirm the sim the way the drop test was. Drive
-the shape-proxy **Ramp** on an S21/testnet4 at two `(ρ, r*)` points chosen to sit
-at the **same `ρ/r*`** but **different `(ρ, r*)` individually**, and read the
-difficulty response off Grafana. The fixed champion (a level estimator) obeys
-`ρ√r*`, not `ρ/r*` (§2), so the prediction for *the shipped controller* is that
-the two responses **differ** (the gap grows with `r*`) — the opposite of the
-note's "same `ρ/r*` ⇒ same shape," and a direct hardware read of the
-unspent-information gap. Champion vs classic side-by-side (the ship/no-ship
-methodology). Add the matched detector to iron only if Experiment B flags a sim
-divergence worth confirming.
+**Scope tightened by the §7.1 result — the floor race does NOT need iron, only
+the ring does.** Experiment B answered the tracking question in sim (floor-limited,
+no reopen), and that answer rests on the *information floor*, which the hardware
+cannot move — so re-running the floor race on iron confirms nothing new. The one
+thing B made a live ship/no-ship question is the **direction-gate variance ring**
+(§7.1): the sim says `holt-est` produces `s>0` (tightening) fires in 8 named
+sub-guard cells, and the only thing iron can tell us that sim can't is whether
+that ring **survives on hardware or is an artifact of the Poisson observation
+model**. That is the narrow test:
+
+> Champion vs `holt-est` side-by-side on an S21/testnet4, at **one or two of the 8
+> ring cells** (the sparsest, e.g. `40%/hr × 2–4 spm`, where the fingerprint is
+> strongest), driving the shape-proxy **Ramp**. Watch Grafana for `s>0`
+> (difficulty-up) fires during the monotonic decline. A tighten on iron at a ring
+> cell = the ring is real and any slope-aware controller owes a fix before ship; no
+> tighten = the ring is a Poisson-model artifact and the risk is sim-only.
+
+This is a cheap overnight run on specific cells, **not** the broad decline sweep
+the original §5 framing (written for Experiment A's collapse overlay) implied. The
+A-style two-point same-`ρ/r*` overlay — predicted to *differ* for the level
+champion since it obeys `ρ√r*` not `ρ/r*` (§2) — remains valid but is
+characterization, not a gate, and is deprioritized behind the ring check.
 
 ## 6. Framing note (for the white paper, if any of this lands)
 
@@ -273,6 +285,17 @@ discontinuity. One quantitative refinement worth stating *if* the envelope holds
 the **width** of the transition region should scale as `1/√(r*τ)` — a finite-count
 rounding of the floor — so it narrows as `r*` rises. That is a second, independent
 prediction the same grid tests for free.
+
+**The through-line (the strongest claim the result licenses).** This is now the
+**second** time the tree has answered "does a better estimator help?" with "no, and
+here is the floor it cannot beat" — first **static** (Theorem 2; the ~12% flat
+field across the operating band, METRIC §8), now **dynamic** (§7.1: oracle ×0.95
+against the self-consistent `L*` on a decline). Two *independent regimes*, the same
+structural answer, is a stronger claim than either alone: it is evidence that the
+**information floor is the governing constraint across the operating envelope**, not
+an artifact of one scenario class. That is the opposite of the note's "build a
+magical estimator" instinct — now refuted in **both** forms by measurement rather
+than argument. State it as the spine if any of this reaches the white paper.
 
 ## 7. Build order and results (`bin/collapse`, `bin/matched-detector`)
 
@@ -352,6 +375,34 @@ estimator-limited**. A slope-aware tracker buys ~5% (oracle, free slope) to ~0%
 reopen-trigger does **not** fire; the slow level estimator stands as not just safe
 but latency-optimal-to-within-the-band on a decline. (`bin/matched-detector`,
 `VARDIFF_MD_TRIALS=200`; sim only — HW unrun.)
+
+**Why a Kalman-velocity follow-up is *not* live.** Holt was the right probe
+precisely because its decoupled trend leg *is* the `ρτ` term in isolation — so
+"de-lagging the lag doesn't help" is as clean a test of "is the lag the binding
+cost" as the design space allows. A variance-optimal Kalman-velocity arm would be
+answering a question §7.1 has shown isn't open. It re-opens **only if the rate
+regime moves**: at higher `r*` the variance floor `1/√(r*τ)` recedes and the bias
+term's *relative* weight grows — the one corner where the §8.4 lever and this
+result interact. Until then, no slope-aware follow-up is warranted.
+
+**Method note — the §6.1 trap, hit 3× and escaped 3× (the transferable part).**
+Three times during this build a mechanism was *plausible from the algebra and wrong
+in the dynamics*, the exact failure METRIC §6.1 documents: (1) an early claim that
+the share-maturing horizon `L_eff/(r_obs/r*)` would over-correct in the dangerous
+corner — inverted on the sign check (`e>0` ⇒ `r_obs < r*`, shares *slow*, lag
+*grows*, a safe-side under-correction, not the predicted tighten); (2) the
+"oracle's fixed `b<0` cannot tighten" 2×2 premise — false, a long de-lagged window
+over-corrects deterministically, caught only by adding the `lvl@orcτ` control; (3)
+the de-lag horizon `L_eff = τ` — wrong, it is the *discrete*-EWMA mean lag
+`α/(1−α)` ticks, a 9% error the **closed-loop gate structurally could not surface**
+(it took feeding the estimator a known ramp open-loop, pin 2 doing its actual job:
+catching a misspecification, not confirming a belief). The escape was identical
+each time: **measure the channel rather than reason about it.** The
+`α/(1−α)`-not-`τ` fact is general to de-lagging any time-EWMA on this tree, not
+specific to Holt — carry it forward. The variance-ring fingerprint's power is the
+same discipline in positive form: either channel alone (`b̂>0`, or low `r_obs/r*`)
+is ambiguous; their *co-location* is what makes "starvation-driven slope-estimation
+noise" unambiguous rather than a plausible story.
 
 ### 7.2 Experiment A — not built (characterization only)
 
