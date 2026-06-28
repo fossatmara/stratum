@@ -47,17 +47,19 @@
     },
     {
       "id": "CIT-construction-ships",
-      "statement": "A controller of this construction (pow2-in-loop, easing crossing below zero rate) is present in deployed pool software.",
-      "warrant_type": "UNDECIDED",
+      "statement": "A controller of this construction (pow2-in-loop, easing crossing below zero rate) is present in deployed pool software, verifiable in public pool source.",
+      "warrant_type": "source",
       "warrant_ref": {
-        "between": ["source", "source-private"],
-        "pending_decision": "attribution call: 'reproducible-public-pointer' (publicly identifiable in pool source -> ordinary `source` with a public commit pin, strongest form, NO sub-type) VS 'authorial-observation' (authors examined -> `source-private`, warrant cannot be public because the public pin de-anonymizes the SV2-first-block operator + the investigation is unpublished)",
-        "owner": "human",
-        "also_pending": "prudence/timing call — publishing a recognizable structural critique of a currently-celebrated party; the archetype framing makes it defensible, not necessarily prudent; framing does not force timing"
+        "doc": "PID_INVESTIGATION.md",
+        "anchor": "re-validated against live DMND source 2026-06-25",
+        "public_source": "dmnd-pool/dmnd-client/src/translator/downstream/diff_management.rs (nearest_power_of_2 :268/:389, next_control_output :267, Kp=-diff*0.01 :281)",
+        "lines": "59-96",
+        "content_must_match": "below zero and\n>   therefore UNREACHABLE"
       },
-      "domain": {"level": "archetype, not instance — no pool named, no block cited"},
-      "status": "UNDECIDED",
-      "_note": "MODELED OPEN ON PURPOSE. The schema must not default this to either branch. source-private's binding to this claim is downstream of this resolution; under reproducible-public-pointer this claim is NOT source-private at all. Blocks the gate until the human decides."
+      "domain": {"level": "construction, verifiable in public source; published-voice names NO operator (see revisit_when)"},
+      "status": "validated",
+      "revisit_when": "(a) pin strength: anchored to a DATE (2026-06-25) + line numbers, NOT a commit hash — line numbers drift against upstream main; strengthen to a pinned commit/sha so the public pointer can't resolve-to-the-wrong-lines (the §7 failure). (b) naming: published-voice currently POINTS to the construction in public source and does NOT name the operator; naming DMND in the published artifact is a SEPARATE deliberate increment (owner: human), not resolved by the prudence call — do not let 'show the data' launder into 'name them'.",
+      "_note": "RESOLVED 2026-06-28 (prudence call: show the verified result). reproducible-public-pointer chosen -> ordinary `source`, strongest form; source-private binds to NO claim here and the sub-type is now unused. Construction is named in INTERNAL docs (PID_INVESTIGATION, this fixture) by source path; the PUBLISHED section points-not-names. Two debts ride in revisit_when: a commit-hash pin, and the still-open name-in-published-voice decision."
     },
     {
       "id": "CIT-self-concealing",
