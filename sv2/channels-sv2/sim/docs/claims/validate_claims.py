@@ -145,6 +145,18 @@ def gate(claims_path, docroot):
         else:
             failures.append(f"{cid}: unknown/unrouted warrant_type={wt!r} — nothing ships unrouted.")
 
+        # A resolved claim may carry revisit_when: "decided the version right for
+        # now, marked the condition under which I'd strengthen it." That is NOT
+        # UNDECIDED (the decision was made) — but a revisit condition that never
+        # re-surfaces is a deferred decision laundered as resolved, the thread's
+        # signature failure. So surface it every run rather than tolerate it
+        # silently. It does not block (the claim is validly resolved now); it
+        # refuses to disappear.
+        if c.get("revisit_when"):
+            warns.append(f"{cid}: REVISIT — resolved as {wt} for now, strengthen when: "
+                         f"{c['revisit_when']}. (Standing condition; surfaced every run so a "
+                         f"matured condition can't pass unnoticed — re-examine, don't auto-resolve.)")
+
     # cited_by>1 canonical-object proxy (lagging) — warn only.
     cby = {}
     for c in claims.values():
