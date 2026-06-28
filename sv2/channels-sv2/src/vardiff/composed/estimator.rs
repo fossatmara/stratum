@@ -91,10 +91,21 @@ pub trait Estimator: Debug + Send + Sync {
     /// `new_hashrate` is the target being set; `old_hashrate` is what
     /// it was before the fire.
     ///
+    /// **Why this method has to exist (the invariant):** the only observable
+    /// is `r_obs = r*·H/Ĥ`, so any estimator whose state is expressed
+    /// *relative to the current difficulty* must be told when the controller
+    /// moves `Ĥ`, or it will read its own retarget as a change in `H`. That
+    /// clause is the discriminator: every difficulty-relative representation
+    /// pays a rescale here (EWMA rescales its shares-per-tick rate, Ckpool its
+    /// dsps, the Kalman/Bayesian filters their ratio state) — only a
+    /// difficulty-*weighted* hashrate-space estimator (weight each share by its
+    /// `job_id_to_target` snapshot) would be retarget-invariant and could
+    /// no-op. The tree deliberately takes the former (see DESIGN.md).
+    ///
     /// Estimators choose how to respond:
     /// - Absolute-rate estimators (CumulativeCounter, EWMA, SlidingWindow):
-    ///   full reset — old data is invalid under the new target.
-    /// - Ratio-based estimators (Bayesian): rescale posterior to center
+    ///   full reset / rate rescale — old data is invalid under the new target.
+    /// - Ratio-based estimators (Bayesian, Kalman): rescale state to center
     ///   on ratio=1.0 relative to the new target, preserving accumulated
     ///   confidence.
     fn on_fire(&mut self, new_hashrate: f32, old_hashrate: f32);

@@ -144,16 +144,35 @@ pub trait Estimator: Debug + Send + Sync {
     /// Notification that the algorithm fired and changed the target.
     /// `new_hashrate` is the new target; `old_hashrate` is what it was.
     ///
-    /// Estimators choose how to respond:
-    /// - CumulativeCounter/EWMA: full reset (old absolute-rate data is
-    ///   invalid under new target)
-    /// - Bayesian: rescale posterior to new baseline, preserving confidence
+    /// Exists because the only observable is `r_obs = r*·H/Ĥ`: any estimator
+    /// whose state is difficulty-relative must be told when the controller
+    /// moves `Ĥ`, or it reads its own retarget as a change in `H`. (See
+    /// "Why `on_fire` has to exist" below.)
+    /// - CumulativeCounter/EWMA: full reset / rate rescale (old absolute-rate
+    ///   data is invalid under new target)
+    /// - Bayesian/Kalman: rescale ratio state to new baseline, preserve confidence
     fn on_fire(&mut self, new_hashrate: f32, old_hashrate: f32);
 
     /// Raw share count since last fire (for Vardiff trait compatibility).
     fn shares_count(&self) -> u32;
 }
 ```
+
+**Why `on_fire` has to exist at all (the representation choice it prices):**
+
+The only observable is `r_obs = r*·H/Ĥ`, so an estimator whose state is
+expressed *relative to the current difficulty* moves whenever the controller
+moves `Ĥ` — without `on_fire` it would read its own retarget as a change in
+`H`. This is a *priced choice with a visible loser*, not a quirk:
+difficulty-relative representations (EWMA's shares-per-tick rate, Ckpool's
+dsps, the ratio-based filters' ratio state) keep the estimator native to the
+count-space the Poisson floor and the boundary's deviation test already live
+in, at the cost of one cheap division per fire. The retarget-invariant
+alternative — difficulty-*weight* each share by its `job_id_to_target`
+snapshot — needs no `on_fire` rescale, but pays a round-trip out of count-space
+on every tick. The tree takes the difficulty-relative road; the rescale below
+is its price, paid identically by all three serious estimators despite their
+different internal representations.
 
 **Why `on_fire` instead of `reset`:**
 
