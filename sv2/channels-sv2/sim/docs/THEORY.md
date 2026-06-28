@@ -16,11 +16,16 @@
 > 2. **The derivation and the falsification trail are authoritative HERE, and are
 >    NOT superseded.** This doc is where the dead ends are recorded — §3a
 >    (magnitude-cancellation, REFUTED), §8.4 (synthesis attempt, REFUTED), the Q6/Q7
->    surprises (§9.1/§9.2) — and that record *is the doc's purpose*: it is what METRIC
->    compresses to "premises drawn and killed" and points back to. The conclusions
->    are dated; the kill-record is live. **Do not read "dated" as "wholly
->    superseded"** — half of this doc (the derivation and the trail) exists nowhere
->    else.
+>    surprises (§9.1/§9.2), **and the in-flight-work rationale (§5.1, §10.2),
+>    RETRACTED — a retarget rejects no in-flight work (`job_id_to_target`); the
+>    asymmetry survives on §5.2 self-starvation, not lost work** — and that record
+>    *is the doc's purpose*: it is what METRIC compresses to "premises drawn and
+>    killed" and points back to. The conclusions are dated; the kill-record is live.
+>    **Do not read "dated" as "wholly superseded"** — half of this doc (the
+>    derivation and the trail) exists nowhere else. (Banner kill-list extended to
+>    cover the in-flight-work retraction, 2026-06-28 — until claim-ids carry this in
+>    the planned registry, this banner IS the reconciliation record, so it must
+>    enumerate the retraction, not omit it.)
 > 3. **The opening proposal was decided.** This notebook was written in the future
 >    tense of an open proposal ("decide whether this framing should replace the
 >    radar"). It *was* decided: the linear sign-split reframe **replaced** the
@@ -226,13 +231,25 @@ wrong or incomplete.
 > boundary, is a symmetric trigger). This higher-altitude section is left as-is; the
 > mechanism-level correction lives in METRIC_DERIVATION §6.1. Not stale-and-clean —
 > flagged.
+>
+> **Second, separate flag — the in-flight-work rationale below is RETRACTED**
+> (`information-floor.md` §6, PR #2188 / `job_id_to_target`). The bullet's claim that
+> tightening "invalidates shares miners already have in flight" is **false against the
+> implementation**: each job snapshots its target at creation and shares validate against
+> *that* snapshot until the next block, so a retarget rejects no in-flight work and churn
+> is value-neutral. This is a REFUTED premise in the sense of §3a/§8.4 — derivation
+> retained for the record, conclusion **not** rewritten — and the "left as-is" above does
+> NOT extend to it. What survives is the *asymmetry's direction*, which stands on §5.2's
+> self-starvation (over-difficulty starves the share stream), not on lost work.
 
 The single most important hole. Commit `a1d3fa7b` (AsymmetricCusum) and
 `5d871ed3` ("never surprise the miner") establish that the two
 directions of error are *not* equally costly:
 
 - **Tightening** (raising difficulty, `e` driven up): invalidates
-  shares miners already have in flight, and at the extreme triggers the
+  shares miners already have in flight `[RETRACTED — see flag above: a retarget
+  rejects no in-flight work; the asymmetry survives via §5.2 self-starvation, not this]`,
+  and at the extreme triggers the
   "timeout death spiral" seen with physical miners — the miner submits
   nothing, looks dead, and the loop can't recover.
 - **Easing** (lowering difficulty, `e` driven down): old, harder work
@@ -992,6 +1009,13 @@ introspection, works for every algorithm:
   effort_down   = Σ(Δln D)²  on easing fires       (≈free)
   detection     = P[fire within window | small persistent drop]   (SEPARATE axis, §9.4)
 ```
+
+> **Flag (in-flight-work retraction, same as §5.1):** the `effort_up` annotation
+> "rejects in-flight shares" is RETRACTED — a retarget rejects no in-flight work
+> (`information-floor.md` §6, `job_id_to_target`). `effort_up` is still costed above
+> `effort_down`, but the surviving basis is the §6(i) variance/over-difficulty concern
+> and churn/usability, **not** lost work. Annotation kept as written for the record;
+> the cost direction stands on the corrected basis.
 
 Reported **per scenario class** (cold / stable / drop / rise / aged-
 counter), never pooled (cold-start dominance, §5.8 Q3). The four
