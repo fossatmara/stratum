@@ -291,8 +291,74 @@ prediction the same grid tests for free.
   build B, scoped as in §3 (one floor per response variable; actuator on the
   detector; oracle-ρ for the ceiling).
 
-_Results to fill — Experiment A: per-arm group fits (fixed on `ρ√r*`, τ*-EWMA on
-`(ρ/r*)^{1/3}`), the convex (★★) fit + sub-guard upturn, fixed-arm gap ordering.
-Experiment B: `regret_over` (and/or latency) champion vs oracle matched detector
-per cell, against the §3 floor; estimated-ρ follow-up if the oracle arm wins. HW
-two-point same-`ρ/r*` shape overlay (predicted to differ for the level champion)._
+### 7.1 Experiment B — RESULT (`bin/matched-detector`, 200 trials/cell, sim)
+
+**Verdict: FLOOR-LIMITED — the decline regime is not gap-dominated, and a
+slope-aware estimator does *not* reopen sparse-estimator work.** The strong form
+of the §3 "information-limited" outcome holds, and it is a *stronger* statement
+than the docs currently make.
+
+**Build.** `decline_floor.rs` (the measured `L*` + the (★★) convex cross-check +
+the oracle decline slope); `holt.rs` (the slope-aware arm — champion EWMA level +
+a *decoupled* multiplicative de-lag `ĥ = h_level·exp(b·L_eff)`, so `b=0` is
+bit-identical to the champion — pin 4); `bin/matched-detector.rs` (the race + the
+open-loop calibration gate + the direction-gate 2×2). All arms share the champion
+boundary/update/clamp/tick; only the estimator differs.
+
+**Primary (regret_over vs the measured bias–variance floor).** Each arm swept over
+its own τ-ladder and scored at its own-best window (the floor is `min_τ` of a
+level-only EWMA; `L* = min_τ(lag+noise)` is per-arm). In the 13 *substantial*
+cells (floor ≥ 1% over-difficulty — the sub-guard/fast corner where the floor
+question lives; the rest are ≈0-floor where the ratio is noise):
+
+```
+  median arm/floor ratio:  oracle ×0.95,  estimated ×1.04
+```
+
+The **oracle** slope-aware arm — handed the true ρ, level still estimated — beats
+the level floor by only ~5%, and the **estimated** arm (must learn the slope from
+Poisson data) sits *at or above* the floor. So even a best-case slope handed for
+free does not materially beat the uniform-window floor on a decline: the removable
+`ρτ` bias is real (§1(a)) but at these rates it is **not worth removing** — the
+slow window is not leaving tracking on the table. This is stronger than §6.1's
+"the slow estimator is *safe*": it is "no estimator is materially *faster*."
+
+**Calibration gate (open-loop, pin 2) — PASSED.** Driving the estimator alone on
+the known ramp (belief fixed, exact dithered counts, no boundary/actuator), the
+oracle de-lag removes ≥70% of the `+ρτ` lag with ≤0.5% residual across the grid,
+**once the de-lag horizon is the DISCRETE-EWMA mean lag `α/(1−α)` ticks, not `τ`**
+(the continuous-`τ` value over-corrected ~9%; the gate caught it at high rate and
+it was re-spec'd per pin 2, not nudged). The two corners that don't fully null are
+named physics the linear de-lag *structurally cannot* remove — the `e^{−e}` convex
+floor (★★) at 40%/sparse, and the sparse Jensen *offset* (not lag) at 1–2%/2spm —
+exactly where the spec predicts. So the ×0.95 is a **real de-bias, not a horizon
+artifact**.
+
+**Direction gate (pin 5) — the genuine new risk, located.** The 2×2, closed
+against a level-EWMA-at-the-oracle's-own-window control (`lvl@orcτ`):
+- The **de-lag never tightens more than `lvl@orcτ`** — where the oracle tightens,
+  it is the *long window* mis-reading sparse data (the champion's own documented
+  sparse-noise tightens, `SLOW_DECLINE_TEST.md` §6), **not** a de-lag fault.
+- The **estimated arm tightens more than the oracle in 8 sub-guard cells** =
+  *trend-estimator variance*. Fingerprint confirmed: `frac(b̂>0) ≈ 1.0`
+  co-located with low `r_obs/r*` (down to 0.85) and rising `e%` — a
+  starvation-driven ring (pin 1's two-channel signature). **This is the new
+  direction risk slope-awareness introduces, and the thing hardware would have to
+  clear before any slope-aware controller could ship.**
+
+**Net.** B answers its own question: the decline regime is **floor-limited, not
+estimator-limited**. A slope-aware tracker buys ~5% (oracle, free slope) to ~0%
+(estimated) on tracking, at the cost of a new sparse-rate tightening risk. The §10
+reopen-trigger does **not** fire; the slow level estimator stands as not just safe
+but latency-optimal-to-within-the-band on a decline. (`bin/matched-detector`,
+`VARDIFF_MD_TRIALS=200`; sim only — HW unrun.)
+
+### 7.2 Experiment A — not built (characterization only)
+
+Per the build lean above, A was not built: the fixed-arm collapse is §8.3
+re-expressed and reopens nothing. The one number A would have added — the
+unconfounded `L*` depth — was produced as a *by-product* of B (the measured floor
+column, `bin/matched-detector`), and the (★★) convex shape is confirmed as the
+cross-check in `decline_floor` (the floor depth bends up super-linearly in `ρ/r*`,
+near-collapsing the two equal-group cells). The HW two-point same-`ρ/r*` overlay
+(§5) remains unrun.
