@@ -60,7 +60,6 @@
 //! against an expectation of E has probability e^-E), rather than being
 //! discounted as a small sample.
 
-use crate::target::hash_rate_from_target;
 use bitcoin::Target;
 use tracing::debug;
 
@@ -82,11 +81,12 @@ pub const DEFAULT_DEADBAND: f64 = 0.1;
 /// Significance threshold in standard deviations: a single window only
 /// triggers an update when its raw log-error exceeds `Z / sqrt(N_eff)`, the
 /// approximate sigma of a Poisson window's log-rate estimate. Sized for
-/// share-driven evaluation (many judged windows per minute): 2.5 sigma keeps
-/// the per-window false-positive rate low enough that a converged miner is
-/// rarely disturbed, while a genuine hashrate step (|e| >= ln 2) clears the
-/// gate on the first evidence-complete window.
-pub const DEFAULT_SIGNIFICANCE_Z: f64 = 2.5;
+/// share-driven evaluation (many judged windows per minute): 3 sigma keeps
+/// the per-window false-positive rate negligible so converged miners are
+/// left alone; large hashrate steps still clear the gate on the first
+/// evidence-complete window, and smaller drifts correct through the
+/// integral-pressure path.
+pub const DEFAULT_SIGNIFICANCE_Z: f64 = 3.0;
 /// Back-calculation tracking time constant (seconds): how fast the integral
 /// unwinds toward the saturated output when the `max_step` clamp engages.
 pub const DEFAULT_TRACKING_SECS: f64 = 60.0;
@@ -169,6 +169,10 @@ pub struct PidVardiffState {
     timestamp_of_last_update: f64,
     /// Integral of the log-space error over time (seconds).
     integral: f64,
+    /// Accumulated variance of the integral under pure Poisson noise; the
+    /// integral-pressure emission gate tests |I| against Z * sqrt(this), so
+    /// noise random-walks don't masquerade as accumulated evidence.
+    integral_noise_var: f64,
     /// Previous log-measurement, for the derivative term.
     prev_log_measurement: Option<f64>,
     /// EWMA-filtered derivative of the log-measurement.
@@ -187,6 +191,7 @@ impl PidVardiffState {
             shares_since_last_update: 0,
             timestamp_of_last_update: timestamp_secs,
             integral: 0.0,
+            integral_noise_var: 0.0,
             prev_log_measurement: None,
             filtered_derivative: 0.0,
         })
@@ -277,7 +282,7 @@ impl PidVardiffState {
     pub fn try_vardiff_observed(
         &mut self,
         hashrate: f32,
-        target: &Target,
+        _target: &Target,
         shares_per_minute: f32,
     ) -> Result<(Option<f32>, Option<WindowObservation>), VardiffError> {
         let now = super::sim_clock::now_secs_f64();
@@ -355,6 +360,10 @@ impl PidVardiffState {
                 error * dt + tracking * dt / self.params.tracking_secs.max(f64::EPSILON);
             let limit = self.integral_limit();
             self.integral = self.integral.clamp(-limit, limit);
+            // One window of pure noise contributes conf*dt*sigma_e to the
+            // integral, sigma_e ~ 1/sqrt(N); accumulate its variance so the
+            // pressure gate can test significance of the sum.
+            self.integral_noise_var += (confidence * dt / n_eff.sqrt()).powi(2);
         }
 
         debug!(
@@ -370,7 +379,12 @@ impl PidVardiffState {
         // so a persistent sub-sigma bias accumulates and emits through the
         // integral-pressure path instead of being lost.
         let significant_window = raw_error.abs() >= self.params.significance_z / n_eff.sqrt();
-        let integral_pressure = (self.params.ki * self.integral).abs() >= self.params.deadband;
+        // Integral pressure must be *statistically significant* accumulated
+        // evidence, not a noise random-walk: require |I| to clear Z sigmas
+        // of its own accumulated noise in addition to the deadband floor.
+        let integral_sigma = self.integral_noise_var.sqrt().max(f64::EPSILON);
+        let integral_pressure = (self.params.ki * self.integral).abs() >= self.params.deadband
+            && self.integral.abs() >= self.params.significance_z * integral_sigma;
         if !significant_window && !integral_pressure {
             debug!(
                 target: "vardiff",
@@ -387,36 +401,14 @@ impl PidVardiffState {
             return Ok((None, Some(observation)));
         }
 
-        // Estimate the miner's true hashrate from what the current target
-        // realized, then scale by the controller output. The estimate (rather
-        // than the nominal hashrate) anchors the P-step to the observed rate,
-        // like the classic implementation.
-        let estimated_hashrate =
-            match hash_rate_from_target(target.to_le_bytes().into(), realized_spm) {
-                Ok(h) => h as f64,
-                Err(e) => {
-                    debug!(
-                        target: "vardiff",
-                        "target->hashrate conversion failed ({e:?}); scaling nominal hashrate"
-                    );
-                    hashrate as f64 * realized_spm / setpoint
-                }
-            };
-        // The controller output is the total move from the *current* operating
-        // point; the estimate already embodies the proportional correction
-        // (estimated/nominal = exp(error)), so apply the residual.
-        let residual = output - self.params.kp * error;
-        let mut new_hashrate = (estimated_hashrate.powf(self.params.kp)
-            * (hashrate as f64).powf(1.0 - self.params.kp)
-            * residual.exp()) as f32;
-
-        // Bound the resulting per-step change like the raw output.
-        let ratio = (new_hashrate / hashrate) as f64;
-        if ratio > self.params.max_step {
-            new_hashrate = (hashrate as f64 * self.params.max_step) as f32;
-        } else if ratio < 1.0 / self.params.max_step {
-            new_hashrate = (hashrate as f64 / self.params.max_step) as f32;
-        }
+        // Emit exactly the controller's clamped output as a multiplicative
+        // move from the current operating point. The output already carries
+        // the confidence weighting, integral evidence, and per-step clamp;
+        // anchoring to a raw observed-rate hashrate estimate here (as the
+        // classic algorithm does) would bypass the confidence weighting and
+        // let one thin lucky window emit its full unweighted correction,
+        // which oscillates in closed loop.
+        let mut new_hashrate = (hashrate as f64 * output.exp()) as f32;
         if new_hashrate < self.params.min_allowed_hashrate {
             new_hashrate = self.params.min_allowed_hashrate;
         }
@@ -427,8 +419,10 @@ impl PidVardiffState {
         // The difficulty plant is itself an integrator: the emitted move is
         // absorbed multiplicatively into the channel target, so the evidence
         // the integral accumulated is now applied. Consume it — a standing
-        // I-term after emission double-counts and rings.
+        // I-term after emission double-counts and rings. Its noise budget
+        // restarts with it.
         self.integral = 0.0;
+        self.integral_noise_var = 0.0;
 
         observation.emitted = true;
         Ok((Some(new_hashrate), Some(observation)))
@@ -614,6 +608,179 @@ mod tests {
         let res = state.try_vardiff(100.0e12, &target, 6.0).unwrap();
         assert!(res.is_none());
         assert_eq!(state.shares_since_last_update(), 3, "evidence must be retained");
+    }
+
+    /// Deterministic xorshift for reproducible noise in tests.
+    struct TestRng(u64);
+    impl TestRng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn uniform(&mut self) -> f64 {
+            (self.next() >> 11) as f64 / (1u64 << 53) as f64
+        }
+        /// Poisson sample (Knuth), matching real share-arrival statistics.
+        fn poisson(&mut self, lambda: f64) -> u32 {
+            let l = (-lambda).exp();
+            let mut k = 0u32;
+            let mut p = 1.0;
+            loop {
+                p *= self.uniform();
+                if p <= l {
+                    return k;
+                }
+                k += 1;
+            }
+        }
+    }
+
+    /// Closed-loop helper: expected shares for `true_hashrate` in a 60s
+    /// window at the current target.
+    fn shares_at(true_hashrate: f64, nominal: f32, spm: f32) -> u32 {
+        let target = target_for(nominal, spm);
+        let per_spm = hash_rate_from_target(target.to_le_bytes().into(), 1.0)
+            .expect("valid target");
+        (true_hashrate / per_spm).round() as u32
+    }
+
+    #[test]
+    fn noisy_on_target_miner_gets_few_updates() {
+        // Closed loop: a steady miner whose shares arrive with true Poisson
+        // noise must rarely be disturbed, and the difficulty must not walk
+        // away from the correct operating point.
+        let spm: f32 = 6.0;
+        let true_hashrate: f64 = 100.0e12;
+        let mut nominal: f32 = 100.0e12;
+        let mut state = PidVardiffState::new().unwrap();
+        let mut rng = TestRng(0x5eed_cafe);
+        let mut emissions = 0;
+        for _ in 0..60 {
+            let expected = shares_at(true_hashrate, nominal, spm) as f64;
+            for _ in 0..rng.poisson(expected) {
+                state.increment_shares_since_last_update();
+            }
+            backdate(&mut state, 60);
+            if let Some(new) = state
+                .try_vardiff(nominal, &target_for(nominal, spm), spm)
+                .unwrap()
+            {
+                nominal = new;
+                emissions += 1;
+            }
+        }
+        assert!(
+            emissions <= 6,
+            "noisy but on-target miner disturbed {emissions}/60 windows"
+        );
+        let ratio = nominal as f64 / true_hashrate;
+        assert!(
+            (0.5..2.0).contains(&ratio),
+            "difficulty walked away under noise: ratio {ratio:.3}"
+        );
+    }
+
+    #[test]
+    fn aggressive_ramp_up_then_down_is_tracked() {
+        // True hashrate doubles every window to 16x, holds, then halves
+        // back down; the controller must follow both directions and end
+        // near the truth without winding up.
+        let spm: f32 = 6.0;
+        let mut nominal: f32 = 100.0e12;
+        let mut true_hashrate: f64 = 100.0e12;
+        let mut state = PidVardiffState::new().unwrap();
+        let step = |state: &mut PidVardiffState, nominal: &mut f32, th: f64| {
+            for _ in 0..shares_at(th, *nominal, spm) {
+                state.increment_shares_since_last_update();
+            }
+            backdate(state, 60);
+            if let Some(new) = state.try_vardiff(*nominal, &target_for(*nominal, spm), spm).unwrap() {
+                *nominal = new;
+            }
+        };
+        for _ in 0..4 {
+            true_hashrate *= 2.0;
+            step(&mut state, &mut nominal, true_hashrate);
+        }
+        for _ in 0..6 {
+            step(&mut state, &mut nominal, true_hashrate);
+        }
+        let up_ratio = nominal as f64 / true_hashrate;
+        assert!(
+            (0.5..2.0).contains(&up_ratio),
+            "ramp-up not tracked: nominal {nominal:.3e} vs true {true_hashrate:.3e}"
+        );
+        for _ in 0..4 {
+            true_hashrate /= 2.0;
+            step(&mut state, &mut nominal, true_hashrate);
+        }
+        for _ in 0..8 {
+            step(&mut state, &mut nominal, true_hashrate);
+        }
+        let down_ratio = nominal as f64 / true_hashrate;
+        assert!(
+            (0.5..2.0).contains(&down_ratio),
+            "ramp-down not tracked: nominal {nominal:.3e} vs true {true_hashrate:.3e}"
+        );
+    }
+
+    #[test]
+    fn silence_then_resume_reconverges() {
+        // Flaky miner: converged, goes silent (rig off / disconnect without
+        // channel teardown), difficulty ratchets down via zero-share
+        // windows, then the miner resumes at its true rate and the loop
+        // must re-converge without oscillating from leftover state.
+        let spm: f32 = 6.0;
+        let true_hashrate: f64 = 100.0e12;
+        let mut nominal: f32 = 100.0e12;
+        let mut state = PidVardiffState::new().unwrap();
+        // Converged phase.
+        for _ in 0..3 {
+            for _ in 0..shares_at(true_hashrate, nominal, spm) {
+                state.increment_shares_since_last_update();
+            }
+            backdate(&mut state, 60);
+            if let Some(new) = state
+                .try_vardiff(nominal, &target_for(nominal, spm), spm)
+                .unwrap()
+            {
+                nominal = new;
+            }
+        }
+        // Silence: several long zero-share backstop windows.
+        for _ in 0..5 {
+            backdate(&mut state, 120);
+            if let Some(new) = state
+                .try_vardiff(nominal, &target_for(nominal, spm), spm)
+                .unwrap()
+            {
+                nominal = new;
+            }
+        }
+        assert!(
+            (nominal as f64) < true_hashrate * 0.6,
+            "silence should ratchet the estimate down, got {nominal:.3e}"
+        );
+        // Resume at the true rate.
+        for _ in 0..10 {
+            for _ in 0..shares_at(true_hashrate, nominal, spm) {
+                state.increment_shares_since_last_update();
+            }
+            backdate(&mut state, 60);
+            if let Some(new) = state
+                .try_vardiff(nominal, &target_for(nominal, spm), spm)
+                .unwrap()
+            {
+                nominal = new;
+            }
+        }
+        let ratio = nominal as f64 / true_hashrate;
+        assert!(
+            (0.5..2.0).contains(&ratio),
+            "did not reconverge after resume: {nominal:.3e} (ratio {ratio:.3})"
+        );
     }
 
     #[test]
