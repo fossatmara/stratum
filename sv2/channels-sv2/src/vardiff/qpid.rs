@@ -282,6 +282,13 @@ impl QPidVardiffState {
         (self.kp, self.ki, self.kd)
     }
 
+    /// Enables gain telemetry (see [`PidVardiffState::set_telemetry_key`]);
+    /// the learner's per-decision gain updates publish automatically through
+    /// the inner controller.
+    pub fn set_telemetry_key(&mut self, key: String) {
+        self.pid.set_telemetry_key(key);
+    }
+
     fn learn_and_schedule(&mut self, obs: &WindowObservation) {
         let state = state_index(obs);
         let mut table = match self.table.lock() {

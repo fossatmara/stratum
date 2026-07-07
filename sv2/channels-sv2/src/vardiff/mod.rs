@@ -7,6 +7,7 @@ pub mod error;
 pub mod pid;
 pub mod qpid;
 pub mod sim_clock;
+pub mod telemetry;
 pub mod tuning;
 #[cfg(test)]
 pub mod test;

@@ -197,6 +197,10 @@ pub struct PidVardiffState {
     /// integral-pressure emission gate tests |I| against Z * sqrt(this), so
     /// noise random-walks don't masquerade as accumulated evidence.
     integral_noise_var: f64,
+    /// Telemetry identity: when set, gain values are published to
+    /// [`super::telemetry`] so visualizations can track them (instance id
+    /// guards against a reconnect race clearing the successor's entry).
+    telemetry: Option<(String, u64)>,
     /// Virtual timestamp of the most recent share (or channel creation).
     /// Zero-share windows are judged over the silence since this point, so
     /// sustained starvation is cumulative evidence and successive corrections
@@ -221,6 +225,7 @@ impl PidVardiffState {
             timestamp_of_last_update: timestamp_secs,
             integral: 0.0,
             integral_noise_var: 0.0,
+            telemetry: None,
             last_share_time: timestamp_secs,
             prev_log_measurement: None,
             filtered_derivative: 0.0,
@@ -234,9 +239,24 @@ impl PidVardiffState {
     /// Replaces the P/I/D gains (used by adaptive controllers layered on
     /// top, e.g. Q-learning gain scheduling).
     pub fn set_gains(&mut self, kp: f64, ki: f64, kd: f64) {
+        let changed =
+            kp != self.params.kp || ki != self.params.ki || kd != self.params.kd;
         self.params.kp = kp;
         self.params.ki = ki;
         self.params.kd = kd;
+        if changed {
+            if let Some((key, id)) = &self.telemetry {
+                super::telemetry::publish_gains(key, *id, kp, ki, kd);
+            }
+        }
+    }
+
+    /// Enables gain telemetry under the given identity (usually the
+    /// channel's user identity) and publishes the current gains.
+    pub fn set_telemetry_key(&mut self, key: String) {
+        let id = super::telemetry::next_instance_id();
+        super::telemetry::publish_gains(&key, id, self.params.kp, self.params.ki, self.params.kd);
+        self.telemetry = Some((key, id));
     }
 
     /// Integral clamp so that the I-term alone can never exceed the per-step
@@ -247,6 +267,14 @@ impl PidVardiffState {
             self.params.max_step.ln() / self.params.ki
         } else {
             0.0
+        }
+    }
+}
+
+impl Drop for PidVardiffState {
+    fn drop(&mut self) {
+        if let Some((key, id)) = &self.telemetry {
+            super::telemetry::clear_gains(key, *id);
         }
     }
 }
