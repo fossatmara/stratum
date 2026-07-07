@@ -50,6 +50,27 @@ pub fn set_significance_z(z: f64) {
     }
 }
 
+static SIGNIFICANCE_Z_DOWN: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Live override for the downward significance threshold. `None` means
+/// controllers use their configured value. The effective down-bar is always
+/// capped at the effective up-bar.
+pub fn significance_z_down_override() -> Option<f64> {
+    let bits = SIGNIFICANCE_Z_DOWN.load(Ordering::Relaxed);
+    if bits == u64::MAX {
+        None
+    } else {
+        Some(f64::from_bits(bits))
+    }
+}
+
+/// Sets the live downward significance override (clamped to `[0.5, 10.0]`).
+pub fn set_significance_z_down(z: f64) {
+    if z.is_finite() {
+        SIGNIFICANCE_Z_DOWN.store(z.clamp(0.5, 10.0).to_bits(), Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

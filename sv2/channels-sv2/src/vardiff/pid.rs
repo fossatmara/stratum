@@ -341,7 +341,9 @@ impl PidVardiffState {
         // retained for the next call. Pure-silence windows qualify at the
         // (lower) evidence level matched to the down-side significance bar.
         let z_up = super::tuning::significance_z_override().unwrap_or(self.params.significance_z);
-        let z_down = self.params.significance_z_down.min(z_up);
+        let z_down = super::tuning::significance_z_down_override()
+            .unwrap_or(self.params.significance_z_down)
+            .min(z_up);
         let eval_expected = if shares == 0 {
             silence_eval_expected(z_down)
         } else {
