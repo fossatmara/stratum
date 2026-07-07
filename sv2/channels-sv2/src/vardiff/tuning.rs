@@ -30,6 +30,26 @@ pub fn set_confidence_k(k: f64) {
     CONFIDENCE_K.store(k.to_bits(), Ordering::Relaxed);
 }
 
+static SIGNIFICANCE_Z: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Live override for the significance threshold Z (sigmas). `None` means
+/// controllers use their configured [`super::pid::PidParams::significance_z`].
+pub fn significance_z_override() -> Option<f64> {
+    let bits = SIGNIFICANCE_Z.load(Ordering::Relaxed);
+    if bits == u64::MAX {
+        None
+    } else {
+        Some(f64::from_bits(bits))
+    }
+}
+
+/// Sets the live significance-Z override (clamped to `[0.5, 10.0]`).
+pub fn set_significance_z(z: f64) {
+    if z.is_finite() {
+        SIGNIFICANCE_Z.store(z.clamp(0.5, 10.0).to_bits(), Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -44,5 +64,16 @@ mod tests {
         set_confidence_k(1e9);
         assert_eq!(confidence_k(), 64.0);
         set_confidence_k(DEFAULT_CONFIDENCE_K);
+    }
+
+    #[test]
+    fn significance_override_defaults_to_none_and_clamps() {
+        assert_eq!(significance_z_override(), None);
+        set_significance_z(2.0);
+        assert_eq!(significance_z_override(), Some(2.0));
+        set_significance_z(100.0);
+        assert_eq!(significance_z_override(), Some(10.0));
+        // Restore process-global state for other tests.
+        SIGNIFICANCE_Z.store(u64::MAX, Ordering::Relaxed);
     }
 }

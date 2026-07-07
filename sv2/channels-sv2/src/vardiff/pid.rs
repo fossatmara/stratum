@@ -399,19 +399,21 @@ impl PidVardiffState {
         // N_eff shares. Windows that fail the test still feed the integral,
         // so a persistent sub-sigma bias accumulates and emits through the
         // integral-pressure path instead of being lost.
-        let significant_window = raw_error.abs() >= self.params.significance_z / n_eff.sqrt();
+        let significance_z = super::tuning::significance_z_override()
+            .unwrap_or(self.params.significance_z);
+        let significant_window = raw_error.abs() >= significance_z / n_eff.sqrt();
         // Integral pressure must be *statistically significant* accumulated
         // evidence, not a noise random-walk: require |I| to clear Z sigmas
         // of its own accumulated noise in addition to the deadband floor.
         let integral_sigma = self.integral_noise_var.sqrt().max(f64::EPSILON);
         let integral_pressure = (self.params.ki * self.integral).abs() >= self.params.deadband
-            && self.integral.abs() >= self.params.significance_z * integral_sigma;
+            && self.integral.abs() >= significance_z * integral_sigma;
         if !significant_window && !integral_pressure {
             debug!(
                 target: "vardiff",
                 "PID hold: |e|={:.4} < {:.4} (Z/sqrt(N)) and |ki*I|={:.4} < {:.4}",
                 raw_error.abs(),
-                self.params.significance_z / n_eff.sqrt(),
+                significance_z / n_eff.sqrt(),
                 (self.params.ki * self.integral).abs(),
                 self.params.deadband,
             );
