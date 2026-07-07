@@ -92,6 +92,11 @@ pub struct QTable {
 
 impl QTable {
     pub fn new() -> Self {
+        Self::with_seed(super::sim_clock::now_secs_f64().to_bits())
+    }
+
+    /// Deterministic construction for reproducible tests and experiments.
+    pub fn with_seed(seed: u64) -> Self {
         // A tiny optimistic seed on the neutral action makes untrained
         // states default to "keep the gains" instead of an arbitrary
         // tie-break drifting them; exploration still visits everything.
@@ -103,7 +108,7 @@ impl QTable {
             q,
             visits: vec![0; STATES * ACTIONS],
             total: 0,
-            rng: super::sim_clock::now_secs_f64().to_bits() | 1,
+            rng: seed | 1,
         }
     }
 
@@ -431,7 +436,7 @@ mod tests {
 
     #[test]
     fn gains_stay_bounded_under_learning() {
-        let table: SharedQTable = Arc::new(Mutex::new(QTable::new()));
+        let table: SharedQTable = Arc::new(Mutex::new(QTable::with_seed(7)));
         let mut state = QPidVardiffState::new(table).unwrap();
         let target = target_for(100.0e12, 6.0);
         for i in 0..200 {
@@ -463,7 +468,7 @@ mod tests {
         let true_hashrate: f64 = 2000.0e12;
         let mut nominal: f32 = 100.0e12;
         let spm: f32 = 6.0;
-        let table: SharedQTable = Arc::new(Mutex::new(QTable::new()));
+        let table: SharedQTable = Arc::new(Mutex::new(QTable::with_seed(42)));
         let mut state = QPidVardiffState::new(table).unwrap();
 
         for _ in 0..16 {
