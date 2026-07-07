@@ -87,6 +87,13 @@ pub const DEFAULT_DEADBAND: f64 = 0.1;
 /// SetTarget churn matters more than reaction latency (live-tunable via
 /// `super::tuning`).
 pub const DEFAULT_SIGNIFICANCE_Z: f64 = 2.0;
+/// Significance threshold for DOWNWARD difficulty corrections (miner slower
+/// than setpoint). Asymmetric by design: overshooting downward yields more
+/// shares — more information and fast self-correction — while staying too
+/// high starves the pool of evidence. A lower bar on the down side buys
+/// materially faster reaction to hashrate drops for a small rate of benign
+/// downward nudges.
+pub const DEFAULT_SIGNIFICANCE_Z_DOWN: f64 = 1.5;
 /// Back-calculation tracking time constant (seconds): how fast the integral
 /// unwinds toward the saturated output when the `max_step` clamp engages.
 pub const DEFAULT_TRACKING_SECS: f64 = 60.0;
@@ -107,12 +114,20 @@ const MIN_WINDOW_SECS: f64 = 0.1;
 /// scales with information rate: a big hashrate step supplies these shares
 /// almost instantly, while a converged miner accumulates them quietly.
 const MIN_EVAL_SHARES: f64 = 8.0;
-/// Expected-count qualification for judging a window that lacks
-/// MIN_EVAL_SHARES observed shares. Observing zero shares when 6 were
-/// expected has probability e^-6 ~ 0.25%, the same one-sided 3-sigma bar as
-/// the significance gate — so this is the honest floor for detecting
-/// hashrate drops, which accumulate evidence only through absence.
+/// Expected-count qualification for judging a share-bearing window that
+/// lacks MIN_EVAL_SHARES observed shares. Zero-share windows instead derive
+/// their qualification from the down-side significance bar (see
+/// `silence_eval_expected`): silence of expected count E has probability
+/// e^-E, so the sigma-equivalent evidence scales with E and a lower Z_down
+/// honestly permits judging shorter silences.
 const MIN_EVAL_EXPECTED: f64 = 6.0;
+
+/// Expected-count needed before judging a pure-silence window, matched to
+/// the down-side significance bar: approximates -ln(p) for the one-sided
+/// normal tail at `z_down` sigmas (1.5 -> ~2.7, 2 -> ~4, 3 -> ~7.7).
+fn silence_eval_expected(z_down: f64) -> f64 {
+    z_down * z_down * 0.75 + 1.0
+}
 /// Log-error clamp; bounds the reaction to pathological windows (e.g. zero
 /// shares after a huge hashrate drop).
 const MAX_ABS_ERROR: f64 = 3.0;
@@ -140,6 +155,10 @@ pub struct PidParams {
     /// deadband): a window emits on its own only when
     /// `|error| >= significance_z / sqrt(N_eff)`.
     pub significance_z: f64,
+    /// Significance threshold for downward difficulty corrections; lower
+    /// than `significance_z` by design (see [`DEFAULT_SIGNIFICANCE_Z_DOWN`]).
+    /// Effectively capped at `significance_z`.
+    pub significance_z_down: f64,
     /// Back-calculation anti-windup tracking time constant in seconds.
     pub tracking_secs: f64,
     /// Lowest hashrate estimate the controller will output.
@@ -155,6 +174,7 @@ impl Default for PidParams {
             max_step: DEFAULT_MAX_STEP,
             deadband: DEFAULT_DEADBAND,
             significance_z: DEFAULT_SIGNIFICANCE_Z,
+            significance_z_down: DEFAULT_SIGNIFICANCE_Z_DOWN,
             tracking_secs: DEFAULT_TRACKING_SECS,
             min_allowed_hashrate: DEFAULT_MIN_HASHRATE,
         }
@@ -318,8 +338,16 @@ impl PidVardiffState {
 
         // Keep accumulating until the window carries enough evidence to be
         // judged; the counter is NOT reset on this path, so the evidence is
-        // retained for the next call.
-        if (shares as f64) < MIN_EVAL_SHARES && setpoint * dt_eff / 60.0 < MIN_EVAL_EXPECTED {
+        // retained for the next call. Pure-silence windows qualify at the
+        // (lower) evidence level matched to the down-side significance bar.
+        let z_up = super::tuning::significance_z_override().unwrap_or(self.params.significance_z);
+        let z_down = self.params.significance_z_down.min(z_up);
+        let eval_expected = if shares == 0 {
+            silence_eval_expected(z_down)
+        } else {
+            MIN_EVAL_EXPECTED
+        };
+        if (shares as f64) < MIN_EVAL_SHARES && setpoint * dt_eff / 60.0 < eval_expected {
             return Ok((None, None));
         }
 
@@ -399,21 +427,22 @@ impl PidVardiffState {
         // N_eff shares. Windows that fail the test still feed the integral,
         // so a persistent sub-sigma bias accumulates and emits through the
         // integral-pressure path instead of being lost.
-        let significance_z = super::tuning::significance_z_override()
-            .unwrap_or(self.params.significance_z);
-        let significant_window = raw_error.abs() >= significance_z / n_eff.sqrt();
+        // Asymmetric significance: downward corrections (negative error —
+        // the miner is slower than setpoint) use the lower bar.
+        let z_for = |direction: f64| if direction < 0.0 { z_down } else { z_up };
+        let significant_window = raw_error.abs() >= z_for(raw_error) / n_eff.sqrt();
         // Integral pressure must be *statistically significant* accumulated
         // evidence, not a noise random-walk: require |I| to clear Z sigmas
         // of its own accumulated noise in addition to the deadband floor.
         let integral_sigma = self.integral_noise_var.sqrt().max(f64::EPSILON);
         let integral_pressure = (self.params.ki * self.integral).abs() >= self.params.deadband
-            && self.integral.abs() >= significance_z * integral_sigma;
+            && self.integral.abs() >= z_for(self.integral) * integral_sigma;
         if !significant_window && !integral_pressure {
             debug!(
                 target: "vardiff",
                 "PID hold: |e|={:.4} < {:.4} (Z/sqrt(N)) and |ki*I|={:.4} < {:.4}",
                 raw_error.abs(),
-                significance_z / n_eff.sqrt(),
+                z_for(raw_error) / n_eff.sqrt(),
                 (self.params.ki * self.integral).abs(),
                 self.params.deadband,
             );
@@ -677,10 +706,12 @@ mod tests {
         let spm: f32 = 6.0;
         let true_hashrate: f64 = 100.0e12;
         let mut nominal: f32 = 100.0e12;
-        // Pin Z: this test guards the confidence weighting and integral
-        // noise gate, independent of the shipped significance default.
+        // Pin both bars symmetric at 3: this test guards the confidence
+        // weighting and integral noise gate, independent of the shipped
+        // significance defaults (including the asymmetric down-bar).
         let mut state = PidVardiffState::with_params(PidParams {
             significance_z: 3.0,
+            significance_z_down: 3.0,
             ..PidParams::default()
         })
         .unwrap();
@@ -755,6 +786,41 @@ mod tests {
         assert!(
             (0.5..2.0).contains(&down_ratio),
             "ramp-down not tracked: nominal {nominal:.3e} vs true {true_hashrate:.3e}"
+        );
+    }
+
+    #[test]
+    fn downward_bar_is_lower_than_upward() {
+        // A moderate slowdown clears the down-bar; the mirror-image window
+        // with the same |error| against a symmetric Z (z_down == z_up) holds.
+        // 7 shares in 120s at setpoint 6: e = ln(3.5/6) = -0.539,
+        // n_eff = max(7, 12) = 12 -> down-bar 1.5/sqrt(12) = 0.43 (emit),
+        // up-bar 2/sqrt(12) = 0.58 (hold).
+        let spm: f32 = 6.0;
+        let target = target_for(100.0e12, spm);
+
+        let mut asym = PidVardiffState::new().unwrap();
+        for _ in 0..7 {
+            asym.increment_shares_since_last_update();
+        }
+        backdate(&mut asym, 120);
+        assert!(
+            asym.try_vardiff(100.0e12, &target, spm).unwrap().is_some(),
+            "slowdown should clear the down-bar"
+        );
+
+        let mut sym = PidVardiffState::with_params(PidParams {
+            significance_z_down: DEFAULT_SIGNIFICANCE_Z,
+            ..PidParams::default()
+        })
+        .unwrap();
+        for _ in 0..7 {
+            sym.increment_shares_since_last_update();
+        }
+        backdate(&mut sym, 120);
+        assert!(
+            sym.try_vardiff(100.0e12, &target, spm).unwrap().is_none(),
+            "same window must hold under a symmetric bar"
         );
     }
 
