@@ -81,8 +81,12 @@ pub const DEFAULT_MAX_STEP: f64 = 8.0;
 pub const DEFAULT_DEADBAND: f64 = 0.1;
 /// Significance threshold in standard deviations: a single window only
 /// triggers an update when its raw log-error exceeds `Z / sqrt(N_eff)`, the
-/// approximate sigma of a Poisson window's log-rate estimate.
-pub const DEFAULT_SIGNIFICANCE_Z: f64 = 2.0;
+/// approximate sigma of a Poisson window's log-rate estimate. Sized for
+/// share-driven evaluation (many judged windows per minute): 2.5 sigma keeps
+/// the per-window false-positive rate low enough that a converged miner is
+/// rarely disturbed, while a genuine hashrate step (|e| >= ln 2) clears the
+/// gate on the first evidence-complete window.
+pub const DEFAULT_SIGNIFICANCE_Z: f64 = 2.5;
 /// Back-calculation tracking time constant (seconds): how fast the integral
 /// unwinds toward the saturated output when the `max_step` clamp engages.
 pub const DEFAULT_TRACKING_SECS: f64 = 60.0;
@@ -94,6 +98,15 @@ const DEFAULT_MIN_HASHRATE: f32 = 1.0;
 /// genuine burst of shares are real evidence worth acting on. This floor
 /// only guards the rate division against near-zero windows.
 const MIN_WINDOW_SECS: f64 = 0.1;
+/// Minimum evidence to judge a window: at least this many observed shares,
+/// or a span in which the setpoint expected this many. Share-driven callers
+/// may evaluate on every share; single inter-arrival times are exponentially
+/// distributed and far too noisy to judge alone (a lone share looks
+/// "2-sigma fast" ~13% of the time by chance), so the window keeps
+/// accumulating until it carries real evidence. Reaction latency then scales
+/// with information rate: a big hashrate step supplies these shares almost
+/// instantly, while a converged miner accumulates them quietly.
+const MIN_EVAL_SHARES: f64 = 8.0;
 /// Log-error clamp; bounds the reaction to pathological windows (e.g. zero
 /// shares after a huge hashrate drop).
 const MAX_ABS_ERROR: f64 = 3.0;
@@ -273,6 +286,16 @@ impl PidVardiffState {
             return Ok((None, None));
         }
         let shares = self.shares_since_last_update;
+        let setpoint = shares_per_minute as f64;
+        if setpoint <= 0.0 {
+            return Ok((None, None));
+        }
+        // Keep accumulating until the window carries enough evidence to be
+        // judged (see MIN_EVAL_SHARES); the counter is NOT reset on this
+        // path, so the evidence is retained for the next call.
+        if (shares as f64) < MIN_EVAL_SHARES && setpoint * dt / 60.0 < MIN_EVAL_SHARES {
+            return Ok((None, None));
+        }
 
         // Fresh window every evaluation: controller memory lives in the
         // integral term, not in an ever-growing measurement window.
@@ -281,10 +304,6 @@ impl PidVardiffState {
         // With zero shares "0.5 shares" bounds the log-error instead of
         // sending it to -infinity; the clamp below caps pathological windows.
         let realized_spm = (shares as f64).max(0.5) * 60.0 / dt;
-        let setpoint = shares_per_minute as f64;
-        if setpoint <= 0.0 {
-            return Ok((None, None));
-        }
         // Positive error => shares arriving too fast => difficulty too low.
         // Shrunk by the window's statistical confidence: the log-rate of a
         // Poisson window with N shares has variance ~1/N, so few-share
@@ -483,7 +502,8 @@ mod tests {
     fn lowers_hashrate_on_zero_shares() {
         let mut state = PidVardiffState::new().unwrap();
         let target = target_for(100.0e12, 6.0);
-        backdate(&mut state, 60);
+        // Long enough that the setpoint expected >= MIN_EVAL_SHARES shares.
+        backdate(&mut state, 120);
         let new = state
             .try_vardiff(100.0e12, &target, 6.0)
             .unwrap()
@@ -572,12 +592,28 @@ mod tests {
     fn window_resets_every_evaluation() {
         let mut state = PidVardiffState::new().unwrap();
         let target = target_for(100.0e12, 6.0);
-        for _ in 0..6 {
+        for _ in 0..8 {
             state.increment_shares_since_last_update();
         }
-        backdate(&mut state, 60);
+        backdate(&mut state, 80);
         let _ = state.try_vardiff(100.0e12, &target, 6.0).unwrap();
         assert_eq!(state.shares_since_last_update(), 0);
+    }
+
+    #[test]
+    fn thin_windows_accumulate_instead_of_resetting() {
+        // Below the evidence threshold the window must hold AND keep its
+        // shares, so share-driven callers can evaluate on every share
+        // without judging meaningless single-interval windows.
+        let mut state = PidVardiffState::new().unwrap();
+        let target = target_for(100.0e12, 6.0);
+        for _ in 0..3 {
+            state.increment_shares_since_last_update();
+        }
+        backdate(&mut state, 20);
+        let res = state.try_vardiff(100.0e12, &target, 6.0).unwrap();
+        assert!(res.is_none());
+        assert_eq!(state.shares_since_last_update(), 3, "evidence must be retained");
     }
 
     #[test]
