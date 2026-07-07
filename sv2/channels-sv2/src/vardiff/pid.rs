@@ -80,13 +80,13 @@ pub const DEFAULT_MAX_STEP: f64 = 8.0;
 pub const DEFAULT_DEADBAND: f64 = 0.1;
 /// Significance threshold in standard deviations: a single window only
 /// triggers an update when its raw log-error exceeds `Z / sqrt(N_eff)`, the
-/// approximate sigma of a Poisson window's log-rate estimate. Sized for
-/// share-driven evaluation (many judged windows per minute): 3 sigma keeps
-/// the per-window false-positive rate negligible so converged miners are
-/// left alone; large hashrate steps still clear the gate on the first
-/// evidence-complete window, and smaller drifts correct through the
-/// integral-pressure path.
-pub const DEFAULT_SIGNIFICANCE_Z: f64 = 3.0;
+/// approximate sigma of a Poisson window's log-rate estimate. 2 sigma
+/// favors responsiveness: moderate hashrate changes clear the gate a window
+/// or two sooner, at the cost of an occasional (~5% per judged window)
+/// noise-triggered adjustment on converged miners. Raise toward 3 when
+/// SetTarget churn matters more than reaction latency (live-tunable via
+/// `super::tuning`).
+pub const DEFAULT_SIGNIFICANCE_Z: f64 = 2.0;
 /// Back-calculation tracking time constant (seconds): how fast the integral
 /// unwinds toward the saturated output when the `max_step` clamp engages.
 pub const DEFAULT_TRACKING_SECS: f64 = 60.0;
@@ -677,7 +677,13 @@ mod tests {
         let spm: f32 = 6.0;
         let true_hashrate: f64 = 100.0e12;
         let mut nominal: f32 = 100.0e12;
-        let mut state = PidVardiffState::new().unwrap();
+        // Pin Z: this test guards the confidence weighting and integral
+        // noise gate, independent of the shipped significance default.
+        let mut state = PidVardiffState::with_params(PidParams {
+            significance_z: 3.0,
+            ..PidParams::default()
+        })
+        .unwrap();
         let mut rng = TestRng(0x5eed_cafe);
         let mut emissions = 0;
         for _ in 0..60 {
