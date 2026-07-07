@@ -4,6 +4,8 @@ use std::fmt::Debug;
 
 pub mod classic;
 pub mod error;
+pub mod pid;
+pub mod sim_clock;
 #[cfg(test)]
 pub mod test;
 

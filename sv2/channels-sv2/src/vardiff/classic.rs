@@ -34,9 +34,7 @@ impl VardiffState {
     /// # Arguments
     /// * `min_allowed_hashrate` - The minimum hashrate to enforce.
     pub fn new_with_min(min_allowed_hashrate: f32) -> Result<Self, VardiffError> {
-        let timestamp_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs();
+        let timestamp_secs = super::sim_clock::now_secs();
 
         Ok(VardiffState {
             shares_since_last_update: 0,
@@ -76,9 +74,7 @@ impl Vardiff for VardiffState {
 
     /// Resets the share counter and updates the timestamp to now.
     fn reset_counter(&mut self) -> Result<(), VardiffError> {
-        let timestamp_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs();
+        let timestamp_secs = super::sim_clock::now_secs();
         self.set_timestamp_of_last_update(timestamp_secs);
         self.set_shares_since_last_update(0);
         Ok(())
@@ -99,10 +95,7 @@ impl Vardiff for VardiffState {
         target: &Target,
         shares_per_minute: f32,
     ) -> Result<Option<f32>, VardiffError> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(VardiffError::TimeError)?
-            .as_secs();
+        let now = super::sim_clock::now_secs();
 
         let delta_time = now - self.timestamp_of_last_update;
 

@@ -34,4 +34,8 @@ pub mod target;
 pub mod vardiff;
 
 #[cfg(not(feature = "no_std"))]
-pub use vardiff::{classic::VardiffState, Vardiff};
+pub use vardiff::{
+    classic::VardiffState,
+    pid::{PidParams, PidVardiffState},
+    Vardiff,
+};
