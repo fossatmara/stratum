@@ -401,6 +401,12 @@ impl<'a> StandardChannel<'a> {
         self.expected_share_per_minute
     }
 
+    /// Updates the vardiff setpoint. Subsequent hashrate-to-target
+    /// conversions (e.g. `update_channel`) use the new value.
+    pub fn set_shares_per_minute(&mut self, shares_per_minute: f32) {
+        self.expected_share_per_minute = shares_per_minute;
+    }
+
     /// Returns the current chain tip, if set.
     pub fn get_chain_tip(&self) -> Option<&ChainTip> {
         self.chain_tip.as_ref()

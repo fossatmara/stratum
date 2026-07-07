@@ -275,6 +275,12 @@ impl<'a> ExtendedChannel<'a> {
         self.expected_share_per_minute
     }
 
+    /// Updates the vardiff setpoint. Subsequent hashrate-to-target
+    /// conversions (e.g. `update_channel`) use the new value.
+    pub fn set_shares_per_minute(&mut self, shares_per_minute: f32) {
+        self.expected_share_per_minute = shares_per_minute;
+    }
+
     /// Only for testing purposes, not meant to be used in real apps.
     #[cfg(test)]
     fn set_chain_tip(&mut self, chain_tip: ChainTip) {

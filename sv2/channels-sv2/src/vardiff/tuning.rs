@@ -71,6 +71,28 @@ pub fn set_significance_z_down(z: f64) {
     }
 }
 
+static SHARES_PER_MINUTE: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Live override for the vardiff setpoint (shares per minute). `None` means
+/// the pool uses its configured value. The setpoint is the control system's
+/// sample rate: raising it buys reaction latency linearly at the cost of
+/// share bandwidth.
+pub fn shares_per_minute_override() -> Option<f64> {
+    let bits = SHARES_PER_MINUTE.load(Ordering::Relaxed);
+    if bits == u64::MAX {
+        None
+    } else {
+        Some(f64::from_bits(bits))
+    }
+}
+
+/// Sets the live setpoint override (clamped to `[0.5, 600.0]` spm).
+pub fn set_shares_per_minute(spm: f64) {
+    if spm.is_finite() {
+        SHARES_PER_MINUTE.store(spm.clamp(0.5, 600.0).to_bits(), Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
