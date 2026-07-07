@@ -1,0 +1,48 @@
+//! Live-tunable vardiff parameters, for interactive controller tuning.
+//!
+//! Process-global like [`super::sim_clock`]: a simulator embedding the pool
+//! in its own process can turn these knobs at runtime and watch the
+//! controller respond. Production pools simply never touch them and get the
+//! defaults.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Default confidence shrinkage constant `K` in `w = N_eff / (N_eff + K)`.
+/// Larger values discount thin measurement windows more aggressively.
+pub const DEFAULT_CONFIDENCE_K: f64 = 2.0;
+
+static CONFIDENCE_K: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Current confidence shrinkage constant.
+pub fn confidence_k() -> f64 {
+    let bits = CONFIDENCE_K.load(Ordering::Relaxed);
+    if bits == u64::MAX {
+        DEFAULT_CONFIDENCE_K
+    } else {
+        f64::from_bits(bits)
+    }
+}
+
+/// Sets the confidence shrinkage constant (clamped to `[0.0, 64.0]`;
+/// 0 disables confidence weighting entirely).
+pub fn set_confidence_k(k: f64) {
+    let k = if k.is_finite() { k.clamp(0.0, 64.0) } else { DEFAULT_CONFIDENCE_K };
+    CONFIDENCE_K.store(k.to_bits(), Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_then_sets_then_clamps() {
+        assert_eq!(confidence_k(), DEFAULT_CONFIDENCE_K);
+        set_confidence_k(5.0);
+        assert_eq!(confidence_k(), 5.0);
+        set_confidence_k(-3.0);
+        assert_eq!(confidence_k(), 0.0);
+        set_confidence_k(1e9);
+        assert_eq!(confidence_k(), 64.0);
+        set_confidence_k(DEFAULT_CONFIDENCE_K);
+    }
+}

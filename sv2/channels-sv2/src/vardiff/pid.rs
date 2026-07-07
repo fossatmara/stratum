@@ -99,20 +99,24 @@ const DEFAULT_MIN_HASHRATE: f32 = 1.0;
 /// only guards the rate division against near-zero windows.
 const MIN_WINDOW_SECS: f64 = 0.1;
 /// Minimum evidence to judge a window: at least this many observed shares,
-/// or a span in which the setpoint expected this many. Share-driven callers
-/// may evaluate on every share; single inter-arrival times are exponentially
-/// distributed and far too noisy to judge alone (a lone share looks
-/// "2-sigma fast" ~13% of the time by chance), so the window keeps
-/// accumulating until it carries real evidence. Reaction latency then scales
-/// with information rate: a big hashrate step supplies these shares almost
-/// instantly, while a converged miner accumulates them quietly.
+/// or a span in which the setpoint expected [`MIN_EVAL_EXPECTED`]. Share-
+/// driven callers may evaluate on every share; single inter-arrival times
+/// are exponentially distributed and far too noisy to judge alone (a lone
+/// share looks "2-sigma fast" ~13% of the time by chance), so the window
+/// keeps accumulating until it carries real evidence. Reaction latency then
+/// scales with information rate: a big hashrate step supplies these shares
+/// almost instantly, while a converged miner accumulates them quietly.
 const MIN_EVAL_SHARES: f64 = 8.0;
+/// Expected-count qualification for judging a window that lacks
+/// MIN_EVAL_SHARES observed shares. Observing zero shares when 6 were
+/// expected has probability e^-6 ~ 0.25%, the same one-sided 3-sigma bar as
+/// the significance gate — so this is the honest floor for detecting
+/// hashrate drops, which accumulate evidence only through absence.
+const MIN_EVAL_EXPECTED: f64 = 6.0;
 /// Log-error clamp; bounds the reaction to pathological windows (e.g. zero
 /// shares after a huge hashrate drop).
 const MAX_ABS_ERROR: f64 = 3.0;
-/// Shrinkage constant for the confidence weight `N_eff / (N_eff + K)`.
-/// Larger values discount small windows more aggressively.
-const CONFIDENCE_K: f64 = 2.0;
+// Confidence shrinkage constant: live-tunable, see `super::tuning`.
 /// Absolute floor below which an update is never worth a SetTarget.
 const MIN_EMIT_OUTPUT: f64 = 0.02;
 /// EWMA factor for the derivative filter (higher = smoother, slower).
@@ -173,6 +177,11 @@ pub struct PidVardiffState {
     /// integral-pressure emission gate tests |I| against Z * sqrt(this), so
     /// noise random-walks don't masquerade as accumulated evidence.
     integral_noise_var: f64,
+    /// Virtual timestamp of the most recent share (or channel creation).
+    /// Zero-share windows are judged over the silence since this point, so
+    /// sustained starvation is cumulative evidence and successive corrections
+    /// deepen instead of repeating from scratch.
+    last_share_time: f64,
     /// Previous log-measurement, for the derivative term.
     prev_log_measurement: Option<f64>,
     /// EWMA-filtered derivative of the log-measurement.
@@ -192,6 +201,7 @@ impl PidVardiffState {
             timestamp_of_last_update: timestamp_secs,
             integral: 0.0,
             integral_noise_var: 0.0,
+            last_share_time: timestamp_secs,
             prev_log_measurement: None,
             filtered_derivative: 0.0,
         })
@@ -240,6 +250,7 @@ impl Vardiff for PidVardiffState {
 
     fn increment_shares_since_last_update(&mut self) {
         self.shares_since_last_update += 1;
+        self.last_share_time = super::sim_clock::now_secs_f64();
     }
 
     fn reset_counter(&mut self) -> Result<(), VardiffError> {
@@ -295,10 +306,20 @@ impl PidVardiffState {
         if setpoint <= 0.0 {
             return Ok((None, None));
         }
+        // Zero-share windows are measured over the FULL silence since the
+        // last share: absence is cumulative evidence, and re-anchoring it to
+        // each post-emission window would make every correction round repeat
+        // the same timid first step (drops would take many minutes to track).
+        let dt_eff = if shares == 0 {
+            (now - self.last_share_time).max(dt)
+        } else {
+            dt
+        };
+
         // Keep accumulating until the window carries enough evidence to be
-        // judged (see MIN_EVAL_SHARES); the counter is NOT reset on this
-        // path, so the evidence is retained for the next call.
-        if (shares as f64) < MIN_EVAL_SHARES && setpoint * dt / 60.0 < MIN_EVAL_SHARES {
+        // judged; the counter is NOT reset on this path, so the evidence is
+        // retained for the next call.
+        if (shares as f64) < MIN_EVAL_SHARES && setpoint * dt_eff / 60.0 < MIN_EVAL_EXPECTED {
             return Ok((None, None));
         }
 
@@ -308,16 +329,16 @@ impl PidVardiffState {
 
         // With zero shares "0.5 shares" bounds the log-error instead of
         // sending it to -infinity; the clamp below caps pathological windows.
-        let realized_spm = (shares as f64).max(0.5) * 60.0 / dt;
+        let realized_spm = (shares as f64).max(0.5) * 60.0 / dt_eff;
         // Positive error => shares arriving too fast => difficulty too low.
         // Shrunk by the window's statistical confidence: the log-rate of a
         // Poisson window with N shares has variance ~1/N, so few-share
         // windows get proportionally less gain instead of being chased as if
         // they were exact. Zero-share windows are judged against how many
         // shares the setpoint *expected*, which is real evidence, not noise.
-        let expected_at_setpoint = setpoint * dt / 60.0;
+        let expected_at_setpoint = setpoint * dt_eff / 60.0;
         let n_eff = (shares as f64).max(expected_at_setpoint);
-        let confidence = n_eff / (n_eff + CONFIDENCE_K);
+        let confidence = n_eff / (n_eff + super::tuning::confidence_k());
         let raw_error = (realized_spm / setpoint)
             .ln()
             .clamp(-MAX_ABS_ERROR, MAX_ABS_ERROR);
@@ -726,6 +747,62 @@ mod tests {
         assert!(
             (0.5..2.0).contains(&down_ratio),
             "ramp-down not tracked: nominal {nominal:.3e} vs true {true_hashrate:.3e}"
+        );
+    }
+
+    #[test]
+    fn large_drop_tracks_within_minutes() {
+        // A converged miner loses 100x of its hashrate. Silence is
+        // cumulative evidence: each starved window measures the full quiet
+        // span, so corrections deepen exponentially instead of repeating the
+        // same first step. Must be within 3x of truth after 6 windows (~6
+        // minutes at 60s windows) — the old per-window anchoring took far
+        // longer.
+        let spm: f32 = 6.0;
+        let mut true_hashrate: f64 = 100.0e12;
+        let mut nominal: f32 = 100.0e12;
+        let mut state = PidVardiffState::new().unwrap();
+        // Converged phase.
+        for _ in 0..3 {
+            for _ in 0..shares_at(true_hashrate, nominal, spm) {
+                state.increment_shares_since_last_update();
+            }
+            backdate(&mut state, 60);
+            if let Some(new) = state
+                .try_vardiff(nominal, &target_for(nominal, spm), spm)
+                .unwrap()
+            {
+                nominal = new;
+            }
+        }
+        // The drop.
+        true_hashrate /= 100.0;
+        for _ in 0..6 {
+            let shares = shares_at(true_hashrate, nominal, spm);
+            for _ in 0..shares {
+                state.increment_shares_since_last_update();
+            }
+            backdate(&mut state, 60);
+            if shares == 0 {
+                // Tests simulate time by backdating; extend the silence
+                // anchor the same way the wall clock would.
+                state.last_share_time -= 60.0;
+            }
+            if let Some(new) = state
+                .try_vardiff(nominal, &target_for(nominal, spm), spm)
+                .unwrap()
+            {
+                nominal = new;
+            }
+        }
+        let ratio = nominal as f64 / true_hashrate;
+        assert!(
+            ratio < 3.0,
+            "drop not tracked: nominal {nominal:.3e} vs true {true_hashrate:.3e} (ratio {ratio:.1})"
+        );
+        assert!(
+            ratio > 0.2,
+            "overshot below truth: ratio {ratio:.3}"
         );
     }
 
