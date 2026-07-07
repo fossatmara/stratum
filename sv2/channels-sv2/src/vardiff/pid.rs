@@ -183,6 +183,14 @@ impl PidVardiffState {
         &self.params
     }
 
+    /// Replaces the P/I/D gains (used by adaptive controllers layered on
+    /// top, e.g. Q-learning gain scheduling).
+    pub fn set_gains(&mut self, kp: f64, ki: f64, kd: f64) {
+        self.params.kp = kp;
+        self.params.ki = ki;
+        self.params.kd = kd;
+    }
+
     /// Integral clamp so that the I-term alone can never exceed the per-step
     /// output limit; combined with conditional integration this provides
     /// anti-windup.
@@ -228,10 +236,41 @@ impl Vardiff for PidVardiffState {
         target: &Target,
         shares_per_minute: f32,
     ) -> Result<Option<f32>, VardiffError> {
+        self.try_vardiff_observed(hashrate, target, shares_per_minute)
+            .map(|(update, _)| update)
+    }
+}
+
+/// What one evaluated measurement window looked like; consumed by adaptive
+/// gain schedulers.
+#[derive(Debug, Clone, Copy)]
+pub struct WindowObservation {
+    /// Confidence-unweighted log-space error.
+    pub raw_error: f64,
+    /// Effective sample count backing the window.
+    pub n_eff: f64,
+    /// EWMA-filtered log-measurement slope.
+    pub derivative: f64,
+    /// Window length in (virtual) seconds.
+    pub dt: f64,
+    /// Whether this evaluation emitted a difficulty update.
+    pub emitted: bool,
+}
+
+impl PidVardiffState {
+    /// Same as [`Vardiff::try_vardiff`], but also returns the window
+    /// observation when a window was actually measured (`None` while the
+    /// window is still too short).
+    pub fn try_vardiff_observed(
+        &mut self,
+        hashrate: f32,
+        target: &Target,
+        shares_per_minute: f32,
+    ) -> Result<(Option<f32>, Option<WindowObservation>), VardiffError> {
         let now = super::sim_clock::now_secs_f64();
         let dt = now - self.timestamp_of_last_update;
         if dt < MIN_WINDOW_SECS {
-            return Ok(None);
+            return Ok((None, None));
         }
         let shares = self.shares_since_last_update;
 
@@ -244,7 +283,7 @@ impl Vardiff for PidVardiffState {
         let realized_spm = (shares as f64).max(0.5) * 60.0 / dt;
         let setpoint = shares_per_minute as f64;
         if setpoint <= 0.0 {
-            return Ok(None);
+            return Ok((None, None));
         }
         // Positive error => shares arriving too fast => difficulty too low.
         // Shrunk by the window's statistical confidence: the log-rate of a
@@ -270,6 +309,14 @@ impl Vardiff for PidVardiffState {
         self.prev_log_measurement = Some(log_measurement);
         self.filtered_derivative = DERIVATIVE_FILTER * self.filtered_derivative
             + (1.0 - DERIVATIVE_FILTER) * raw_derivative;
+
+        let mut observation = WindowObservation {
+            raw_error,
+            n_eff,
+            derivative: self.filtered_derivative,
+            dt,
+            emitted: false,
+        };
 
         let max_step_ln = self.params.max_step.ln();
         let unsaturated = self.params.kp * error
@@ -314,11 +361,11 @@ impl Vardiff for PidVardiffState {
                 (self.params.ki * self.integral).abs(),
                 self.params.deadband,
             );
-            return Ok(None);
+            return Ok((None, Some(observation)));
         }
         // Never worth a SetTarget regardless of significance.
         if output.abs() < MIN_EMIT_OUTPUT {
-            return Ok(None);
+            return Ok((None, Some(observation)));
         }
 
         // Estimate the miner's true hashrate from what the current target
@@ -355,7 +402,7 @@ impl Vardiff for PidVardiffState {
             new_hashrate = self.params.min_allowed_hashrate;
         }
         if !new_hashrate.is_finite() || new_hashrate <= 0.0 {
-            return Ok(None);
+            return Ok((None, Some(observation)));
         }
 
         // The difficulty plant is itself an integrator: the emitted move is
@@ -364,7 +411,8 @@ impl Vardiff for PidVardiffState {
         // I-term after emission double-counts and rings.
         self.integral = 0.0;
 
-        Ok(Some(new_hashrate))
+        observation.emitted = true;
+        Ok((Some(new_hashrate), Some(observation)))
     }
 }
 

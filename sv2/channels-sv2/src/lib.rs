@@ -37,5 +37,6 @@ pub mod vardiff;
 pub use vardiff::{
     classic::VardiffState,
     pid::{PidParams, PidVardiffState},
+    qpid::{QPidParams, QPidVardiffState, QTable, SharedQTable},
     Vardiff,
 };
