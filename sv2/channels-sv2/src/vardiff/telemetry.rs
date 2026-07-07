@@ -10,13 +10,16 @@ use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicU64, Ordering},
-        LazyLock, Mutex,
+        Mutex, OnceLock,
     },
 };
 
-static GAINS: LazyLock<Mutex<HashMap<String, (u64, f64, f64, f64)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static GAINS: OnceLock<Mutex<HashMap<String, (u64, f64, f64, f64)>>> = OnceLock::new();
 static IDS: AtomicU64 = AtomicU64::new(1);
+
+fn gains_map() -> &'static Mutex<HashMap<String, (u64, f64, f64, f64)>> {
+    GAINS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// Unique id per controller instance, so a replaced controller (miner
 /// reconnect creates a new channel before the old one drops) cannot clear
@@ -27,7 +30,7 @@ pub fn next_instance_id() -> u64 {
 
 /// Publishes the current gains for a user identity.
 pub fn publish_gains(key: &str, instance: u64, kp: f64, ki: f64, kd: f64) {
-    GAINS
+    gains_map()
         .lock()
         .expect("gain telemetry lock")
         .insert(key.to_string(), (instance, kp, ki, kd));
@@ -35,7 +38,7 @@ pub fn publish_gains(key: &str, instance: u64, kp: f64, ki: f64, kd: f64) {
 
 /// Current gains for a user identity, if a controller has published them.
 pub fn gains(key: &str) -> Option<(f64, f64, f64)> {
-    GAINS
+    gains_map()
         .lock()
         .expect("gain telemetry lock")
         .get(key)
@@ -44,7 +47,7 @@ pub fn gains(key: &str) -> Option<(f64, f64, f64)> {
 
 /// Clears an identity\'s entry, but only if it still belongs to `instance`.
 pub fn clear_gains(key: &str, instance: u64) {
-    let mut gains = GAINS.lock().expect("gain telemetry lock");
+    let mut gains = gains_map().lock().expect("gain telemetry lock");
     if gains.get(key).map(|&(i, ..)| i) == Some(instance) {
         gains.remove(key);
     }

@@ -80,13 +80,12 @@ pub const DEFAULT_MAX_STEP: f64 = 8.0;
 pub const DEFAULT_DEADBAND: f64 = 0.1;
 /// Significance threshold in standard deviations: a single window only
 /// triggers an update when its raw log-error exceeds `Z / sqrt(N_eff)`, the
-/// approximate sigma of a Poisson window's log-rate estimate. 2 sigma
-/// favors responsiveness: moderate hashrate changes clear the gate a window
-/// or two sooner, at the cost of an occasional (~5% per judged window)
-/// noise-triggered adjustment on converged miners. Raise toward 3 when
-/// SetTarget churn matters more than reaction latency (live-tunable via
-/// `super::tuning`).
-pub const DEFAULT_SIGNIFICANCE_Z: f64 = 2.0;
+/// approximate sigma of a Poisson window's log-rate estimate. 3 sigma on the
+/// up side keeps noise-triggered adjustments on converged miners negligible;
+/// reaction latency for drops is governed by the (lower) down-side bar, so
+/// the asymmetric pair gets fast drop response without upward churn.
+/// Live-tunable via `super::tuning`.
+pub const DEFAULT_SIGNIFICANCE_Z: f64 = 3.0;
 /// Significance threshold for DOWNWARD difficulty corrections (miner slower
 /// than setpoint). Asymmetric by design: overshooting downward yields more
 /// shares — more information and fast self-correction — while staying too
