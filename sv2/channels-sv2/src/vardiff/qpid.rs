@@ -54,8 +54,14 @@ use super::{
 pub const DEFAULT_ALPHA: f64 = 0.15;
 /// Discount factor. Short horizon: the plant reacts within a window or two.
 pub const DEFAULT_GAMMA: f64 = 0.7;
-/// Exploration rate.
+/// Initial exploration rate; decays with table experience.
 pub const DEFAULT_EPSILON: f64 = 0.1;
+/// Experience half-life of the exploration rate: after this many recorded
+/// decisions the effective epsilon is half the configured value.
+const EPSILON_HALF_LIFE: f64 = 2000.0;
+/// Exploration never drops below this (the environment is non-stationary:
+/// miners come, go, and change behavior).
+const EPSILON_FLOOR: f64 = 0.02;
 /// Churn penalty per emitted update in the reward.
 const CHURN_PENALTY: f64 = 0.05;
 /// Multiplicative gain nudge per action step.
@@ -79,6 +85,7 @@ const KEEP_ACTION: usize = 13;
 pub struct QTable {
     q: Vec<f64>,
     visits: Vec<u32>,
+    total: u64,
     /// xorshift64 state for epsilon-greedy exploration.
     rng: u64,
 }
@@ -95,6 +102,7 @@ impl QTable {
         Self {
             q,
             visits: vec![0; STATES * ACTIONS],
+            total: 0,
             rng: super::sim_clock::now_secs_f64().to_bits() | 1,
         }
     }
@@ -135,11 +143,18 @@ impl QTable {
         let idx = state * ACTIONS + action;
         self.q[idx] += alpha * (reward + gamma * best_next - self.q[idx]);
         self.visits[idx] = self.visits[idx].saturating_add(1);
+        self.total += 1;
     }
 
     /// Total table visits (how much experience the policy has absorbed).
     pub fn total_visits(&self) -> u64 {
-        self.visits.iter().map(|&v| v as u64).sum()
+        self.total
+    }
+
+    /// Exploration rate after experience decay: `e0 * H / (H + total)`,
+    /// floored so a trained policy still tracks a changing fleet.
+    pub fn effective_epsilon(&self, initial: f64) -> f64 {
+        (initial * EPSILON_HALF_LIFE / (EPSILON_HALF_LIFE + self.total as f64)).max(EPSILON_FLOOR)
     }
 
     /// Greedy (kp, ki, kd) multipliers for a state, for introspection.
@@ -282,7 +297,8 @@ impl QPidVardiffState {
             );
         }
 
-        let action = table.choose(state, self.params.epsilon);
+        let epsilon = table.effective_epsilon(self.params.epsilon);
+        let action = table.choose(state, epsilon);
         drop(table);
 
         let (kp_mul, ki_mul, kd_mul) = action_multipliers(action);
@@ -294,7 +310,7 @@ impl QPidVardiffState {
 
         debug!(
             target: "vardiff",
-            "QPID: state={state} action={action} kp={:.4} ki={:.5} kd={:.4} |e|={:.4} emitted={}",
+            "QPID: state={state} action={action} kp={:.4} ki={:.5} kd={:.4} eps={epsilon:.4} |e|={:.4} emitted={}",
             self.kp, self.ki, self.kd, obs.raw_error.abs(), obs.emitted,
         );
     }
@@ -396,6 +412,21 @@ mod tests {
         for _ in 0..20 {
             assert_eq!(table.choose(3, 0.0), 7);
         }
+    }
+
+    #[test]
+    fn epsilon_decays_with_experience_and_floors() {
+        let mut table = QTable::new();
+        assert!((table.effective_epsilon(0.1) - 0.1).abs() < 1e-9);
+        for _ in 0..2000 {
+            table.update(0, 0, 0.0, 0, 0.1, 0.5);
+        }
+        let half = table.effective_epsilon(0.1);
+        assert!((half - 0.05).abs() < 1e-3, "expected ~half, got {half}");
+        for _ in 0..100_000 {
+            table.update(0, 0, 0.0, 0, 0.1, 0.5);
+        }
+        assert!((table.effective_epsilon(0.1) - EPSILON_FLOOR).abs() < 1e-9);
     }
 
     #[test]
