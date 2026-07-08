@@ -266,8 +266,12 @@ impl QPidVardiffState {
         let kp = pid_params.kp;
         let ki = pid_params.ki;
         let kd = pid_params.kd;
+        let mut pid = PidVardiffState::with_params(pid_params)?;
+        // The learner owns the gains; manual live overrides must not fight
+        // its per-decision scheduling.
+        pid.set_adaptive_gains();
         Ok(Self {
-            pid: PidVardiffState::with_params(pid_params)?,
+            pid,
             table,
             params,
             kp,
@@ -329,6 +333,10 @@ impl QPidVardiffState {
 }
 
 impl Vardiff for QPidVardiffState {
+    fn kind(&self) -> super::VardiffKind {
+        super::VardiffKind::QPid
+    }
+
     fn last_update_timestamp(&self) -> u64 {
         self.pid.last_update_timestamp()
     }

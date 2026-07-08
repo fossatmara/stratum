@@ -196,6 +196,9 @@ pub struct PidVardiffState {
     /// integral-pressure emission gate tests |I| against Z * sqrt(this), so
     /// noise random-walks don't masquerade as accumulated evidence.
     integral_noise_var: f64,
+    /// True when an adaptive layer (e.g. qpid) owns the gains; manual gain
+    /// overrides from `super::tuning` are then ignored.
+    adaptive_gains: bool,
     /// Telemetry identity: when set, gain values are published to
     /// [`super::telemetry`] so visualizations can track them (instance id
     /// guards against a reconnect race clearing the successor's entry).
@@ -224,6 +227,7 @@ impl PidVardiffState {
             timestamp_of_last_update: timestamp_secs,
             integral: 0.0,
             integral_noise_var: 0.0,
+            adaptive_gains: false,
             telemetry: None,
             last_share_time: timestamp_secs,
             prev_log_measurement: None,
@@ -248,6 +252,12 @@ impl PidVardiffState {
                 super::telemetry::publish_gains(key, *id, kp, ki, kd);
             }
         }
+    }
+
+    /// Marks the gains as owned by an adaptive layer (qpid); manual gain
+    /// overrides no longer apply.
+    pub fn set_adaptive_gains(&mut self) {
+        self.adaptive_gains = true;
     }
 
     /// Enables gain telemetry under the given identity (usually the
@@ -279,6 +289,10 @@ impl Drop for PidVardiffState {
 }
 
 impl Vardiff for PidVardiffState {
+    fn kind(&self) -> super::VardiffKind {
+        super::VardiffKind::Pid
+    }
+
     fn last_update_timestamp(&self) -> u64 {
         self.timestamp_of_last_update as u64
     }
@@ -353,6 +367,20 @@ impl PidVardiffState {
         if setpoint <= 0.0 {
             return Ok((None, None));
         }
+        // Manual live gain overrides (ignored under adaptive scheduling).
+        // Routed through set_gains so telemetry publishes the change.
+        if !self.adaptive_gains {
+            let (kp, ki, kd) = super::tuning::gain_overrides();
+            let (kp, ki, kd) = (
+                kp.unwrap_or(self.params.kp),
+                ki.unwrap_or(self.params.ki),
+                kd.unwrap_or(self.params.kd),
+            );
+            if kp != self.params.kp || ki != self.params.ki || kd != self.params.kd {
+                self.set_gains(kp, ki, kd);
+            }
+        }
+
         // Zero-share windows are measured over the FULL silence since the
         // last share: absence is cumulative evidence, and re-anchoring it to
         // each post-emission window would make every correction round repeat

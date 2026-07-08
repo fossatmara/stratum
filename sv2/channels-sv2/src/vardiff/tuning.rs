@@ -93,6 +93,70 @@ pub fn set_shares_per_minute(spm: f64) {
     }
 }
 
+static ALGORITHM: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Live override for the vardiff algorithm. `None` means pools use their
+/// configured algorithm.
+pub fn algorithm_override() -> Option<super::VardiffKind> {
+    match ALGORITHM.load(Ordering::Relaxed) {
+        0 => Some(super::VardiffKind::Classic),
+        1 => Some(super::VardiffKind::Pid),
+        2 => Some(super::VardiffKind::QPid),
+        _ => None,
+    }
+}
+
+/// Sets the live algorithm override.
+pub fn set_algorithm(kind: super::VardiffKind) {
+    let v = match kind {
+        super::VardiffKind::Classic => 0,
+        super::VardiffKind::Pid => 1,
+        super::VardiffKind::QPid => 2,
+    };
+    ALGORITHM.store(v, Ordering::Relaxed);
+}
+
+static KP: AtomicU64 = AtomicU64::new(u64::MAX);
+static KI: AtomicU64 = AtomicU64::new(u64::MAX);
+static KD: AtomicU64 = AtomicU64::new(u64::MAX);
+
+fn opt_f64(cell: &AtomicU64) -> Option<f64> {
+    let bits = cell.load(Ordering::Relaxed);
+    if bits == u64::MAX {
+        None
+    } else {
+        Some(f64::from_bits(bits))
+    }
+}
+
+/// Live manual gain overrides (kp, ki, kd), applied by non-adaptive PID
+/// controllers at evaluation time. Adaptive controllers (qpid) own their
+/// gains and ignore these.
+pub fn gain_overrides() -> (Option<f64>, Option<f64>, Option<f64>) {
+    (opt_f64(&KP), opt_f64(&KI), opt_f64(&KD))
+}
+
+/// Sets the live kp override (clamped to `[0.01, 5.0]`).
+pub fn set_kp(kp: f64) {
+    if kp.is_finite() {
+        KP.store(kp.clamp(0.01, 5.0).to_bits(), Ordering::Relaxed);
+    }
+}
+
+/// Sets the live ki override (clamped to `[0.0, 1.0]`).
+pub fn set_ki(ki: f64) {
+    if ki.is_finite() {
+        KI.store(ki.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
+}
+
+/// Sets the live kd override (clamped to `[0.0, 2.0]`).
+pub fn set_kd(kd: f64) {
+    if kd.is_finite() {
+        KD.store(kd.clamp(0.0, 2.0).to_bits(), Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

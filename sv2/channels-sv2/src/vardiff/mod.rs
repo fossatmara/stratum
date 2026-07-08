@@ -12,8 +12,21 @@ pub mod tuning;
 #[cfg(test)]
 pub mod test;
 
+/// Which vardiff control algorithm an implementation is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VardiffKind {
+    Classic,
+    Pid,
+    QPid,
+}
+
 /// Trait defining the interface for a Vardiff implementation.
 pub trait Vardiff: Debug + Send + Sync {
+    /// Which algorithm this controller implements (lets a pool detect that a
+    /// live algorithm selection differs from a channel's controller and
+    /// rebuild it).
+    fn kind(&self) -> VardiffKind;
+
     /// Gets the timestamp of the last update.
     fn last_update_timestamp(&self) -> u64;
 

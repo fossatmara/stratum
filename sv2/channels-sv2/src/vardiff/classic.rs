@@ -50,6 +50,10 @@ impl VardiffState {
 }
 
 impl Vardiff for VardiffState {
+    fn kind(&self) -> super::VardiffKind {
+        super::VardiffKind::Classic
+    }
+
     fn last_update_timestamp(&self) -> u64 {
         self.timestamp_of_last_update
     }
