@@ -102,6 +102,7 @@ pub fn algorithm_override() -> Option<super::VardiffKind> {
         0 => Some(super::VardiffKind::Classic),
         1 => Some(super::VardiffKind::Pid),
         2 => Some(super::VardiffKind::QPid),
+        3 => Some(super::VardiffKind::Champion),
         _ => None,
     }
 }
@@ -112,6 +113,7 @@ pub fn set_algorithm(kind: super::VardiffKind) {
         super::VardiffKind::Classic => 0,
         super::VardiffKind::Pid => 1,
         super::VardiffKind::QPid => 2,
+        super::VardiffKind::Champion => 3,
     };
     ALGORITHM.store(v, Ordering::Relaxed);
 }

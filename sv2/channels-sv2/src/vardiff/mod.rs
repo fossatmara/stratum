@@ -2,6 +2,7 @@ use bitcoin::Target;
 use error::VardiffError;
 use std::fmt::Debug;
 
+pub mod champion;
 pub mod classic;
 pub mod error;
 pub mod pid;
@@ -18,6 +19,8 @@ pub enum VardiffKind {
     Classic,
     Pid,
     QPid,
+    /// The decline-safe adaptive EWMA algorithm from stratum-mining/stratum#2188.
+    Champion,
 }
 
 /// Trait defining the interface for a Vardiff implementation.

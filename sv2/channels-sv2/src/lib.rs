@@ -35,6 +35,7 @@ pub mod vardiff;
 
 #[cfg(not(feature = "no_std"))]
 pub use vardiff::{
+    champion::ChampionVardiffState,
     classic::VardiffState,
     pid::{PidParams, PidVardiffState},
     qpid::{QPidParams, QPidVardiffState, QTable, SharedQTable},
