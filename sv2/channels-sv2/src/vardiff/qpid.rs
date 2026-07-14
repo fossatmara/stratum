@@ -55,41 +55,47 @@ use super::{
     Vardiff,
 };
 
-/// Learning rate.
-pub const DEFAULT_ALPHA: f64 = 0.15;
+/// Learning rate. Kept modest so the domain-seeded prior (see
+/// [`QTable::with_seed`]) is refined, not immediately washed out, in the
+/// sample-starved online setting (a single run visits each state only a
+/// handful of times).
+pub const DEFAULT_ALPHA: f64 = 0.1;
 /// Discount factor. Short horizon: the plant reacts within a window or two.
 pub const DEFAULT_GAMMA: f64 = 0.7;
-/// Initial exploration rate; decays with table experience.
-pub const DEFAULT_EPSILON: f64 = 0.1;
-/// Experience half-life of the exploration rate: after this many recorded
-/// decisions the effective epsilon is half the configured value.
+/// Initial exploration rate; decays with table experience. Low because the
+/// policy is seeded with a sensible prior rather than learned from scratch —
+/// exploration refines it, it isn't the primary source of good gains.
+pub const DEFAULT_EPSILON: f64 = 0.05;
+/// Experience half-life of the exploration rate.
 const EPSILON_HALF_LIFE: f64 = 2000.0;
-/// Exploration never drops below this (the environment is non-stationary:
-/// miners come, go, and change behavior). Kept low because a nonzero floor is
-/// a *permanent* perturbation applied to every converged miner; guided
-/// single-axis exploration ([`QTable::explore_from`]) makes each such step
-/// gentle enough that 1% suffices to keep tracking a changing fleet.
-const EPSILON_FLOOR: f64 = 0.01;
-/// Churn penalty per emitted update in the reward. Sized so that near
-/// convergence (small squared log-error) it meaningfully discourages gains
-/// that emit a `SetTarget` a settled miner didn't need, while a genuine
-/// correction (error term up to `MAX_ABS_ERROR^2 = 9`) still dominates.
+/// Exploration never drops below this. A nonzero floor is a permanent
+/// perturbation on every converged miner, so it's kept small; guided
+/// single-axis exploration ([`QTable::explore_from`]) keeps each step gentle.
+const EPSILON_FLOOR: f64 = 0.005;
+/// Churn penalty per emitted update in the reward.
 const CHURN_PENALTY: f64 = 0.1;
-/// Multiplicative gain nudge per action step.
-const GAIN_STEP: f64 = 1.25;
-/// kp bounds.
-const KP_BOUNDS: (f64, f64) = (0.1, 1.2);
-/// ki bounds (per second).
-const KI_BOUNDS: (f64, f64) = (0.0005, 0.05);
-/// kd bounds. Zero disables derivative action entirely.
-const KD_BOUNDS: (f64, f64) = (0.0, 0.5);
-/// Smallest non-zero kd; the increase action bootstraps a zero kd here.
-const KD_FLOOR: f64 = 0.01;
+
+/// Absolute gain PRESETS the learner selects among (low / mid / high per
+/// axis). Unlike the former multiplicative nudges, an action SETS the gains to
+/// a preset, so a state maps to a stable gain choice — no random-walk drift
+/// away from good values, and an untrained table sitting at its seeded greedy
+/// action already behaves like a well-scheduled controller.
+///
+/// `mid` matches the PID defaults (kp 0.6, ki 0.005, kd off); `high` is the
+/// aggressive end for large disturbances, `low` the calm end for settled
+/// miners. kd stays off at low/mid (differentiating Poisson noise rarely
+/// helps) and only engages at `high`.
+const KP_PRESETS: [f64; 3] = [0.35, 0.6, 1.0];
+const KI_PRESETS: [f64; 3] = [0.002, 0.005, 0.02];
+const KD_PRESETS: [f64; 3] = [0.0, 0.0, 0.08];
 
 pub const STATES: usize = 36;
 pub const ACTIONS: usize = 27;
-/// Index of the keep/keep/keep action (no gain change).
-const KEEP_ACTION: usize = 13;
+/// Index of the mid/mid/low action (the PID-default gains: kp 0.6, ki 0.005,
+/// kd off) — kp preset 1, ki preset 1, kd preset 0. Used by tests as a stable
+/// reference action.
+#[allow(dead_code)]
+const KEEP_ACTION: usize = 9 + 3;
 
 /// Tabular Q-values shared across all channels of a pool.
 #[derive(Debug)]
@@ -108,12 +114,17 @@ impl QTable {
 
     /// Deterministic construction for reproducible tests and experiments.
     pub fn with_seed(seed: u64) -> Self {
-        // A tiny optimistic seed on the neutral action makes untrained
-        // states default to "keep the gains" instead of an arbitrary
-        // tie-break drifting them; exploration still visits everything.
+        // Seed each state's domain-prior action optimistically so an untrained
+        // table already schedules gains sensibly (see `seed_action`). This is
+        // the key to online performance: a fresh pool (every benchmark run
+        // starts fresh) behaves like a well-tuned scheduled controller from
+        // tick one, and learning refines the prior rather than discovering it
+        // from a random walk. The prior value is small relative to typical
+        // rewards (|reward| up to ~9), so a few real updates can still
+        // override it where the environment disagrees.
         let mut q = vec![0.0; STATES * ACTIONS];
         for state in 0..STATES {
-            q[state * ACTIONS + KEEP_ACTION] = 1e-3;
+            q[state * ACTIONS + seed_action(state)] = 0.05;
         }
         Self {
             q,
@@ -204,9 +215,9 @@ impl QTable {
         (initial * EPSILON_HALF_LIFE / (EPSILON_HALF_LIFE + self.total as f64)).max(EPSILON_FLOOR)
     }
 
-    /// Greedy (kp, ki, kd) multipliers for a state, for introspection.
+    /// Greedy (kp, ki, kd) gains for a state, for introspection.
     pub fn greedy_action(&self, state: usize) -> (f64, f64, f64) {
-        action_multipliers(self.best_action(state))
+        action_gains(self.best_action(state))
     }
 
     /// Serializes the learned policy to a self-describing little-endian blob so
@@ -334,30 +345,57 @@ fn state_index(obs: &WindowObservation) -> usize {
     (mag * 3 + trend) * 3 + confidence
 }
 
-/// (kp, ki, kd) multipliers for an action index.
-fn action_multipliers(action: usize) -> (f64, f64, f64) {
-    const STEPS: [f64; 3] = [1.0 / GAIN_STEP, 1.0, GAIN_STEP];
-    (STEPS[action / 9], STEPS[(action / 3) % 3], STEPS[action % 3])
+/// Absolute (kp, ki, kd) gains for an action index. The action encodes a
+/// preset per axis in base 3: `(kp_preset, ki_preset, kd_preset)`.
+fn action_gains(action: usize) -> (f64, f64, f64) {
+    (
+        KP_PRESETS[action / 9],
+        KI_PRESETS[(action / 3) % 3],
+        KD_PRESETS[action % 3],
+    )
 }
 
-/// Applies a kd multiplier with the zero-escape rule.
-fn nudge_kd(kd: f64, mul: f64) -> f64 {
-    if kd < KD_FLOOR {
-        // Off (or effectively off): only the increase action turns it on.
-        if mul > 1.0 {
-            KD_FLOOR
-        } else {
-            0.0
+/// Domain prior: the sensible action for a given (magnitude, trend,
+/// confidence) state, used to seed the Q-table so an untrained controller
+/// already schedules gains well. The principle mirrors the hand-tuned PID
+/// intuition: far from setpoint or moving away → high gains (react); near
+/// setpoint with confidence → low gains (don't chase noise); otherwise the
+/// PID-default mid preset.
+fn seed_action(state: usize) -> usize {
+    let mag = state / 9; // 0:<0.1  1:<0.3  2:<1.0  3:>=1.0
+    let trend = (state / 3) % 3; // 0 falling, 1 flat, 2 rising
+    let confidence = state % 3; // 0:<8  1:<32  2:>=32
+    // preset indices per axis (0 low, 1 mid, 2 high)
+    let (kp, ki, kd) = match mag {
+        // Large error: react hard, engage derivative to curb overshoot.
+        3 => (2, 2, 2),
+        // Moderate error: STAY aggressive. De-escalating here causes premature
+        // stalling — after the first fire drops the error from "large" to
+        // "moderate", weaker gains fail to close the remaining distance and the
+        // miner never re-enters the band. Keep high kp/ki until actually near
+        // the setpoint.
+        2 => (2, 2, 1),
+        // Small error (|e|<0.3): mid gains — but if it's still drifting away
+        // (not flat) keep a touch more integral to close it out.
+        1 => {
+            if trend == 1 {
+                (1, 1, 0)
+            } else {
+                (1, 2, 0)
+            }
         }
-    } else {
-        let next = (kd * mul).clamp(KD_BOUNDS.0, KD_BOUNDS.1);
-        // Decreasing below the floor switches derivative action off.
-        if next < KD_FLOOR {
-            0.0
-        } else {
-            next
+        // Converged (|e|<0.1): calm down proportionally to confidence so a
+        // well-sampled settled miner stops chasing noise; a low-confidence
+        // converged window keeps default gains rather than over-relaxing.
+        _ => {
+            if confidence == 2 {
+                (0, 0, 0)
+            } else {
+                (1, 1, 0)
+            }
         }
-    }
+    };
+    kp * 9 + ki * 3 + kd
 }
 
 /// PID vardiff controller whose gains are adapted online by Q-learning.
@@ -421,8 +459,14 @@ impl QPidVardiffState {
         };
 
         if let Some((prev_state, prev_action)) = self.pending.take() {
+            // Reward: drive the next window's error to zero, penalize churn.
+            // Using |raw_error| (not squared) keeps the reward scale linear so
+            // the seeded prior isn't dwarfed by a single large-error window,
+            // and a convergence bonus sharpens the gradient toward the band.
+            let abs_e = obs.raw_error.abs();
+            let converged_bonus = if abs_e < 0.2 { 0.5 } else { 0.0 };
             let reward =
-                -(obs.raw_error * obs.raw_error) - CHURN_PENALTY * (obs.emitted as u8 as f64);
+                -abs_e - CHURN_PENALTY * (obs.emitted as u8 as f64) + converged_bonus;
             table.update(
                 prev_state,
                 prev_action,
@@ -437,10 +481,12 @@ impl QPidVardiffState {
         let action = table.choose(state, epsilon);
         drop(table);
 
-        let (kp_mul, ki_mul, kd_mul) = action_multipliers(action);
-        self.kp = (self.kp * kp_mul).clamp(KP_BOUNDS.0, KP_BOUNDS.1);
-        self.ki = (self.ki * ki_mul).clamp(KI_BOUNDS.0, KI_BOUNDS.1);
-        self.kd = nudge_kd(self.kd, kd_mul);
+        // Actions set ABSOLUTE gains (presets), so there's no drift: a state
+        // deterministically maps to a gain choice.
+        let (kp, ki, kd) = action_gains(action);
+        self.kp = kp;
+        self.ki = ki;
+        self.kd = kd;
         self.pid.set_gains(self.kp, self.ki, self.kd);
         self.pending = Some((state, action));
 
@@ -685,13 +731,12 @@ mod tests {
             }
             backdate(&mut state, 60);
             let _ = state.try_vardiff(100.0e12, &target, 6.0).unwrap();
+            // Gains are always exactly one of the presets (actions set absolute
+            // gains, so no out-of-range drift is possible).
             let (kp, ki, kd) = state.gains();
-            assert!((KP_BOUNDS.0..=KP_BOUNDS.1).contains(&kp), "kp={kp}");
-            assert!((KI_BOUNDS.0..=KI_BOUNDS.1).contains(&ki), "ki={ki}");
-            assert!(
-                (KD_BOUNDS.0..=KD_BOUNDS.1).contains(&kd) && (kd == 0.0 || kd >= KD_FLOOR),
-                "kd={kd}"
-            );
+            assert!(KP_PRESETS.contains(&kp), "kp={kp} not a preset");
+            assert!(KI_PRESETS.contains(&ki), "ki={ki} not a preset");
+            assert!(KD_PRESETS.contains(&kd), "kd={kd} not a preset");
         }
         assert!(
             state.table.lock().unwrap().total_visits() > 100,

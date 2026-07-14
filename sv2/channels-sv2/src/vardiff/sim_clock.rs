@@ -57,11 +57,39 @@ pub fn scale() -> f64 {
         .unwrap_or(1.0)
 }
 
+/// Freezes virtual time at `start`: the clock stops tracking wall time
+/// (scale 0) and only [`advance`] moves it. This makes a deterministic,
+/// reproducible virtual clock for offline harnesses (e.g. the fitness
+/// evaluator) — the live scale API clamps to `>= 0.01`, so production never
+/// reaches this mode. Not for use in a running pool.
+pub fn freeze_at(start: f64) {
+    let mut state = STATE.lock().expect("sim clock lock poisoned");
+    *state = Some(ClockState {
+        anchor_wall: 0.0,
+        anchor_virtual: start,
+        scale: 0.0, // frozen: wall time no longer contributes
+    });
+}
+
+/// Advances frozen virtual time by `secs`. No-op unless [`freeze_at`] is
+/// active (scale 0).
+pub fn advance(secs: f64) {
+    let mut state = STATE.lock().expect("sim clock lock poisoned");
+    if let Some(s) = state.as_mut() {
+        if s.scale == 0.0 {
+            s.anchor_virtual += secs;
+        }
+    }
+}
+
 /// Current virtual time as fractional seconds since the Unix epoch.
 pub fn now_secs_f64() -> f64 {
     let state = STATE.lock().expect("sim clock lock poisoned");
     let wall = wall_now();
     match state.as_ref() {
+        // scale 0 (frozen): virtual time is exactly anchor_virtual, wall time
+        // does not contribute — fully deterministic.
+        Some(s) if s.scale == 0.0 => s.anchor_virtual,
         Some(s) => s.anchor_virtual + (wall - s.anchor_wall) * s.scale,
         None => wall,
     }
