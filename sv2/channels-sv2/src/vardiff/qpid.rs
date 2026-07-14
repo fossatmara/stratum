@@ -26,6 +26,11 @@
 //! floor first and the decrease action can switch it back off — the learner
 //! decides per regime whether derivative action earns its keep.
 //!
+//! Exploration is *guided*: an epsilon-greedy step perturbs the greedy action
+//! along a single axis by a single step (see [`QTable::explore_from`]) rather
+//! than jumping to a uniformly random one of the 27, so the worst gain move
+//! ever applied to a live miner is one `GAIN_STEP` on one gain.
+//!
 //! # Reward
 //!
 //! Observed at the next evaluation: `-(e'^2) - churn * emitted`. Squared
@@ -60,10 +65,16 @@ pub const DEFAULT_EPSILON: f64 = 0.1;
 /// decisions the effective epsilon is half the configured value.
 const EPSILON_HALF_LIFE: f64 = 2000.0;
 /// Exploration never drops below this (the environment is non-stationary:
-/// miners come, go, and change behavior).
-const EPSILON_FLOOR: f64 = 0.02;
-/// Churn penalty per emitted update in the reward.
-const CHURN_PENALTY: f64 = 0.05;
+/// miners come, go, and change behavior). Kept low because a nonzero floor is
+/// a *permanent* perturbation applied to every converged miner; guided
+/// single-axis exploration ([`QTable::explore_from`]) makes each such step
+/// gentle enough that 1% suffices to keep tracking a changing fleet.
+const EPSILON_FLOOR: f64 = 0.01;
+/// Churn penalty per emitted update in the reward. Sized so that near
+/// convergence (small squared log-error) it meaningfully discourages gains
+/// that emit a `SetTarget` a settled miner didn't need, while a genuine
+/// correction (error term up to `MAX_ABS_ERROR^2 = 9`) still dominates.
+const CHURN_PENALTY: f64 = 0.1;
 /// Multiplicative gain nudge per action step.
 const GAIN_STEP: f64 = 1.25;
 /// kp bounds.
@@ -132,11 +143,42 @@ impl QTable {
     }
 
     fn choose(&mut self, state: usize, epsilon: f64) -> usize {
+        let greedy = self.best_action(state);
         if self.next_random() < epsilon {
-            (self.next_random() * ACTIONS as f64) as usize % ACTIONS
+            self.explore_from(greedy)
         } else {
-            self.best_action(state)
+            greedy
         }
+    }
+
+    /// Guided exploration: perturb the greedy action along exactly ONE gain
+    /// axis by ONE step, instead of jumping to a uniformly random action.
+    ///
+    /// The action encodes `(kp_step, ki_step, kd_step)` in base 3, each step in
+    /// `{0=down, 1=keep, 2=up}`. Uniform 27-way exploration can apply a
+    /// simultaneous 3-axis gain swing to a *live* miner's difficulty (e.g.
+    /// kp x0.8, ki x1.25, kd x1.25 at once) — a large, incoherent move on the
+    /// hot path. Restricting exploration to a single-axis, single-step neighbor
+    /// keeps learning going while bounding the worst applied move to one
+    /// `GAIN_STEP` on one gain, and guarantees the explored action actually
+    /// differs from greedy (so an exploration step is never wasted).
+    fn explore_from(&mut self, greedy: usize) -> usize {
+        let mut steps = [greedy / 9, (greedy / 3) % 3, greedy % 3];
+        let axis = (self.next_random() * 3.0) as usize % 3;
+        steps[axis] = match steps[axis] {
+            // At a boundary the only in-bounds one-step move is toward keep.
+            0 => 1,
+            2 => 1,
+            // From keep, explore up or down with equal probability.
+            _ => {
+                if self.next_random() < 0.5 {
+                    0
+                } else {
+                    2
+                }
+            }
+        };
+        steps[0] * 9 + steps[1] * 3 + steps[2]
     }
 
     fn update(&mut self, state: usize, action: usize, reward: f64, next_state: usize, alpha: f64, gamma: f64) {
@@ -166,6 +208,84 @@ impl QTable {
     pub fn greedy_action(&self, state: usize) -> (f64, f64, f64) {
         action_multipliers(self.best_action(state))
     }
+
+    /// Serializes the learned policy to a self-describing little-endian blob so
+    /// a pool can persist experience across restarts (see [`QTable::decode`]).
+    ///
+    /// Layout: `MAGIC(4) | VERSION(2) | STATES(u32) | ACTIONS(u32) | rng(u64) |
+    /// total(u64) | q[STATES*ACTIONS] as f64 | visits[STATES*ACTIONS] as u32`.
+    /// `STATES`/`ACTIONS` are embedded so a blob written by a build with a
+    /// different state/action layout is rejected on load rather than silently
+    /// misread. The live `rng` is persisted too, so a reloaded table does not
+    /// replay the same exploration sequence every boot.
+    pub fn encode(&self) -> Vec<u8> {
+        let n = STATES * ACTIONS;
+        let mut buf = Vec::with_capacity(Self::HEADER_LEN + n * (8 + 4));
+        buf.extend_from_slice(&Self::MAGIC);
+        buf.extend_from_slice(&Self::VERSION.to_le_bytes());
+        buf.extend_from_slice(&(STATES as u32).to_le_bytes());
+        buf.extend_from_slice(&(ACTIONS as u32).to_le_bytes());
+        buf.extend_from_slice(&self.rng.to_le_bytes());
+        buf.extend_from_slice(&self.total.to_le_bytes());
+        for &v in &self.q {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for &v in &self.visits {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        buf
+    }
+
+    /// Reconstructs a table from [`QTable::encode`] output. Returns
+    /// [`VardiffError::InvalidQTableBlob`] if the magic, version, or embedded
+    /// `STATES`/`ACTIONS` don't match this build, or the length is short — a
+    /// stale or corrupt file is rejected so the caller can fall back to a fresh
+    /// table instead of learning from garbage.
+    pub fn decode(bytes: &[u8]) -> Result<Self, VardiffError> {
+        let n = STATES * ACTIONS;
+        let expected = Self::HEADER_LEN + n * (8 + 4);
+        if bytes.len() != expected {
+            return Err(VardiffError::InvalidQTableBlob);
+        }
+        if bytes[0..4] != Self::MAGIC {
+            return Err(VardiffError::InvalidQTableBlob);
+        }
+        let mut off = 4;
+        let take = |off: &mut usize, len: usize| {
+            let s = &bytes[*off..*off + len];
+            *off += len;
+            s
+        };
+        let version = u16::from_le_bytes(take(&mut off, 2).try_into().unwrap());
+        let states = u32::from_le_bytes(take(&mut off, 4).try_into().unwrap()) as usize;
+        let actions = u32::from_le_bytes(take(&mut off, 4).try_into().unwrap()) as usize;
+        if version != Self::VERSION || states != STATES || actions != ACTIONS {
+            return Err(VardiffError::InvalidQTableBlob);
+        }
+        let rng = u64::from_le_bytes(take(&mut off, 8).try_into().unwrap());
+        let total = u64::from_le_bytes(take(&mut off, 8).try_into().unwrap());
+        let mut q = Vec::with_capacity(n);
+        for _ in 0..n {
+            q.push(f64::from_le_bytes(take(&mut off, 8).try_into().unwrap()));
+        }
+        let mut visits = Vec::with_capacity(n);
+        for _ in 0..n {
+            visits.push(u32::from_le_bytes(take(&mut off, 4).try_into().unwrap()));
+        }
+        Ok(Self {
+            q,
+            visits,
+            total,
+            // A zero rng would freeze xorshift64 (a corrupt/zeroed blob); any
+            // nonzero state round-trips exactly, since xorshift64 never reaches
+            // zero from a nonzero seed.
+            rng: if rng == 0 { 1 } else { rng },
+        })
+    }
+
+    const MAGIC: [u8; 4] = *b"QPID";
+    const VERSION: u16 = 1;
+    const HEADER_LEN: usize = 4 + 2 + 4 + 4 + 8 + 8;
 }
 
 impl Default for QTable {
@@ -400,6 +520,109 @@ mod tests {
             dt: 60.0,
             emitted: false,
         }
+    }
+
+    /// Decodes an action index back to its `(kp, ki, kd)` steps in `{0,1,2}`.
+    fn action_steps(a: usize) -> [usize; 3] {
+        [a / 9, (a / 3) % 3, a % 3]
+    }
+
+    #[test]
+    fn exploration_perturbs_exactly_one_axis_by_one_step() {
+        let mut table = QTable::with_seed(12345);
+        // Greedy action = keep/keep/keep so any single-axis nudge is reachable
+        // up or down; every explored action must differ from greedy on exactly
+        // one axis, and never touch a second.
+        let greedy = KEEP_ACTION;
+        let g = action_steps(greedy);
+        let mut saw_non_greedy = false;
+        for _ in 0..2000 {
+            let a = table.explore_from(greedy);
+            let s = action_steps(a);
+            let diffs: Vec<usize> = (0..3).filter(|&i| s[i] != g[i]).collect();
+            assert!(
+                diffs.len() <= 1,
+                "explored action {a:?} differs from greedy {g:?} on {} axes",
+                diffs.len()
+            );
+            for &i in &diffs {
+                assert!(
+                    s[i].abs_diff(g[i]) == 1,
+                    "axis {i} moved more than one step: {g:?} -> {s:?}"
+                );
+            }
+            if !diffs.is_empty() {
+                saw_non_greedy = true;
+            }
+        }
+        assert!(saw_non_greedy, "exploration never left the greedy action");
+    }
+
+    #[test]
+    fn exploration_from_boundary_stays_in_bounds() {
+        let mut table = QTable::with_seed(999);
+        // Greedy at down/up/down = steps (0,2,0) => index 6: the only in-bounds
+        // single-step moves are toward keep on whichever axis is chosen.
+        let greedy = 6;
+        assert_eq!(action_steps(greedy), [0, 2, 0]);
+        for _ in 0..1000 {
+            let a = table.explore_from(greedy);
+            for &step in &action_steps(a) {
+                assert!(step <= 2, "step {step} out of range for action {a}");
+            }
+        }
+    }
+
+    #[test]
+    fn qtable_encode_decode_round_trips() {
+        let mut table = QTable::with_seed(42);
+        // Train into a non-trivial state so q/visits/total/rng all differ from
+        // a fresh table.
+        for i in 0..500 {
+            let state = i % STATES;
+            let action = (i * 7) % ACTIONS;
+            table.update(state, action, (i as f64 % 5.0) - 2.0, (i + 1) % STATES, 0.15, 0.7);
+        }
+        let _ = table.choose(3, 0.5); // advance rng
+        let blob = table.encode();
+        let restored = QTable::decode(&blob).expect("round-trip decodes");
+        assert_eq!(restored.total_visits(), table.total_visits());
+        assert_eq!(restored.q, table.q);
+        assert_eq!(restored.visits, table.visits);
+        assert_eq!(restored.rng, table.rng);
+        // Greedy policy is preserved for every state.
+        for s in 0..STATES {
+            assert_eq!(restored.best_action(s), table.best_action(s));
+        }
+    }
+
+    #[test]
+    fn qtable_decode_rejects_bad_blobs() {
+        let good = QTable::with_seed(1).encode();
+        // Truncated.
+        assert!(matches!(
+            QTable::decode(&good[..good.len() - 1]),
+            Err(VardiffError::InvalidQTableBlob)
+        ));
+        // Wrong magic.
+        let mut bad_magic = good.clone();
+        bad_magic[0] ^= 0xFF;
+        assert!(matches!(
+            QTable::decode(&bad_magic),
+            Err(VardiffError::InvalidQTableBlob)
+        ));
+        // Wrong version (bytes 4..6).
+        let mut bad_ver = good.clone();
+        bad_ver[4] = bad_ver[4].wrapping_add(1);
+        assert!(matches!(
+            QTable::decode(&bad_ver),
+            Err(VardiffError::InvalidQTableBlob)
+        ));
+        // Empty.
+        assert!(matches!(
+            QTable::decode(&[]),
+            Err(VardiffError::InvalidQTableBlob)
+        ));
     }
 
     #[test]

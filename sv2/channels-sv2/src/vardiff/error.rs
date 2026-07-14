@@ -7,6 +7,9 @@ pub enum VardiffError {
     TargetToHashrateError(String),
     /// System time error occurred.
     TimeError(std::time::SystemTimeError),
+    /// A persisted qpid Q-table blob was corrupt, truncated, or written by an
+    /// incompatible build (magic/version/state-space mismatch).
+    InvalidQTableBlob,
 }
 
 impl From<std::time::SystemTimeError> for VardiffError {
