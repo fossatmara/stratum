@@ -160,6 +160,11 @@ pub struct PidParams {
     pub significance_z_down: f64,
     /// Back-calculation anti-windup tracking time constant in seconds.
     pub tracking_secs: f64,
+    /// Confidence shrinkage constant `K` in `w = N_eff / (N_eff + K)`. Larger
+    /// values discount thin (few-share) windows more aggressively, so the
+    /// controller acts on genuine evidence rather than Poisson noise. The live
+    /// [`super::tuning::confidence_k_override`] takes precedence when set.
+    pub confidence_k: f64,
     /// Lowest hashrate estimate the controller will output.
     pub min_allowed_hashrate: f32,
 }
@@ -175,6 +180,7 @@ impl Default for PidParams {
             significance_z: DEFAULT_SIGNIFICANCE_Z,
             significance_z_down: DEFAULT_SIGNIFICANCE_Z_DOWN,
             tracking_secs: DEFAULT_TRACKING_SECS,
+            confidence_k: super::tuning::DEFAULT_CONFIDENCE_K,
             min_allowed_hashrate: DEFAULT_MIN_HASHRATE,
         }
     }
@@ -423,7 +429,8 @@ impl PidVardiffState {
         // shares the setpoint *expected*, which is real evidence, not noise.
         let expected_at_setpoint = setpoint * dt_eff / 60.0;
         let n_eff = (shares as f64).max(expected_at_setpoint);
-        let confidence = n_eff / (n_eff + super::tuning::confidence_k());
+        let k = super::tuning::confidence_k_override().unwrap_or(self.params.confidence_k);
+        let confidence = n_eff / (n_eff + k);
         let raw_error = (realized_spm / setpoint)
             .ln()
             .clamp(-MAX_ABS_ERROR, MAX_ABS_ERROR);

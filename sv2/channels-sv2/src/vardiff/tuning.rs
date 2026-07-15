@@ -13,13 +13,25 @@ pub const DEFAULT_CONFIDENCE_K: f64 = 2.0;
 
 static CONFIDENCE_K: AtomicU64 = AtomicU64::new(u64::MAX);
 
-/// Current confidence shrinkage constant.
+/// Current confidence shrinkage constant (the live override, or
+/// [`DEFAULT_CONFIDENCE_K`] when untouched). For display/back-compat callers;
+/// controllers should prefer their own [`super::pid::PidParams::confidence_k`]
+/// via [`confidence_k_override`].
 pub fn confidence_k() -> f64 {
+    confidence_k_override().unwrap_or(DEFAULT_CONFIDENCE_K)
+}
+
+/// Live override for the confidence shrinkage constant K. `None` means
+/// controllers use their configured [`super::pid::PidParams::confidence_k`].
+/// Set interactively (e.g. by the simulator dashboard) to sweep K across all
+/// controllers at once; production pools leave it unset and each controller
+/// uses its own configured value.
+pub fn confidence_k_override() -> Option<f64> {
     let bits = CONFIDENCE_K.load(Ordering::Relaxed);
     if bits == u64::MAX {
-        DEFAULT_CONFIDENCE_K
+        None
     } else {
-        f64::from_bits(bits)
+        Some(f64::from_bits(bits))
     }
 }
 

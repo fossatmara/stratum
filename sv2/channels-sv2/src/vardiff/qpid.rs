@@ -7,6 +7,23 @@
 //! discrete state, and nudges `kp`/`ki` up or down, reinforced by whether the
 //! *next* window's error shrank.
 //!
+//! # Do no harm
+//!
+//! The learner sits on top of a deliberately strong base tuning
+//! ([`QPidVardiffState::tuned_base`]) and is gated so it can only *improve* on
+//! it, never degrade it — the failure mode of naive gain scheduling, whose
+//! exploratory swings on a sample-starved shared table underperformed a
+//! well-tuned static PID. Two gates enforce this:
+//!
+//! - **Confidence gate** ([`QTable::confident_action`]): a learned action
+//!   overrides the base gains only where it has enough visits *and* a clear
+//!   Q-advantage over "keep"; otherwise the state defers to the base tuning.
+//!   Untrained and thin states therefore behave exactly like the static PID.
+//! - **Converged freeze**: within [`CONVERGED_ERROR`] of setpoint the learner
+//!   exploits greedily (no exploration), so a settled miner is never perturbed
+//!   by an exploratory gain step it didn't need. Exploration happens only in
+//!   the transient regimes where a better gain actually pays off.
+//!
 //! # State space (36 states)
 //!
 //! All features derive from the log-space [`WindowObservation`], so states
@@ -59,8 +76,13 @@ use super::{
 pub const DEFAULT_ALPHA: f64 = 0.15;
 /// Discount factor. Short horizon: the plant reacts within a window or two.
 pub const DEFAULT_GAMMA: f64 = 0.7;
-/// Initial exploration rate; decays with table experience.
-pub const DEFAULT_EPSILON: f64 = 0.1;
+/// Initial exploration rate; decays with table experience. Kept low: the
+/// confidence gate ([`QTable::confident_action`]) means unexplored actions
+/// cost nothing (the state defers to the tuned base gains), so exploration
+/// buys evidence rather than being the only thing standing between a state and
+/// a good action — and every exploratory step is a real gain perturbation on a
+/// live miner, so a little goes a long way.
+pub const DEFAULT_EPSILON: f64 = 0.05;
 /// Experience half-life of the exploration rate: after this many recorded
 /// decisions the effective epsilon is half the configured value.
 const EPSILON_HALF_LIFE: f64 = 2000.0;
@@ -77,14 +99,30 @@ const EPSILON_FLOOR: f64 = 0.01;
 const CHURN_PENALTY: f64 = 0.1;
 /// Multiplicative gain nudge per action step.
 const GAIN_STEP: f64 = 1.25;
-/// kp bounds.
-const KP_BOUNDS: (f64, f64) = (0.1, 1.2);
+/// kp bounds. Upper bound sits above the tuned base kp (0.9) so the learner can
+/// nudge the gain up or down; live sweeps showed kp up to ~1.2 stays stable at
+/// the shipped significance bars, so 1.5 gives headroom without inviting a
+/// runaway gain.
+const KP_BOUNDS: (f64, f64) = (0.1, 1.5);
 /// ki bounds (per second).
 const KI_BOUNDS: (f64, f64) = (0.0005, 0.05);
 /// kd bounds. Zero disables derivative action entirely.
 const KD_BOUNDS: (f64, f64) = (0.0, 0.5);
 /// Smallest non-zero kd; the increase action bootstraps a zero kd here.
 const KD_FLOOR: f64 = 0.01;
+/// Log-error magnitude under which a miner counts as converged. Below this the
+/// learner exploits greedily (no exploration): a settled channel is held by
+/// the base gains, and perturbing them buys nothing but churn. |e|<0.2 is a
+/// ~22% rate deviation, comfortably inside the ±20% convergence band's noise.
+const CONVERGED_ERROR: f64 = 0.2;
+/// Minimum visits on a learned action before it may override the base gains.
+/// Below this the state defers to KEEP (the tuned base). Sized so a single
+/// miner's handful of windows can't flip the fleet policy on noise.
+const MIN_CONFIDENT_VISITS: u32 = 30;
+/// Q-advantage over KEEP a learned action must show before it's exploited.
+/// Rewards are `-(e^2) - churn`, so this is roughly "the learned action must
+/// look at least a modest error-reduction better than holding the base gains."
+const CONFIDENT_MARGIN: f64 = 0.05;
 
 pub const STATES: usize = 36;
 pub const ACTIONS: usize = 27;
@@ -143,11 +181,35 @@ impl QTable {
     }
 
     fn choose(&mut self, state: usize, epsilon: f64) -> usize {
-        let greedy = self.best_action(state);
+        let greedy = self.confident_action(state);
         if self.next_random() < epsilon {
             self.explore_from(greedy)
         } else {
             greedy
+        }
+    }
+
+    /// The action to exploit: the learned best action *only* where the table
+    /// has earned the right to override the base gains — enough visits on that
+    /// action AND a Q-advantage over KEEP that clears a margin. Otherwise
+    /// [`KEEP_ACTION`], so a thin or ambiguous state defers to the (well-tuned)
+    /// base PID instead of committing to a gain move backed by a handful of
+    /// noisy windows. This is what keeps qpid pinned to its strong static
+    /// ceiling until learning genuinely knows better; the shared 36×27 table is
+    /// sample-starved per state, and acting on unconverged Q-values was costing
+    /// more (in transient churn and missed convergence) than the policy earned.
+    fn confident_action(&self, state: usize) -> usize {
+        let base = state * ACTIONS;
+        let best = self.best_action(state);
+        if best == KEEP_ACTION {
+            return KEEP_ACTION;
+        }
+        let enough_visits = self.visits[base + best] >= MIN_CONFIDENT_VISITS;
+        let advantage = self.q[base + best] - self.q[base + KEEP_ACTION];
+        if enough_visits && advantage >= CONFIDENT_MARGIN {
+            best
+        } else {
+            KEEP_ACTION
         }
     }
 
@@ -375,7 +437,43 @@ pub struct QPidVardiffState {
 
 impl QPidVardiffState {
     pub fn new(table: SharedQTable) -> Result<Self, VardiffError> {
-        Self::with_params(table, QPidParams::default(), PidParams::default())
+        Self::with_params(table, QPidParams::default(), Self::tuned_base())
+    }
+
+    /// The base PID tuning qpid schedules gains *around*, tuned for convergence
+    /// **and** steady-state bandwidth jointly and validated on the live pool
+    /// benchmark (not just the offline fitness harness — see the note on
+    /// `significance_z_down`). Differs from [`PidParams::default`] in three ways:
+    ///
+    /// - **`kp` 0.9** (vs 0.6): closes the gap to the implied estimate in fewer,
+    ///   larger moves, so a step re-enters the ±20% band faster. Safe to raise
+    ///   only because the significance bars below are *not* loosened — a fast
+    ///   gain behind a low bar overshoots and rings.
+    /// - **`significance_z_down` 2.5** (vs 1.5): raised toward the up-bar. This
+    ///   is the key bandwidth lever, and it is the *opposite* of what the
+    ///   offline harness suggested — the harness's clean Poisson model rewards a
+    ///   low down-bar (fast drop reaction), but on the live pool (share-delivery
+    ///   latency, reconnects, idle backstop) a low down-bar makes the controller
+    ///   eager to raise difficulty on any dip yet slow to lower it when fast, so
+    ///   the operating point *rectifies high* — miners settle at 4.5–6× setpoint
+    ///   and burn proportional extra share bandwidth. A near-symmetric bar keeps
+    ///   the equilibrium centered on setpoint (share submissions dominate wire
+    ///   traffic, so a centered operating point is the bandwidth win).
+    /// - **`confidence_k` 4.0** (vs 2.0): discounts thin, few-share windows a
+    ///   little harder so the controller acts on evidence rather than Poisson
+    ///   noise, without over-damping response (K=8 was worse live).
+    ///
+    /// `significance_z` stays at the default 3σ up-bar: at the low
+    /// shares-per-minute setpoints this pool runs, that keeps noise-triggered
+    /// upward churn on converged miners negligible.
+    pub fn tuned_base() -> PidParams {
+        PidParams {
+            kp: 0.9,
+            ki: 0.008,
+            significance_z_down: 2.5,
+            confidence_k: 4.0,
+            ..PidParams::default()
+        }
     }
 
     pub fn with_params(
@@ -433,7 +531,18 @@ impl QPidVardiffState {
             );
         }
 
-        let epsilon = table.effective_epsilon(self.params.epsilon);
+        // Do no harm when converged: near setpoint the base gains already hold
+        // the miner, and any exploratory gain swing is a *permanent*
+        // perturbation applied to a settled channel — which is exactly what
+        // made naive gain scheduling underperform a well-tuned static PID.
+        // Exploit greedily here (epsilon=0) so learning never disturbs a
+        // converged miner; the learner still explores in transient regimes.
+        let converged = obs.raw_error.abs() < CONVERGED_ERROR;
+        let epsilon = if converged {
+            0.0
+        } else {
+            table.effective_epsilon(self.params.epsilon)
+        };
         let action = table.choose(state, epsilon);
         drop(table);
 
@@ -651,10 +760,36 @@ mod tests {
     #[test]
     fn greedy_when_epsilon_zero() {
         let mut table = QTable::new();
-        table.update(3, 7, 5.0, 3, 0.5, 0.0);
+        // A learned action is only exploited once it clears the confidence
+        // gate (visits + advantage), so train action 7 well past both bars.
+        for _ in 0..MIN_CONFIDENT_VISITS + 5 {
+            table.update(3, 7, 5.0, 3, 0.5, 0.0);
+        }
         for _ in 0..20 {
             assert_eq!(table.choose(3, 0.0), 7);
         }
+    }
+
+    #[test]
+    fn thin_state_defers_to_keep() {
+        // An action that looks best but has too few visits must NOT override
+        // the base gains: the state falls back to KEEP so a sample-starved
+        // cell can't move a live miner off the tuned base on noise.
+        let mut table = QTable::new();
+        // One lucky high-reward visit on action 7 — best_action prefers it,
+        // but it is below MIN_CONFIDENT_VISITS.
+        table.update(5, 7, 5.0, 5, 0.5, 0.0);
+        assert_eq!(table.best_action(5), 7, "raw greedy should pick the lucky action");
+        assert_eq!(
+            table.choose(5, 0.0),
+            KEEP_ACTION,
+            "thin state must defer to KEEP until the action earns confidence"
+        );
+        // After enough confirming visits with a clear advantage, it takes over.
+        for _ in 0..MIN_CONFIDENT_VISITS {
+            table.update(5, 7, 5.0, 5, 0.5, 0.0);
+        }
+        assert_eq!(table.choose(5, 0.0), 7, "confident action should now be exploited");
     }
 
     #[test]
