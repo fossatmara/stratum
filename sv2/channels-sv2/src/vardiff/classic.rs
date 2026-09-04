@@ -5,6 +5,24 @@ use tracing::debug;
 /// Default minimum hashrate (H/s) if not specified.
 const DEFAULT_MIN_HASHRATE: f32 = 1.0;
 
+/// How many consecutive zero-share eases the difficulty may take before it is held.
+///
+/// Bounds *displacement* — the ratio of a channel's true hashrate to the believed one, `H_t/H_b`.
+/// The ease is multiplicative, so `n` of them leave the belief `3ⁿ` low, and displacement is a
+/// multiplier on the pool's own share-rate target: at `H_t/H_b = d` a miner asked for `r*`
+/// shares/min sends `r*·d`. At `2` the worst case is `d = 9`, whatever `r*` a deployment chooses;
+/// bounding a count rather than a rate-normalised budget is what makes it independent of `r*`, and
+/// it needs no division.
+///
+/// `9` also keeps a returning miner's correction at `800%`, under the `1000%` arm below that caps
+/// the climb back to `×3` per evaluation. So the channel re-targets in one evaluation instead of
+/// walking up in steps; `d > 11` is where that cap engages.
+///
+/// The floor, `min_allowed_hashrate`, does not stop the descent: from a 200 TH belief its `1.0` H/s
+/// default is ~30 eases away. Production incidents, the probability argument for `2`, and the
+/// rejected alternatives are in the commit that introduced this constant.
+const MAX_CONSECUTIVE_SILENT_EASES: u8 = 2;
+
 use super::{error::VardiffError, Vardiff};
 
 /// Represents the dynamic state for a variable difficulty (Vardiff) connection.
@@ -26,6 +44,9 @@ pub struct VardiffState {
     pub timestamp_of_last_update: u64,
     /// The lowest hashrate (H/s) the system will allow; values below this are clamped.
     pub min_allowed_hashrate: f32,
+    /// Consecutive zero-share eases applied to the difficulty; any share clears it.
+    /// See [`MAX_CONSECUTIVE_SILENT_EASES`].
+    silent_eases: u8,
 }
 
 impl VardiffState {
@@ -59,6 +80,7 @@ impl VardiffState {
             shares_since_last_update: 0,
             timestamp_of_last_update: timestamp_secs,
             min_allowed_hashrate,
+            silent_eases: 0,
         })
     }
 
@@ -177,6 +199,25 @@ impl Vardiff for VardiffState {
         let realized_share_per_min =
             self.shares_since_last_update as f64 / (delta_time as f64 / 60.0);
 
+        // Bound the ease on an absent miner. The hold is placed here rather than inside the
+        // zero-share arm below so it survives a change of estimator: the hazard is sustained
+        // silence, not the mechanism that translates it into a lower belief. The counter is
+        // incremented in that arm instead, so it counts eases actually applied — an estimator
+        // that declines to retarget on a silent window must not spend the budget.
+        if realized_share_per_min > 0.0 {
+            self.silent_eases = 0;
+        } else if self.silent_eases >= MAX_CONSECUTIVE_SILENT_EASES {
+            debug!(
+                target: "vardiff",
+                "Difficulty already eased {} times on consecutive silence — holding",
+                self.silent_eases,
+            );
+            // Re-anchor first, so a returning miner is estimated from fresh data rather than
+            // through the accumulated silence.
+            self.reset_counter()?;
+            return Ok(None);
+        }
+
         debug!(
             target: "vardiff",
             "Hashrate update check triggered:
@@ -232,6 +273,9 @@ impl Vardiff for VardiffState {
         // realized_share_per_min is 0.0 when d.difficulty_mgmt.shares_since_last_update is 0
         // so it's safe to compare realized_share_per_min with == 0.0
         if realized_share_per_min == 0.0 {
+            // Bounded by the hold above, which returns before this arm once the budget is spent,
+            // so this cannot exceed `MAX_CONSECUTIVE_SILENT_EASES`.
+            self.silent_eases += 1;
             new_hashrate = match delta_time {
                 dt if dt <= 30 => hashrate / 1.5,
                 dt if dt < 60 => hashrate / 2.0,
