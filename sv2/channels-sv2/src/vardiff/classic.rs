@@ -10,7 +10,15 @@ use super::{error::VardiffError, Vardiff};
 /// Represents the dynamic state for a variable difficulty (Vardiff) connection.
 ///
 /// Tracks performance and adjusts the mining target to achieve a desired share rate.
+///
+/// Construct with [`VardiffState::new`] or [`VardiffState::new_with_min`]. The struct is
+/// `#[non_exhaustive]` so that controller state can be added without a breaking change:
+/// every field of a constructible `pub` struct is part of its public API, whether the field
+/// itself is `pub` or private, so without this attribute each added field forces a major
+/// version. Nothing is constructing this by struct literal — the only literal is in
+/// `new_with_min` below — so the attribute costs callers nothing.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct VardiffState {
     /// Count of shares received since the last difficulty adjustment.
     pub shares_since_last_update: u32,
