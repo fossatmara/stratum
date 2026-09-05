@@ -507,3 +507,170 @@ fn test_asymmetry_follows_the_move_not_the_share_rate() {
         "the move is a loosening: {hashrate} -> {new_hashrate}"
     );
 }
+
+/// The same-direction run accumulates, resets on reversal, and clears with the window.
+///
+/// The run length is what the threshold discount is computed from, so these three behaviours are
+/// the mechanism. The reset on reversal is what keeps noise from earning a discount: a deviation
+/// that changes sign starts over, while a persistent one accumulates.
+///
+/// Clearing on `reset_counter` matters for a second reason. The discount applies to tightening as
+/// well as loosening, so a stale run would carry its accumulated relaxation into a fresh cycle and
+/// erode the extra burden of proof that tightening is supposed to carry.
+#[test]
+fn test_same_direction_run_accumulates_resets_and_clears() {
+    use crate::vardiff::clock::MockClock;
+    use std::sync::Arc;
+
+    let clock = Arc::new(MockClock::new(1_000_000));
+    let mut vardiff = VardiffState::new_with_clock(TEST_MIN_ALLOWED_HASHRATE, clock.clone())
+        .expect("Failed to create VardiffState");
+    let hashrate = TEST_INITIAL_HASHRATE;
+    let target =
+        hash_rate_to_target(hashrate.into(), TEST_SHARES_PER_MINUTE.into()).expect("valid target");
+
+    assert_eq!(
+        vardiff.direction_run(),
+        (0, 0),
+        "a fresh channel has no run"
+    );
+
+    // Three evaluations delivering under target: three loosening observations in a row.
+    for expected_run in 1..=3u32 {
+        vardiff.increment_shares_since_last_update();
+        clock.advance(60);
+        let _ = vardiff.try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE);
+        assert_eq!(
+            vardiff.direction_run(),
+            (-1, expected_run),
+            "a loosening run should reach {expected_run}"
+        );
+    }
+
+    // One evaluation delivering well over target reverses the direction and restarts the count.
+    for _ in 0..60 {
+        vardiff.increment_shares_since_last_update();
+    }
+    clock.advance(60);
+    let _ = vardiff.try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE);
+    assert_eq!(
+        vardiff.direction_run(),
+        (1, 1),
+        "a reversal should restart the run rather than continue it"
+    );
+
+    // Re-anchoring the window clears the run outright.
+    vardiff.reset_counter().expect("reset_counter failed");
+    assert_eq!(
+        vardiff.direction_run(),
+        (0, 0),
+        "reset_counter must clear the run, or its discount outlives the evidence"
+    );
+}
+
+/// The asymmetry leaves a permanent band of over-delivery that is never corrected.
+///
+/// As a window lengthens the evidence term vanishes and only the floor remains, so the loosening
+/// bar approaches `MIN_THRESHOLD_FRACTION` while the tightening bar approaches that floor times
+/// `TIGHTEN_MULTIPLIER`. Measured at a ten-hour window: the controller acts on a 6% shortfall but
+/// not on a 41% excess.
+///
+/// This band is where the controller's settled offset lives — recorded at −6.12% in simulation and
+/// −6.96% on hardware, both inside it. That offset is deliberate rather than an error: a difficulty
+/// settling slightly easy rather than exactly on target keeps the miner's own share-rate excursions inside
+/// a band it tolerates, where a difficulty settled exactly on target would let the upper excursions
+/// cross the point at which a rate-switching miner disconnects. Pinned here because the band is a
+/// product of three constants and changing any of them moves the settled behaviour.
+#[test]
+fn test_asymmetry_leaves_a_dead_zone_of_uncorrected_over_delivery() {
+    use crate::vardiff::clock::MockClock;
+    use std::sync::Arc;
+
+    let hashrate = TEST_INITIAL_HASHRATE;
+    let window = 36_000u64; // ten hours: long enough that the evidence term is negligible
+
+    // Smallest whole-percent deviation the controller acts on, in the given direction.
+    let smallest_acted_on = |tighten: bool| -> u32 {
+        for pct in 1..=200u32 {
+            let factor = if tighten {
+                1.0 + pct as f64 / 100.0
+            } else {
+                1.0 - pct as f64 / 100.0
+            };
+            let clock = Arc::new(MockClock::new(1_000_000));
+            let mut vardiff =
+                VardiffState::new_with_clock(TEST_MIN_ALLOWED_HASHRATE, clock.clone())
+                    .expect("Failed to create VardiffState");
+            let target = hash_rate_to_target(hashrate.into(), TEST_SHARES_PER_MINUTE.into())
+                .expect("valid target");
+            let shares =
+                (TEST_SHARES_PER_MINUTE as f64 * factor * window as f64 / 60.0).round() as u32;
+            for _ in 0..shares {
+                vardiff.increment_shares_since_last_update();
+            }
+            clock.advance(window);
+            if vardiff
+                .try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE)
+                .expect("try_vardiff failed")
+                .is_some()
+            {
+                return pct;
+            }
+        }
+        panic!("no deviation up to 200% was acted on");
+    };
+
+    let loosen = smallest_acted_on(false);
+    let tighten = smallest_acted_on(true);
+
+    assert!(
+        tighten > loosen * 4,
+        "the dead zone should be several times the loosening bar: loosen {loosen}%, tighten {tighten}%"
+    );
+    assert_eq!(
+        (loosen, tighten),
+        (6, 42),
+        "the dead zone is a product of MIN_THRESHOLD_FRACTION and TIGHTEN_MULTIPLIER; a change \
+         here moves the settled offset with it"
+    );
+}
+
+// The discount must change a *decision*, not just a counter. A persistent shortfall evaluated every
+// 20 seconds clears the loosening bar sooner once the run has earned a few discount steps, so the
+// first retarget arrives earlier than it would on a tree with the run counter but no discount.
+// Asserted as an exact index because that index is the whole behavioural claim: without the
+// discount, `DIRECTION_DISCOUNT_PER_OBSERVATION` could be set to zero and every other test here
+// would still pass.
+#[test]
+fn test_the_discount_brings_a_persistent_deviation_forward() {
+    use crate::vardiff::clock::MockClock;
+    use std::sync::Arc;
+
+    let clock = Arc::new(MockClock::new(0));
+    let mut vardiff = VardiffState::new_with_clock(1.0, clock.clone()).expect("state");
+    let hashrate = 1_000_000.0_f32;
+    let target =
+        hash_rate_to_target(hashrate.into(), TEST_SHARES_PER_MINUTE.into()).expect("valid target");
+
+    // A steady 40% shortfall, evaluated every 20 seconds: too small to fire on one short window,
+    // large enough to fire once persistence has relaxed the bar.
+    let mut first_fire = None;
+    for evaluation in 1..=20 {
+        let delivered = ((TEST_SHARES_PER_MINUTE as f64) * (20.0 / 60.0) * 0.6).round() as u32;
+        for _ in 0..delivered {
+            vardiff.increment_shares_since_last_update();
+        }
+        clock.advance(20);
+        if let Ok(Some(_)) = vardiff.try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE) {
+            first_fire = Some(evaluation);
+            break;
+        }
+    }
+
+    assert_eq!(
+        first_fire,
+        Some(6),
+        "a persistent 40% shortfall should first retarget at evaluation 6; without the run discount \
+         the same deviation waits until 8"
+    );
+}

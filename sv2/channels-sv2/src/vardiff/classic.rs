@@ -36,11 +36,23 @@ const SPARSE_SPM_SEAM: f32 = 6.0;
 /// spread of the observed share count.
 const POISSON_Z: f64 = 2.576;
 
-/// Smallest deviation the controller will ever act on, as a fraction.
+/// Floor on the *base* threshold, as a fraction, before the directional multiplier and the
+/// persistence discount scale it.
 ///
-/// Both branches add this, so it is the floor on what the controller can see at any window
-/// length — the thing the fixed 15% ladder set far too high. Shared between them deliberately:
+/// Both branches add this, so as a window lengthens and the evidence term vanishes, this is what
+/// remains — the thing the fixed 15% ladder set far too high. Shared between them deliberately:
 /// "how small a deviation is worth acting on" is one policy, not two.
+///
+/// It is not the smallest deviation the controller will ever act on, and the difference is the
+/// point. [`TIGHTEN_MULTIPLIER`] scales it too, so on a long window the loosening bar approaches
+/// this 5% while the tightening bar approaches `5% × 8 = 40%`, or 16% once a same-direction run
+/// has earned its full discount. Over-delivery below that is never corrected at any window length.
+///
+/// That gap is the asymmetric dead zone, and it is deliberate: it is where the controller's
+/// settled offset comes from. The offset is recorded at −6.12% in simulation and −6.96% on
+/// hardware, comfortably inside the band, and it is load-bearing rather than an error — it parks
+/// the excursion band below the level at which a switch-miner leaves. Widening this constant or
+/// narrowing the multiplier moves the dead zone and therefore moves the offset.
 const MIN_THRESHOLD_FRACTION: f64 = 0.05;
 
 /// Deviation required after one minute of observation, as a fraction, on the dense branch.
@@ -77,6 +89,27 @@ const REFERENCE_SPM: f64 = 30.0;
 /// August 2017 and was replaced within months. The mechanism is not safe in general; it is safe
 /// under this accounting.
 const TIGHTEN_MULTIPLIER: f64 = 8.0;
+
+/// How much the threshold relaxes per extra observation pointing the same way, as a fraction.
+///
+/// A deviation that keeps appearing in the same direction is different evidence from one that
+/// flickers: a shortfall seen five evaluations running is more likely real than five coincidences,
+/// while noise changes sign and earns nothing. So the bar comes down as the direction repeats, and
+/// resets the moment it reverses.
+const DIRECTION_DISCOUNT_PER_OBSERVATION: f64 = 0.06;
+
+/// Ceiling on the accumulated same-direction discount, as a fraction.
+///
+/// Without a ceiling a long run would drive the threshold to zero and the controller would act on
+/// noise indefinitely.
+const MAX_DIRECTION_DISCOUNT: f64 = 0.6;
+
+/// Run length at which the discount reaches [`MAX_DIRECTION_DISCOUNT`].
+///
+/// The stored run is clamped here. Counting past the point where the count changes nothing would
+/// keep state whose value is never read.
+const DIRECTION_RUN_AT_MAX_DISCOUNT: u32 =
+    1 + (MAX_DIRECTION_DISCOUNT / DIRECTION_DISCOUNT_PER_OBSERVATION) as u32;
 
 /// Time constant of the EWMA estimator, in seconds.
 ///
@@ -131,6 +164,10 @@ pub struct VardiffState {
     /// EWMA-smoothed share rate, in shares per minute. Difficulty-relative: it is rescaled on
     /// every retarget by [`VardiffState::rescale_ewma`].
     rate: f64,
+    /// Direction of the last evaluation's move: `+1` tightening, `-1` loosening, `0` unset.
+    last_direction: i8,
+    /// How many consecutive evaluations have moved the same way, counting the current one.
+    consecutive_same_direction: u32,
     /// Whether `rate` holds an observation yet. An unseeded filter takes its first observation
     /// whole rather than blending it against a zero prior, which would start every channel with a
     /// fictitious idle period.
@@ -187,6 +224,8 @@ impl VardiffState {
             clock,
             evidenced_hashrate: 0.0,
             timestamp_of_last_evaluation: timestamp_secs,
+            last_direction: 0,
+            consecutive_same_direction: 0,
             rate: 0.0,
             rate_seeded: false,
         })
@@ -195,6 +234,12 @@ impl VardiffState {
     /// Sets the count of shares since the last update.
     pub fn set_shares_since_last_update(&mut self, shares_since_last_update: u32) {
         self.shares_since_last_update = shares_since_last_update;
+    }
+
+    /// Test-only: the current same-direction run and its recorded direction.
+    #[cfg(test)]
+    pub(crate) fn direction_run(&self) -> (i8, u32) {
+        (self.last_direction, self.consecutive_same_direction)
     }
 
     /// Test-only: the EWMA's smoothed rate, in shares per minute.
@@ -270,6 +315,20 @@ impl VardiffState {
         (realized_share_per_min, h_estimate)
     }
 
+    /// Records this evaluation's direction and returns the length of the current same-direction
+    /// run, counting this evaluation.
+    fn note_direction(&mut self, tightening: bool) -> u32 {
+        let direction: i8 = if tightening { 1 } else { -1 };
+        if direction == self.last_direction {
+            self.consecutive_same_direction =
+                (self.consecutive_same_direction + 1).min(DIRECTION_RUN_AT_MAX_DISCOUNT);
+        } else {
+            self.last_direction = direction;
+            self.consecutive_same_direction = 1;
+        }
+        self.consecutive_same_direction
+    }
+
     /// Smallest deviation worth acting on, as a percentage, given the evidence in this window.
     ///
     /// Replaces a fixed ladder of six rungs whose loosest was 15% after five minutes. That floor
@@ -285,7 +344,13 @@ impl VardiffState {
     ///
     /// Whichever branch sizes it, tightening then requires [`TIGHTEN_MULTIPLIER`] times as much,
     /// because tightening is the direction that can compound.
-    fn threshold(&self, dt_secs: u64, shares_per_minute: f32, tightening: bool) -> f64 {
+    fn threshold(
+        &self,
+        dt_secs: u64,
+        shares_per_minute: f32,
+        tightening: bool,
+        same_direction_run: u32,
+    ) -> f64 {
         let base = if shares_per_minute < SPARSE_SPM_SEAM {
             Self::sparse_threshold(dt_secs, shares_per_minute)
         } else {
@@ -300,11 +365,19 @@ impl VardiffState {
         // `hashrate` describe the same difficulty, which nothing in this signature enforces — and
         // if they disagree, deciding from the rate would apply the extra burden of proof to a
         // loosening move and withhold it from a tightening one, inverting the property.
-        if tightening {
+        let directional = if tightening {
             base * TIGHTEN_MULTIPLIER
         } else {
             base
-        }
+        };
+
+        // Relax in proportion to how long the deviation has pointed this way. Applied to both
+        // directions, because persistence is evidence either way — but note it therefore erodes
+        // the tightening multiplier: at the ceiling an 8x requirement becomes 3.2x.
+        let discount = (DIRECTION_DISCOUNT_PER_OBSERVATION
+            * same_direction_run.saturating_sub(1) as f64)
+            .min(MAX_DIRECTION_DISCOUNT);
+        directional * (1.0 - discount)
     }
 
     /// Sparse branch: widen the threshold by the sampling spread of the expected share count.
@@ -406,6 +479,12 @@ impl Vardiff for VardiffState {
         self.rate = 0.0;
         self.rate_seeded = false;
         self.timestamp_of_last_evaluation = timestamp_secs;
+        // Also clear the same-direction run. A stale count would carry its accumulated discount
+        // into the next cycle and lower the bar on evidence that no longer exists — and because
+        // the discount applies to tightening too, it would erode the very reluctance the previous
+        // patch added.
+        self.last_direction = 0;
+        self.consecutive_same_direction = 0;
         Ok(())
     }
 
@@ -528,8 +607,14 @@ impl Vardiff for VardiffState {
             hashrate,
         );
 
-        let threshold =
-            self.threshold(delta_time, shares_per_minute, estimated_hashrate > hashrate);
+        let tightening = estimated_hashrate > hashrate;
+        let same_direction_run = self.note_direction(tightening);
+        let threshold = self.threshold(
+            delta_time,
+            shares_per_minute,
+            tightening,
+            same_direction_run,
+        );
 
         debug!(
             target: "vardiff",
