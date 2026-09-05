@@ -96,13 +96,13 @@ const TIGHTEN_MULTIPLIER: f64 = 8.0;
 /// flickers: a shortfall seen five evaluations running is more likely real than five coincidences,
 /// while noise changes sign and earns nothing. So the bar comes down as the direction repeats, and
 /// resets the moment it reverses.
-const DIRECTION_DISCOUNT_PER_OBSERVATION: f64 = 0.06;
+pub(crate) const DIRECTION_DISCOUNT_PER_OBSERVATION: f64 = 0.06;
 
 /// Ceiling on the accumulated same-direction discount, as a fraction.
 ///
 /// Without a ceiling a long run would drive the threshold to zero and the controller would act on
 /// noise indefinitely.
-const MAX_DIRECTION_DISCOUNT: f64 = 0.6;
+pub(crate) const MAX_DIRECTION_DISCOUNT: f64 = 0.6;
 
 /// Run length at which the discount reaches [`MAX_DIRECTION_DISCOUNT`].
 ///
@@ -110,6 +110,36 @@ const MAX_DIRECTION_DISCOUNT: f64 = 0.6;
 /// keep state whose value is never read.
 const DIRECTION_RUN_AT_MAX_DISCOUNT: u32 =
     1 + (MAX_DIRECTION_DISCOUNT / DIRECTION_DISCOUNT_PER_OBSERVATION) as u32;
+
+/// Fraction of the gap to the new estimate that a first retarget closes.
+///
+/// A full retarget jumps the belief straight to the estimate. That is the largest move consistent
+/// with the evidence, and on a tick-quantised loop it is slightly too large — the estimate carries
+/// the sampling noise of one window, so moving the whole way transfers that noise into the
+/// difficulty. Moving part of the way keeps most of the correction and leaves the rest to the next
+/// evaluation, which has fresh evidence.
+pub(crate) const STEP_FRACTION_BASE: f32 = 0.2;
+
+/// Extra fraction closed per consecutive retarget in the same direction.
+///
+/// Repeated moves the same way say the partial steps are not keeping up, so the steps grow. A
+/// reversal resets to [`STEP_FRACTION_BASE`], because the direction changing is evidence the previous run had
+/// gone far enough.
+pub(crate) const STEP_FRACTION_GROWTH: f32 = 0.05;
+
+/// Ceiling on the fraction a single retarget may close.
+///
+/// Defensive rather than load-bearing: it takes nine consecutive same-direction retargets to reach,
+/// and the longest run observed in a measured `3x` step response was six, so in that scenario the
+/// ceiling never binds and the effective range is `0.2` to `0.45`.
+pub(crate) const STEP_FRACTION_MAX: f32 = 0.6;
+
+/// Consecutive same-direction retargets at which the step fraction reaches [`STEP_FRACTION_MAX`].
+///
+/// Derived rather than written down, so it cannot drift from the three constants it depends on.
+/// The stored run is clamped here, so it never holds a value that changes nothing.
+const RUN_AT_MAX_STEP_FRACTION: u32 =
+    1 + ((STEP_FRACTION_MAX - STEP_FRACTION_BASE) / STEP_FRACTION_GROWTH) as u32;
 
 /// Time constant of the EWMA estimator, in seconds.
 ///
@@ -166,6 +196,14 @@ pub struct VardiffState {
     rate: f64,
     /// Direction of the last evaluation's move: `+1` tightening, `-1` loosening, `0` unset.
     last_direction: i8,
+    /// Direction of the last *retarget*, as distinct from the last evaluation. Kept separately
+    /// because the two count different events: the threshold discount responds to how long a
+    /// deviation has persisted across evaluations, while the step fraction responds to how many times the
+    /// controller has actually moved the belief the same way. Most evaluations do not retarget, so
+    /// one counter cannot serve both.
+    last_fire_direction: i8,
+    /// Consecutive retargets in the same direction, counting the most recent.
+    consecutive_fires_same_direction: u32,
     /// How many consecutive evaluations have moved the same way, counting the current one.
     consecutive_same_direction: u32,
     /// Whether `rate` holds an observation yet. An unseeded filter takes its first observation
@@ -225,6 +263,8 @@ impl VardiffState {
             evidenced_hashrate: 0.0,
             timestamp_of_last_evaluation: timestamp_secs,
             last_direction: 0,
+            last_fire_direction: 0,
+            consecutive_fires_same_direction: 0,
             consecutive_same_direction: 0,
             rate: 0.0,
             rate_seeded: false,
@@ -240,6 +280,15 @@ impl VardiffState {
     #[cfg(test)]
     pub(crate) fn direction_run(&self) -> (i8, u32) {
         (self.last_direction, self.consecutive_same_direction)
+    }
+
+    /// Test-only: the recorded retarget direction and the length of the current retarget run.
+    #[cfg(test)]
+    pub(crate) fn fire_run(&self) -> (i8, u32) {
+        (
+            self.last_fire_direction,
+            self.consecutive_fires_same_direction,
+        )
     }
 
     /// Test-only: the EWMA's smoothed rate, in shares per minute.
@@ -417,6 +466,42 @@ impl VardiffState {
         (EVIDENCE_AT_ONE_MINUTE * spm_factor / window_minutes + MIN_THRESHOLD_FRACTION) * 100.0
     }
 
+    /// Moves the belief part of the way to the estimate, further on each repeat in one direction.
+    ///
+    /// Returns the new belief. Records the retarget's direction, so a run of same-direction moves
+    /// accelerates and a reversal starts over.
+    fn partial_retarget(&self, estimate: f32, current: f32, fire_run: u32) -> f32 {
+        let step_fraction = (STEP_FRACTION_BASE
+            + STEP_FRACTION_GROWTH * (fire_run.saturating_sub(1)) as f32)
+            .min(STEP_FRACTION_MAX);
+        current + step_fraction * (estimate - current)
+    }
+
+    /// What the retarget run would become if this evaluation's move reaches the wire.
+    ///
+    /// Read-only, and separate from [`VardiffState::commit_fire`] for a reason the step fraction
+    /// depends on. The fraction has to be known *before* the move is computed, but whether the move
+    /// counts as a retarget is only known *after* it has survived the floors and clamps below — an
+    /// evaluation whose whole move is absorbed sends nothing and has not demonstrated that its steps
+    /// are too small. Mutating here would ramp the fraction on moves that never happened: a channel
+    /// pinned at `min_allowed_hashrate` or at the silence floor re-enters this path on every
+    /// evaluation, and the accumulated run would then be spent on the first move that did land.
+    fn prospective_fire_run(&self, tightening: bool) -> u32 {
+        let direction: i8 = if tightening { 1 } else { -1 };
+        if direction == self.last_fire_direction {
+            (self.consecutive_fires_same_direction + 1).min(RUN_AT_MAX_STEP_FRACTION)
+        } else {
+            1
+        }
+    }
+
+    /// Records a retarget that reached the wire, advancing or restarting the run.
+    fn commit_fire(&mut self, tightening: bool) {
+        let direction: i8 = if tightening { 1 } else { -1 };
+        self.last_fire_direction = direction;
+        self.consecutive_fires_same_direction = self.prospective_fire_run(tightening);
+    }
+
     /// Rescales the EWMA after a retarget so its stored rate refers to the new difficulty.
     ///
     /// `rate` counts shares against whatever target was in force when they were found, so it is a
@@ -479,12 +564,15 @@ impl Vardiff for VardiffState {
         self.rate = 0.0;
         self.rate_seeded = false;
         self.timestamp_of_last_evaluation = timestamp_secs;
-        // Also clear the same-direction run. A stale count would carry its accumulated discount
-        // into the next cycle and lower the bar on evidence that no longer exists — and because
-        // the discount applies to tightening too, it would erode the very reluctance the previous
-        // patch added.
+        // Also clear both same-direction runs. A stale count would carry its accumulated discount
+        // into the next cycle and lower the bar on evidence that no longer exists — and because the
+        // discount applies to tightening too, it would erode the very reluctance the asymmetry
+        // provides. The retarget run is cleared for the same reason: a stale one would let the next
+        // move be larger than a first move should be.
         self.last_direction = 0;
         self.consecutive_same_direction = 0;
+        self.last_fire_direction = 0;
+        self.consecutive_fires_same_direction = 0;
         Ok(())
     }
 
@@ -644,6 +732,13 @@ impl Vardiff for VardiffState {
         // When it does fire the displacement floor below bounds the result — the same `9x` the arm
         // was bounded to, so the ceiling is unchanged. What is different until the retarget becomes
         // partial is that the floor is reached in a single evaluation rather than the arm's two.
+        // These multipliers no longer describe the applied move, and this patch is the reason: the
+        // partial retarget below travels only part of the way to whatever this sets, so a `×3`
+        // target becomes a `×1.4` move at [`STEP_FRACTION_BASE`] and `×2.2` at
+        // [`STEP_FRACTION_MAX`]. Tighter than advertised rather than looser, so not a hazard — but
+        // the constants are now misleading, and a bound on the *applied* move would be the right
+        // shape. Left in place because replacing the only limit on upward movement is a change of
+        // its own, and bundling it here would hide it.
         if hashrate_delta_percentage > 1000.0 {
             new_hashrate = match delta_time {
                 dt if dt <= 30 => hashrate * 10.0,
@@ -651,6 +746,12 @@ impl Vardiff for VardiffState {
                 _ => hashrate * 3.0,
             };
         }
+
+        // Move part of the way rather than all of it. The run this reads is *prospective*: it is
+        // what the run becomes if this move reaches the wire, and it is committed below only once
+        // that is known. See `prospective_fire_run` for why the two cannot be one step.
+        let fire_run = self.prospective_fire_run(tightening);
+        new_hashrate = self.partial_retarget(new_hashrate, hashrate, fire_run);
 
         // Bound the ease on absent evidence. Applied as a floor on the value rather than as a gate
         // on the decision, which is what makes the bound exact: a gate lets the step that crosses
@@ -693,6 +794,9 @@ impl Vardiff for VardiffState {
             return Ok(None);
         }
 
+        // Past every floor and clamp, so this move is going out. Only now does it count toward the
+        // run that sizes the next step.
+        self.commit_fire(tightening);
         self.rescale_ewma(new_hashrate, hashrate);
         self.set_timestamp_of_last_update(now);
 

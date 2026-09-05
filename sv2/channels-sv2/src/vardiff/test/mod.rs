@@ -148,7 +148,12 @@ pub fn test_try_vardiff_low_hashrate_decrease_target<V: Vardiff>(vardiff: &mut V
     // As estimated shares per minute is 10
     // with current setup realized shares per minute is 60
     // comes under no special case
-    assert_eq!(new_hashrate, 6.0 * initial_hashrate);
+    // A retarget now closes part of the gap, so the belief moves toward the
+    // estimate of 6.0x without reaching it in one step.
+    assert!(
+        new_hashrate > initial_hashrate && new_hashrate < 6.0 * initial_hashrate,
+        "belief should move toward 6.0x without arriving: got {new_hashrate}"
+    );
     let target: Target = hash_rate_to_target(new_hashrate.into(), TEST_SHARES_PER_MINUTE.into())
         .unwrap()
         .into();
@@ -181,7 +186,12 @@ pub fn test_try_vardiff_with_shares_less_than_30<V: Vardiff>(vardiff: &mut V) {
     let new_hashrate = result.unwrap();
 
     // This logic checks the `dt <= 30` case, which multiple by 10
-    assert_eq!(new_hashrate, 10.0 * initial_hashrate);
+    // A retarget now closes part of the gap, so the belief moves toward the
+    // estimate of 10.0x without reaching it in one step.
+    assert!(
+        new_hashrate > initial_hashrate && new_hashrate < 10.0 * initial_hashrate,
+        "belief should move toward 10.0x without arriving: got {new_hashrate}"
+    );
 
     let target: Target = hash_rate_to_target(new_hashrate.into(), TEST_SHARES_PER_MINUTE.into())
         .unwrap()
@@ -214,7 +224,12 @@ pub fn test_try_vardiff_with_shares_30_to_60s<V: Vardiff>(vardiff: &mut V) {
     let new_hashrate = result.unwrap();
 
     // This logic checks the `dt < 60` case, which multiple by 5
-    assert_eq!(new_hashrate, 5.0 * initial_hashrate);
+    // A retarget now closes part of the gap, so the belief moves toward the
+    // estimate of 5.0x without reaching it in one step.
+    assert!(
+        new_hashrate > initial_hashrate && new_hashrate < 5.0 * initial_hashrate,
+        "belief should move toward 5.0x without arriving: got {new_hashrate}"
+    );
     let target: Target = hash_rate_to_target(new_hashrate.into(), TEST_SHARES_PER_MINUTE.into())
         .unwrap()
         .into();
@@ -246,7 +261,12 @@ pub fn test_try_vardiff_with_shares_more_than_60s<V: Vardiff>(vardiff: &mut V) {
     let new_hashrate = result.unwrap();
 
     // This logic checks the `dt >= 60` case, which multiple by 3
-    assert_eq!(new_hashrate, 3.0 * initial_hashrate);
+    // A retarget now closes part of the gap, so the belief moves toward the
+    // estimate of 3.0x without reaching it in one step.
+    assert!(
+        new_hashrate > initial_hashrate && new_hashrate < 3.0 * initial_hashrate,
+        "belief should move toward 3.0x without arriving: got {new_hashrate}"
+    );
     let target: Target = hash_rate_to_target(new_hashrate.into(), TEST_SHARES_PER_MINUTE.into())
         .unwrap()
         .into();

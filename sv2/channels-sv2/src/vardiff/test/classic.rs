@@ -12,6 +12,10 @@ use super::{
     test_try_vardiff_with_less_spm_than_expected, test_try_vardiff_with_shares_30_to_60s,
     test_try_vardiff_with_shares_less_than_30, test_try_vardiff_with_shares_more_than_60s, Vardiff,
 };
+use crate::vardiff::classic::{
+    DIRECTION_DISCOUNT_PER_OBSERVATION, MAX_DIRECTION_DISCOUNT, STEP_FRACTION_BASE,
+    STEP_FRACTION_GROWTH, STEP_FRACTION_MAX,
+};
 
 fn new_test_vardiff_state() -> Result<VardiffState, VardiffError> {
     VardiffState::new_with_min(TEST_MIN_ALLOWED_HASHRATE)
@@ -83,25 +87,31 @@ fn test_try_vardiff_hashrate_clamps_to_minimum() {
     let mut vardiff = VardiffState::new_with_min(TEST_MIN_ALLOWED_HASHRATE)
         .expect("Failed to create VardiffState");
 
-    // Long enough that a zero estimate is worth acting on. A 16-second window was enough under
-    // the fixed ladder, whose top rung fired on any 100% deviation regardless of window length;
-    // the threshold now asks for roughly 570% at that length, and rightly refuses.
-    let simulation_duration_secs = 300;
-    simulate_shares_and_wait(&mut vardiff, 0, simulation_duration_secs);
+    // Two changes from the original form of this test, both consequences of earlier patches. The
+    // window is 300 seconds rather than 16, because the threshold is sized from the evidence and a
+    // 16-second window does not justify acting. And it takes several evaluations rather than one,
+    // because a retarget now closes part of the gap rather than all of it.
+    let mut belief = hashrate;
+    let mut acted = 0;
+    for _ in 0..40 {
+        simulate_shares_and_wait(&mut vardiff, 0, 300);
+        if let Some(updated) = vardiff
+            .try_vardiff(belief, &target, TEST_SHARES_PER_MINUTE)
+            .expect("try_vardiff failed")
+        {
+            assert!(
+                updated >= TEST_MIN_ALLOWED_HASHRATE,
+                "the floor must never be crossed: got {updated}"
+            );
+            belief = updated;
+            acted += 1;
+        }
+    }
 
-    let result = vardiff
-        .try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE)
-        .expect("try_vardiff failed");
-    assert!(result.is_some(), "Hashrate should update");
-    let new_hashrate = result.unwrap();
-
+    assert!(acted > 0, "a silent channel should have been acted on");
     assert_eq!(
-        new_hashrate, TEST_MIN_ALLOWED_HASHRATE,
-        "Hashrate should be clamped to minimum"
-    );
-    assert_eq!(
-        new_hashrate, TEST_MIN_ALLOWED_HASHRATE,
-        "Stored hashrate should be clamped"
+        belief, TEST_MIN_ALLOWED_HASHRATE,
+        "sustained silence should settle exactly at the floor"
     );
     assert_eq!(vardiff.shares_since_last_update(), 0);
 }
@@ -673,4 +683,119 @@ fn test_the_discount_brings_a_persistent_deviation_forward() {
         "a persistent 40% shortfall should first retarget at evaluation 6; without the run discount \
          the same deviation waits until 8"
     );
+}
+
+/// Consecutive retargets in one direction close a larger share of the gap each time.
+///
+/// Observable without instrumentation on a silent channel: the estimate is zero, so the fraction of
+/// the gap a step closes is just `(before − after) / before`. It should walk up from
+/// `STEP_FRACTION_BASE` by `STEP_FRACTION_GROWTH` per consecutive move, and a reversal should return it to the base.
+///
+/// This is the mechanism's whole content. Its cost is measured separately and is substantial —
+/// convergence on a genuine threefold rise takes roughly five times as many evaluations as a full
+/// retarget — which is why the acceleration exists at all: without it every step would close only
+/// `STEP_FRACTION_BASE`.
+#[test]
+fn test_consecutive_retargets_close_a_growing_share_of_the_gap() {
+    let mut vardiff = new_test_vardiff_state().expect("Failed to create VardiffState");
+    let mut belief = TEST_INITIAL_HASHRATE;
+    let target =
+        hash_rate_to_target(belief.into(), TEST_SHARES_PER_MINUTE.into()).expect("valid target");
+
+    let mut fractions = Vec::new();
+    for _ in 0..5 {
+        simulate_shares_and_wait(&mut vardiff, 0, 300);
+        let before = belief;
+        let Some(after) = vardiff
+            .try_vardiff(belief, &target, TEST_SHARES_PER_MINUTE)
+            .expect("try_vardiff failed")
+        else {
+            break;
+        };
+        // The estimate on a silent channel is zero, so the gap is `before` itself.
+        fractions.push((before - after) / before);
+        belief = after;
+    }
+
+    assert!(
+        fractions.len() >= 3,
+        "expected at least three retargets to compare, got {}",
+        fractions.len()
+    );
+    assert!(
+        (fractions[0] - 0.2).abs() < 1e-4,
+        "a first move should close STEP_FRACTION_BASE of the gap, closed {}",
+        fractions[0]
+    );
+    for pair in fractions.windows(2) {
+        assert!(
+            pair[1] > pair[0],
+            "each consecutive move should close more than the last: {pair:?}"
+        );
+        assert!(
+            (pair[1] - pair[0] - 0.05).abs() < 1e-4,
+            "the step should grow by STEP_FRACTION_GROWTH: {pair:?}"
+        );
+    }
+}
+
+/// Both accumulating mechanisms can actually reach their stated ceilings.
+///
+/// Each clamps its run length at a point derived by dividing two float constants and truncating,
+/// so whether the ceiling is reachable depends on which side of an integer boundary the division
+/// lands. It currently lands correctly for both — the step fraction saturates at a run of 9 and the
+/// threshold discount at 11 — but that is a property of the constants' float representation rather
+/// than of the arithmetic, and changing any of them could move it by one without any other test
+/// noticing. Guarded here so that would fail loudly instead.
+#[test]
+fn test_accumulating_ceilings_are_reachable() {
+    let step_run = 1u32 + ((STEP_FRACTION_MAX - STEP_FRACTION_BASE) / STEP_FRACTION_GROWTH) as u32;
+    let step_at_run = STEP_FRACTION_BASE + STEP_FRACTION_GROWTH * (step_run - 1) as f32;
+    assert!(
+        step_at_run >= STEP_FRACTION_MAX,
+        "a run of {step_run} reaches only {step_at_run}, so STEP_FRACTION_MAX of \
+         {STEP_FRACTION_MAX} is unreachable — the derived clamp is short by one"
+    );
+
+    let discount_run = 1u32 + (MAX_DIRECTION_DISCOUNT / DIRECTION_DISCOUNT_PER_OBSERVATION) as u32;
+    let discount_at_run = DIRECTION_DISCOUNT_PER_OBSERVATION * (discount_run - 1) as f64;
+    assert!(
+        discount_at_run >= MAX_DIRECTION_DISCOUNT,
+        "a run of {discount_run} reaches only {discount_at_run}, so MAX_DIRECTION_DISCOUNT of \
+         {MAX_DIRECTION_DISCOUNT} is unreachable — the derived clamp is short by one"
+    );
+}
+
+// The retarget run must count moves that reach the wire, not evaluations that enter the fire path.
+// A belief already at `min_allowed_hashrate` clears the threshold on every silent evaluation — the
+// deviation is 100% — computes an ease, has all of it absorbed by the clamp, and returns `Ok(None)`
+// with nothing sent. Those must not advance the run, because the run sizes the next step and an
+// evaluation that moved nothing has not shown its steps are too small.
+#[test]
+fn test_absorbed_evaluations_do_not_advance_the_retarget_run() {
+    use crate::vardiff::clock::MockClock;
+    use std::sync::Arc;
+
+    let clock = Arc::new(MockClock::new(0));
+    let mut vardiff = VardiffState::new_with_clock(1_000.0, clock.clone()).expect("state");
+    let belief = 1_000.0_f32; // exactly the floor, so every ease is absorbed whole
+    let target =
+        hash_rate_to_target(belief.into(), TEST_SHARES_PER_MINUTE.into()).expect("valid target");
+
+    for evaluation in 1..=6 {
+        clock.advance(61);
+        let outcome = vardiff
+            .try_vardiff(belief, &target, TEST_SHARES_PER_MINUTE)
+            .expect("try_vardiff failed");
+        assert!(
+            outcome.is_none(),
+            "evaluation {evaluation} should send nothing: the belief is already at the floor"
+        );
+        assert_eq!(
+            vardiff.fire_run(),
+            (0, 0),
+            "evaluation {evaluation} sent nothing but advanced the retarget run, so the next real \
+             move would close a larger share of the gap than a first move should"
+        );
+    }
 }
