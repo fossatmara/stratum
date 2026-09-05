@@ -141,6 +141,45 @@ pub(crate) const STEP_FRACTION_MAX: f32 = 0.6;
 const RUN_AT_MAX_STEP_FRACTION: u32 =
     1 + ((STEP_FRACTION_MAX - STEP_FRACTION_BASE) / STEP_FRACTION_GROWTH) as u32;
 
+/// Most one evaluation may multiply or divide the believed hashrate by.
+///
+/// One window of evidence should not be able to move the belief arbitrarily far, in either
+/// direction, however large the deviation it reports.
+///
+/// Replaces a one-sided special case that multiplied by 10, 5 or 3 according to which of three
+/// elapsed-time buckets the window fell in. Two shapes were wrong there. Bucketing by elapsed time
+/// duplicated what the threshold already does with the window — a short window is already held to a
+/// higher evidence bar, so widening its permitted step pulls against that. And the factor applied
+/// to the *pre-move* estimate rather than to the move made, so once retargets became partial the
+/// documented factor was never the factor applied.
+///
+/// `2.0` is not uniformly tighter than what it replaces, and the comparison worth making is a
+/// trajectory rather than a pair of constants. Measured against a source whose share rate does not
+/// respond to the target, the buckets applied steps anywhere from `×1.40` to `×6.40` depending on
+/// window length and how far a same-direction run had grown the step fraction; this bound applies
+/// `×2.00` on every fire. So it is looser than the buckets at the start of a long-window run and
+/// tighter everywhere else.
+///
+/// Sixty evaluations against that source, `k` being the multiple of the target rate delivered:
+///
+/// | source            | buckets     | this bound  |
+/// |-------------------|-------------|-------------|
+/// | `k=20`, 61 s      | `3.2e26×`   | `5.8e17×`   |
+/// | `k=20`, 29 s      | `3.3e20×`   | `1.1e12×`   |
+/// | `k=100`, 61 s     | `5.2e19×`   | `1.2e18×`   |
+/// | `k=100`, 29 s     | `6.5e31×`   | `1.2e18×`   |
+///
+/// The gain is not monotone in intensity, and quoting one figure for it would mislead: it is
+/// fourteen orders of magnitude at the worst bucket case and only `46×` at `k=100` with 61-second
+/// windows. What the bound does buy unconditionally is that the displacement no longer depends on
+/// the source at all — every row above is `2^60` once the bound binds.
+///
+/// This bounds the *rate* at which such a climb proceeds. It does not stop one — a bound on step
+/// size cannot, because each step is individually warranted by the evidence in front of it.
+/// Recognising that raising the difficulty is not reducing the share rate is a separate mechanism,
+/// and is not attempted here.
+const MAX_STEP_RATIO: f32 = 2.0;
+
 /// Time constant of the EWMA estimator, in seconds.
 ///
 /// Old evidence decays on the clock at `e^(−Δt/tau)`, which is what makes the window unable to
@@ -729,29 +768,27 @@ impl Vardiff for VardiffState {
         // at a 61-second window, a zero-share evaluation fires for `6 <= spm < 12.4` and nowhere
         // else, a band that contains this crate's own test rate of 10.
         //
-        // When it does fire the displacement floor below bounds the result — the same `9x` the arm
-        // was bounded to, so the ceiling is unchanged. What is different until the retarget becomes
-        // partial is that the floor is reached in a single evaluation rather than the arm's two.
-        // These multipliers no longer describe the applied move, and this patch is the reason: the
-        // partial retarget below travels only part of the way to whatever this sets, so a `×3`
-        // target becomes a `×1.4` move at [`STEP_FRACTION_BASE`] and `×2.2` at
-        // [`STEP_FRACTION_MAX`]. Tighter than advertised rather than looser, so not a hazard — but
-        // the constants are now misleading, and a bound on the *applied* move would be the right
-        // shape. Left in place because replacing the only limit on upward movement is a change of
-        // its own, and bundling it here would hide it.
-        if hashrate_delta_percentage > 1000.0 {
-            new_hashrate = match delta_time {
-                dt if dt <= 30 => hashrate * 10.0,
-                dt if dt < 60 => hashrate * 5.0,
-                _ => hashrate * 3.0,
-            };
-        }
-
+        // When it does fire, `MAX_STEP_RATIO` bounds the single step and the displacement floor
+        // below still pins where the descent settles — the same `9x` the arm was bounded to.
         // Move part of the way rather than all of it. The run this reads is *prospective*: it is
         // what the run becomes if this move reaches the wire, and it is committed below only once
         // that is known. See `prospective_fire_run` for why the two cannot be one step.
         let fire_run = self.prospective_fire_run(tightening);
         new_hashrate = self.partial_retarget(new_hashrate, hashrate, fire_run);
+
+        // Bound the move itself, in both directions. One window of evidence does not warrant an
+        // unbounded change of belief, however large the deviation it reports.
+        let bounded = new_hashrate.clamp(hashrate / MAX_STEP_RATIO, hashrate * MAX_STEP_RATIO);
+        if bounded != new_hashrate {
+            debug!(
+                target: "vardiff",
+                "Move bounded to {:.0}x per evaluation: {:.2} -> {:.2} H/s",
+                MAX_STEP_RATIO,
+                new_hashrate,
+                bounded,
+            );
+            new_hashrate = bounded;
+        }
 
         // Bound the ease on absent evidence. Applied as a floor on the value rather than as a gate
         // on the decision, which is what makes the bound exact: a gate lets the step that crosses

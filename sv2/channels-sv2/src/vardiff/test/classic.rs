@@ -799,3 +799,91 @@ fn test_absorbed_evaluations_do_not_advance_the_retarget_run() {
         );
     }
 }
+
+// No single evaluation may move the belief more than [`MAX_STEP_RATIO`], in either direction.
+// Sustained rather than one window, because the downward bound only binds once a same-direction run
+// has grown the step fraction: a first move travels 20% of the gap, which cannot halve the belief.
+#[test]
+fn test_no_evaluation_moves_the_belief_past_the_step_bound() {
+    for (label, delivered) in [
+        (
+            "a hundredfold burst",
+            (TEST_SHARES_PER_MINUTE * 100.0) as u32,
+        ),
+        ("a collapse to near nothing", 1),
+    ] {
+        let mut vardiff = new_test_vardiff_state().expect("Failed to create VardiffState");
+        let mut hashrate = TEST_INITIAL_HASHRATE;
+        let mut widest = 1.0_f32;
+
+        for _ in 0..40 {
+            let target = hash_rate_to_target(hashrate.into(), TEST_SHARES_PER_MINUTE.into())
+                .expect("valid target");
+            simulate_shares_and_wait(&mut vardiff, delivered, 61);
+            if let Ok(Some(updated)) =
+                vardiff.try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE)
+            {
+                let ratio = updated / hashrate;
+                widest = widest.max(if ratio >= 1.0 { ratio } else { 1.0 / ratio });
+                hashrate = updated;
+            }
+        }
+
+        // Literal rather than derived from `MAX_STEP_RATIO`, matching the silence bound's test: a
+        // derived expectation moves with the constant and would assert nothing, and this way the
+        // test also fails against the buckets this replaces, whose widest observed step was 6.4x.
+        assert!(
+            widest <= 2.0 + 1e-3,
+            "{label}: an evaluation moved the belief {widest:.2}x, outside the 2x bound"
+        );
+    }
+}
+
+// The step bound is the one mechanism in this controller that could quietly slow the response to a
+// genuine decline, which is what the decline-safety gate measures. It must not reach that far: a
+// halved hashrate puts the estimate at half the belief, and a partial move toward it is nowhere
+// near a halving of the difficulty. Asserted rather than reasoned, because the margin depends on
+// three constants that later work may move.
+#[test]
+fn test_the_step_bound_does_not_slow_the_response_to_a_decline() {
+    for (label, surviving_fraction) in [("half", 0.5_f32), ("a tenth", 0.1), ("a hundredth", 0.01)]
+    {
+        let mut vardiff = new_test_vardiff_state().expect("Failed to create VardiffState");
+        let mut hashrate = TEST_INITIAL_HASHRATE;
+
+        // Settle first: an on-target half hour, so the decline starts from a converged belief.
+        for _ in 0..30 {
+            let target = hash_rate_to_target(hashrate.into(), TEST_SHARES_PER_MINUTE.into())
+                .expect("valid target");
+            simulate_shares_and_wait(&mut vardiff, TEST_SHARES_PER_MINUTE as u32, 61);
+            if let Ok(Some(updated)) =
+                vardiff.try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE)
+            {
+                hashrate = updated;
+            }
+        }
+
+        // The gate's observation window: two hours at the reduced rate.
+        let delivered = (TEST_SHARES_PER_MINUTE * surviving_fraction).round() as u32;
+        let mut widest = 1.0_f32;
+        for _ in 0..120 {
+            let target = hash_rate_to_target(hashrate.into(), TEST_SHARES_PER_MINUTE.into())
+                .expect("valid target");
+            simulate_shares_and_wait(&mut vardiff, delivered, 61);
+            if let Ok(Some(updated)) =
+                vardiff.try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE)
+            {
+                let ratio = updated / hashrate;
+                widest = widest.max(if ratio >= 1.0 { ratio } else { 1.0 / ratio });
+                hashrate = updated;
+            }
+        }
+
+        assert!(
+            widest < 2.0,
+            "a decline to {label} of the rate moved the belief {widest:.2}x in one evaluation, \
+             reaching the 2x step bound — the bound is now shaping decline response, which the \
+             decline-safety gate measures"
+        );
+    }
+}
