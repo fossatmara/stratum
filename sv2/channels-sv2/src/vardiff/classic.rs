@@ -23,7 +23,12 @@ const DEFAULT_MIN_HASHRATE: f32 = 1.0;
 /// rejected alternatives are in the commit that introduced this constant.
 const MAX_CONSECUTIVE_SILENT_EASES: u8 = 2;
 
-use super::{error::VardiffError, Vardiff};
+use super::{
+    clock::{Clock, SystemClock},
+    error::VardiffError,
+    Vardiff,
+};
+use std::sync::Arc;
 
 /// Represents the dynamic state for a variable difficulty (Vardiff) connection.
 ///
@@ -44,6 +49,11 @@ pub struct VardiffState {
     pub timestamp_of_last_update: u64,
     /// The lowest hashrate (H/s) the system will allow; values below this are clamped.
     pub min_allowed_hashrate: f32,
+    /// Source of "current time". Defaults to [`SystemClock`], so production behaviour is
+    /// unchanged; tests substitute a [`MockClock`] to drive elapsed time explicitly.
+    ///
+    /// [`MockClock`]: super::clock::MockClock
+    clock: Arc<dyn Clock>,
     /// Consecutive zero-share eases applied to the difficulty; any share clears it.
     /// See [`MAX_CONSECUTIVE_SILENT_EASES`].
     silent_eases: u8,
@@ -65,9 +75,25 @@ impl VardiffState {
     ///   value is meaningless as a floor (and would reintroduce the division-by-zero that
     ///   [`Vardiff::try_vardiff`] guards against), so it falls back to the default.
     pub fn new_with_min(min_allowed_hashrate: f32) -> Result<Self, VardiffError> {
-        let timestamp_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs();
+        Self::new_with_clock(min_allowed_hashrate, Arc::new(SystemClock))
+    }
+
+    /// Creates a new `VardiffState` reading time from `clock`.
+    ///
+    /// The controller's behaviour is a function of elapsed time — which window has passed, how
+    /// long a channel has been silent, how many evaluations have gone by without acting — so
+    /// testing it means controlling the clock rather than waiting on one. [`VardiffState::new`]
+    /// and [`VardiffState::new_with_min`] supply [`SystemClock`] and behave exactly as before.
+    ///
+    /// # Arguments
+    /// * `min_allowed_hashrate` - As [`VardiffState::new_with_min`].
+    /// * `clock` - Time source. Shared, because the algorithm reads it while a test driver
+    ///   advances it.
+    pub fn new_with_clock(
+        min_allowed_hashrate: f32,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self, VardiffError> {
+        let timestamp_secs = clock.now_secs()?;
 
         let min_allowed_hashrate = if min_allowed_hashrate.is_finite() && min_allowed_hashrate > 0.0
         {
@@ -81,6 +107,7 @@ impl VardiffState {
             timestamp_of_last_update: timestamp_secs,
             min_allowed_hashrate,
             silent_eases: 0,
+            clock,
         })
     }
 
@@ -115,9 +142,7 @@ impl Vardiff for VardiffState {
 
     /// Resets the share counter and updates the timestamp to now.
     fn reset_counter(&mut self) -> Result<(), VardiffError> {
-        let timestamp_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs();
+        let timestamp_secs = self.clock.now_secs()?;
         self.set_timestamp_of_last_update(timestamp_secs);
         self.set_shares_since_last_update(0);
         Ok(())
@@ -138,10 +163,7 @@ impl Vardiff for VardiffState {
         target: &Target,
         shares_per_minute: f32,
     ) -> Result<Option<f32>, VardiffError> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(VardiffError::TimeError)?
-            .as_secs();
+        let now = self.clock.now_secs()?;
 
         let delta_time = match now.checked_sub(self.timestamp_of_last_update) {
             Some(delta_time) => delta_time,

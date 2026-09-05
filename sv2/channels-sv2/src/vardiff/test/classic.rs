@@ -253,3 +253,68 @@ fn test_share_activity_clears_the_silence_budget() {
         "activity did not clear the silence budget: {eased:?}"
     );
 }
+
+/// How long a decline goes unnoticed on a channel that has not retargeted for an hour.
+///
+/// Documents shipped behaviour, not desired behaviour. The estimator averages every share since
+/// the last retarget, and the window is cleared only by a retarget, so it grows for exactly as
+/// long as the controller declines to act. An hour of healthy history then swamps a fresh
+/// decline: the miner drops to a tenth of its rate and **thirteen** evaluations pass before the
+/// deviation clears the lowest rung of the threshold ladder.
+///
+/// Only reachable with a controllable clock. `simulate_shares_and_wait` re-anchors the window on
+/// every call, so it can express "the window is an hour long" but not "an hour arrived as sixty
+/// separate evaluations" — and the second is what grows the window. That is why this test needs
+/// [`MockClock`] and why the clock is injectable.
+///
+/// [`MockClock`]: crate::vardiff::clock::MockClock
+#[test]
+fn test_long_window_delays_decline_detection() {
+    use crate::vardiff::clock::MockClock;
+    use std::sync::Arc;
+
+    let clock = Arc::new(MockClock::new(1_000_000));
+    let mut vardiff = VardiffState::new_with_clock(TEST_MIN_ALLOWED_HASHRATE, clock.clone())
+        .expect("Failed to create VardiffState");
+    let hashrate = TEST_INITIAL_HASHRATE;
+    let target =
+        hash_rate_to_target(hashrate.into(), TEST_SHARES_PER_MINUTE.into()).expect("valid target");
+
+    // An hour of delivery exactly on target. Nothing retargets, so the window reaches an hour.
+    for evaluation in 1..=60 {
+        for _ in 0..TEST_SHARES_PER_MINUTE as u32 {
+            vardiff.increment_shares_since_last_update();
+        }
+        clock.advance(60);
+        let outcome = vardiff
+            .try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE)
+            .expect("try_vardiff failed");
+        assert!(
+            outcome.is_none(),
+            "on-target delivery should not retarget (evaluation {evaluation})"
+        );
+    }
+
+    // The miner collapses to a tenth of its rate and stays there.
+    let mut evaluations_to_react = 0;
+    loop {
+        evaluations_to_react += 1;
+        vardiff.increment_shares_since_last_update();
+        clock.advance(60);
+        let outcome = vardiff
+            .try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE)
+            .expect("try_vardiff failed");
+        if outcome.is_some() || evaluations_to_react > 60 {
+            break;
+        }
+    }
+
+    assert!(
+        evaluations_to_react > 10,
+        "a decline on an hour-old window should go unnoticed for many evaluations, took {evaluations_to_react}"
+    );
+    assert_eq!(
+        evaluations_to_react, 13,
+        "shipped behaviour is 13 evaluations; a change here is a change in reaction time"
+    );
+}
