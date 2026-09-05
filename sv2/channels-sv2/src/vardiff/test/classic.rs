@@ -7,9 +7,7 @@ use crate::{target::hash_rate_to_target, vardiff::VardiffError, VardiffState};
 
 use super::{
     test_backwards_clock_step_reanchors_window, test_increment_and_reset_shares,
-    test_try_vardiff_low_hashrate_decrease_target, test_try_vardiff_no_shares_30_to_60s_decrease,
-    test_try_vardiff_no_shares_less_than_30s_decrease,
-    test_try_vardiff_no_shares_more_than_60s_decrease,
+    test_try_vardiff_low_hashrate_decrease_target,
     test_try_vardiff_stable_hashrate_minimal_change_or_no_change,
     test_try_vardiff_with_less_spm_than_expected, test_try_vardiff_with_shares_30_to_60s,
     test_try_vardiff_with_shares_less_than_30, test_try_vardiff_with_shares_more_than_60s, Vardiff,
@@ -70,24 +68,6 @@ pub fn test_try_vardiff_with_shares_more_than_60s_classic() {
 }
 
 #[test]
-pub fn test_try_vardiff_no_shares_30_to_60s_decrease_classic() {
-    let mut vardiff = new_test_vardiff_state().expect("Failed to create VardiffState");
-    test_try_vardiff_no_shares_30_to_60s_decrease(&mut vardiff);
-}
-
-#[test]
-pub fn test_try_vardiff_no_shares_more_than_60s_decrease_classic() {
-    let mut vardiff = new_test_vardiff_state().expect("Failed to create VardiffState");
-    test_try_vardiff_no_shares_more_than_60s_decrease(&mut vardiff);
-}
-
-#[test]
-pub fn test_try_vardiff_no_shares_less_than_30s_decrease_classic() {
-    let mut vardiff = new_test_vardiff_state().expect("Failed to create VardiffState");
-    test_try_vardiff_no_shares_less_than_30s_decrease(&mut vardiff);
-}
-
-#[test]
 fn test_try_vardiff_with_less_spm_than_expected_classic() {
     let mut vardiff = new_test_vardiff_state().expect("Failed to create VardiffState");
     test_try_vardiff_with_less_spm_than_expected(&mut vardiff);
@@ -103,7 +83,10 @@ fn test_try_vardiff_hashrate_clamps_to_minimum() {
     let mut vardiff = VardiffState::new_with_min(TEST_MIN_ALLOWED_HASHRATE)
         .expect("Failed to create VardiffState");
 
-    let simulation_duration_secs = 16;
+    // Long enough that a zero estimate is worth acting on. A 16-second window was enough under
+    // the fixed ladder, whose top rung fired on any 100% deviation regardless of window length;
+    // the threshold now asks for roughly 570% at that length, and rightly refuses.
+    let simulation_duration_secs = 300;
     simulate_shares_and_wait(&mut vardiff, 0, simulation_duration_secs);
 
     let result = vardiff
@@ -190,10 +173,10 @@ fn test_new_with_min_rejects_unusable_floor() {
     }
 }
 
-// A fully-silent channel must not be eased all the way to the floor. The zero-share path removes
-// up to `÷3` per evaluation with nothing bounding how many times it runs, so displacement after
-// `n` silent evaluations is `3ⁿ`. A returning miner is then served a difficulty that much too easy
-// and floods shares until vardiff climbs back.
+// A fully-silent channel must not be eased all the way to the floor. Unbounded, each silent
+// evaluation eases again with nothing limiting how many times it runs, so displacement compounds
+// without limit. A returning miner is then served a difficulty that much too easy and floods shares
+// until vardiff climbs back.
 #[test]
 fn test_silent_channel_ease_displacement_is_bounded() {
     let mut vardiff = new_test_vardiff_state().expect("Failed to create VardiffState");
@@ -210,10 +193,10 @@ fn test_silent_channel_ease_displacement_is_bounded() {
         }
     }
 
-    // Displacement must settle at `3² = 9×`, the bound `MAX_CONSECUTIVE_SILENT_EASES = 2` sets.
-    // Written as a literal rather than derived from that constant deliberately: a derived
-    // expectation moves with the constant and would assert nothing, and this way the test also
-    // compiles and fails against a tree without the bound at all.
+    // Displacement must settle at the `9×` that MAX_SILENT_DISPLACEMENT sets. Written as a literal
+    // rather than derived from that constant deliberately: a derived expectation moves with the
+    // constant and would assert nothing, and this way the test also compiles and fails against a
+    // tree without the bound at all.
     let expected = TEST_INITIAL_HASHRATE / 9.0;
     assert!(
         (hashrate / expected - 1.0).abs() < 1e-3,
@@ -290,6 +273,8 @@ fn test_share_activity_rearms_the_silence_bound() {
 /// evaluation clock independently of the retarget clock.
 ///
 /// The intervals below are chosen to stay under the decision boundary, so no retarget intervenes.
+/// They are shorter than they once were because the boundary is now sized from the evidence: at
+/// this share rate a 180-second gap clears it, where the old fixed ladder would not have fired.
 /// That matters: on a retarget `rescale_ewma` re-expresses the rate against the new difficulty, so
 /// the stored rate returns to roughly its pre-decay value — correct, but it hides the decay from
 /// an observer reading the rate afterwards.
@@ -316,46 +301,46 @@ fn test_estimator_forgets_on_the_clock() {
         "seeding should take the first observation whole, got {seeded}"
     );
 
-    // Half a time constant of silence discards `1 − e^(−1/2)` of the stored rate.
-    simulate_shares_and_wait(&mut single, 0, 180);
+    // A quarter of a time constant of silence discards `1 − e^(−1/4)` of the stored rate.
+    simulate_shares_and_wait(&mut single, 0, 90);
     let fired = single
         .try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE)
         .expect("try_vardiff failed");
-    assert!(fired.is_none(), "a 180s gap should stay under the boundary");
-    let expected = seeded * (-0.5f64).exp();
+    assert!(fired.is_none(), "a 90s gap should stay under the boundary");
+    let expected = seeded * (-0.25f64).exp();
     let decayed = single.ewma_rate();
     assert!(
         (decayed / expected - 1.0).abs() < 1e-3,
-        "after half a tau the rate should be {expected}, got {decayed}"
+        "after a quarter of a tau the rate should be {expected}, got {decayed}"
     );
 
-    // Decay tracks elapsed time, not the number of evaluations: two quarter-tau gaps must land
-    // where one half-tau gap did. A per-evaluation constant would forget twice as much here, which
+    // Decay tracks elapsed time, not the number of evaluations: two eighth-tau gaps must land
+    // where one quarter-tau gap did. A per-evaluation constant would forget twice as much here, which
     // is how an irregular cadence silently changes a filter's memory.
     let mut split = new_test_vardiff_state().expect("Failed to create VardiffState");
     seed(&mut split);
     for _ in 0..2 {
-        simulate_shares_and_wait(&mut split, 0, 90);
+        simulate_shares_and_wait(&mut split, 0, 45);
         let fired = split
             .try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE)
             .expect("try_vardiff failed");
-        assert!(fired.is_none(), "a 90s gap should stay under the boundary");
+        assert!(fired.is_none(), "a 45s gap should stay under the boundary");
     }
     assert!(
         (split.ewma_rate() / decayed - 1.0).abs() < 1e-3,
-        "two quarter-tau gaps ({}) should decay the same as one half-tau ({decayed})",
+        "two eighth-tau gaps ({}) should decay the same as one quarter-tau ({decayed})",
         split.ewma_rate()
     );
 }
 
 /// A decline is detected in the same few evaluations whatever the channel's age.
 ///
-/// This is the patch's headline claim, end to end. The previous estimator averaged every share
-/// since the last retarget and cleared that window only on a retarget, so the window grew for
-/// exactly as long as the controller declined to act, and an hour of healthy history swamped a
-/// fresh decline. Against the same scenario it took **thirteen** evaluations to react; the
-/// clock-decayed average takes **two**, because evidence ages whether or not the controller
-/// fires.
+/// The same scenario across the series: an hour of on-target delivery over sixty non-retargeting
+/// evaluations, then the miner drops to a tenth of its rate. The fixed ladder over a cumulative
+/// window took **thirteen** evaluations to react. The clock-decayed average took **two**, because
+/// evidence ages whether or not the controller fires. Sizing the threshold from the evidence takes
+/// it to **one**: after an hour the window holds enough observation that a tenfold shortfall clears
+/// the bar immediately, where the ladder still demanded a fixed 15%.
 ///
 /// Both figures are asserted exactly rather than as bounds. Reaction time is the quantity these
 /// patches trade against each other, so a change to it should appear as a change to this line.
@@ -407,12 +392,12 @@ fn test_decline_detected_regardless_of_window_age() {
     }
 
     assert!(
-        evaluations_to_react <= 3,
+        evaluations_to_react <= 2,
         "an hour-old window must not delay detection; took {evaluations_to_react} evaluations \
-         (the cumulative estimator took 13)"
+         (the fixed ladder over a cumulative window took 13)"
     );
     assert_eq!(
-        evaluations_to_react, 2,
-        "reaction time is 2 evaluations; a change here is a change in reaction time"
+        evaluations_to_react, 1,
+        "reaction time is 1 evaluation; a change here is a change in reaction time"
     );
 }

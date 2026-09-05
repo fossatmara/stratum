@@ -12,16 +12,51 @@ const DEFAULT_MIN_HASHRATE: f32 = 1.0;
 /// returns. Bounding displacement bounds the flood.
 ///
 /// A ratio rather than a count of eases, because a count only equals a ratio for one step size.
-/// On this revision the two agree: a silent channel still takes the `÷3` arm, so two eases and a
-/// ratio of `9` are the same bound. They part company once that arm goes and silence eases through
-/// the estimator instead, where two eases is `1.14×`. Changing the form now, while both give `9×`,
-/// makes the change checkable as a no-op — the existing bound test passes untouched.
+/// The two agreed while a silent channel took the fixed `÷3` arm, where two eases and a ratio of
+/// `9` were the same bound; the form was deliberately changed to the ratio while they still agreed,
+/// so the change was checkable as a no-op against an unchanged bound test. This patch removes that
+/// arm, and the forms part company here: silence now eases through the estimator, so the number of
+/// evaluations it takes to reach `9×` depends on the step size rather than being fixed at two.
 /// `min_allowed_hashrate` is no substitute: from a 200 TH belief its `1.0` H/s default is some
 /// thirty eases away.
 ///
 /// Binds only while evidence is absent: [`VardiffState::evidenced_hashrate`] re-anchors whenever
 /// shares arrive, so a genuinely declining miner, which still submits, is never held back by it.
 const MAX_SILENT_DISPLACEMENT: f32 = 9.0;
+
+/// Share rate below which the decision threshold is sized from a Poisson interval rather than a
+/// sequential test, in shares per minute.
+///
+/// Below this the per-window share count is small enough that its own sampling spread dominates,
+/// so the threshold has to be widened by that spread or the controller chases counting noise. At
+/// or above it there are enough shares per window for a sequential test to be the tighter choice.
+const SPARSE_SPM_SEAM: f32 = 6.0;
+
+/// Two-sided 99% normal quantile, used to widen the sparse-branch threshold by the sampling
+/// spread of the observed share count.
+const POISSON_Z: f64 = 2.576;
+
+/// Smallest deviation the controller will ever act on, as a fraction.
+///
+/// Both branches add this, so it is the floor on what the controller can see at any window
+/// length — the thing the fixed 15% ladder set far too high. Shared between them deliberately:
+/// "how small a deviation is worth acting on" is one policy, not two.
+const MIN_THRESHOLD_FRACTION: f64 = 0.05;
+
+/// Evidence the sequential test requires, in units of one minute of observation.
+///
+/// Divided by the window's length in minutes, so the threshold falls as evidence accumulates: a
+/// deviation too small to act on after one minute becomes actionable after several.
+const CUSUM_SENSITIVITY: f64 = 1.5;
+
+/// Share rate at which `CUSUM_SENSITIVITY` is calibrated, in shares per minute.
+///
+/// A channel run at `k` times this rate sees `k` times as many shares per window, and a count's
+/// *relative* spread falls as `1/sqrt(count)` — so the same window carries `sqrt(k)` times the
+/// resolving power. The requirement is scaled by `sqrt(k)` to match, which keeps the false-fire
+/// rate roughly flat across deployments rather than letting a high-rate channel retarget on noise
+/// a low-rate one would ignore.
+const CUSUM_REFERENCE_SPM: f64 = 30.0;
 
 /// Time constant of the EWMA estimator, in seconds.
 ///
@@ -215,6 +250,58 @@ impl VardiffState {
         (realized_share_per_min, h_estimate)
     }
 
+    /// Smallest deviation worth acting on, as a percentage, given the evidence in this window.
+    ///
+    /// Replaces a fixed ladder of six rungs whose loosest was 15% after five minutes. That floor
+    /// was set once, for no stated share rate, so every deviation under it was unseeable however
+    /// long the channel ran or however many shares it delivered: a channel 12% off target simply
+    /// never retargeted. Sizing the threshold from the evidence instead means the controller acts
+    /// as soon as the deviation is larger than what sampling noise could explain.
+    ///
+    /// Two branches, because the thing that limits confidence changes with the share rate. Below
+    /// [`SPARSE_SPM_SEAM`] the window holds few enough shares that the count's own spread
+    /// dominates, so the threshold is widened by that spread. At or above it, enough shares arrive
+    /// for a sequential test to be tighter.
+    fn threshold(&self, dt_secs: u64, shares_per_minute: f32) -> f64 {
+        if shares_per_minute < SPARSE_SPM_SEAM {
+            Self::poisson_threshold(dt_secs, shares_per_minute)
+        } else {
+            Self::cusum_threshold(dt_secs, shares_per_minute)
+        }
+    }
+
+    /// Sparse branch: widen the threshold by the sampling spread of the expected share count.
+    ///
+    /// With `lambda` shares expected in the window, the count's standard deviation is
+    /// `sqrt(lambda)`, so a deviation of `z·sqrt(lambda)` shares is within ordinary variation. As a
+    /// fraction of `lambda` that is `z/sqrt(lambda)`, which shrinks as the window lengthens — the
+    /// threshold tightens on its own as evidence accumulates. The `+0.5` is the continuity
+    /// correction for treating a discrete count as continuous.
+    fn poisson_threshold(dt_secs: u64, shares_per_minute: f32) -> f64 {
+        let lambda = (shares_per_minute as f64 / 60.0) * dt_secs as f64;
+        if lambda <= 0.0 {
+            // No evidence can arrive in a zero-length window; refuse to act.
+            return f64::INFINITY;
+        }
+        ((POISSON_Z * lambda.sqrt() + 0.5) / lambda + MIN_THRESHOLD_FRACTION) * 100.0
+    }
+
+    /// Dense branch: require a fixed quantity of evidence, spread over however long it takes.
+    ///
+    /// The requirement is divided by the length of the window in minutes, so a deviation too small
+    /// to act on after one minute becomes actionable after several. Deliberately *not* clamped at
+    /// one minute: a shorter window then yields a proportionally higher threshold, which is what
+    /// makes a separate minimum-interval guard unnecessary. A one-second window demands roughly
+    /// 9000%, so noise measured over a moment cannot move the difficulty.
+    fn cusum_threshold(dt_secs: u64, shares_per_minute: f32) -> f64 {
+        let window_minutes = dt_secs as f64 / 60.0;
+        if window_minutes <= 0.0 {
+            return f64::INFINITY;
+        }
+        let spm_factor = (shares_per_minute as f64 / CUSUM_REFERENCE_SPM).sqrt();
+        (CUSUM_SENSITIVITY * spm_factor / window_minutes + MIN_THRESHOLD_FRACTION) * 100.0
+    }
+
     /// Rescales the EWMA after a retarget so its stored rate refers to the new difficulty.
     ///
     /// `rate` counts shares against whatever target was in force when they were found, so it is a
@@ -399,36 +486,37 @@ impl Vardiff for VardiffState {
             hashrate,
         );
 
-        let should_update = match hashrate_delta_percentage {
-            pct if pct >= 100.0 => true,
-            pct if pct >= 60.0 && delta_time >= 60 => true,
-            pct if pct >= 50.0 && delta_time >= 120 => true,
-            pct if pct >= 45.0 && delta_time >= 180 => true,
-            pct if pct >= 30.0 && delta_time >= 240 => true,
-            pct if pct >= 15.0 && delta_time >= 300 => true,
-            _ => false,
-        };
+        let threshold = self.threshold(delta_time, shares_per_minute);
 
-        if !should_update {
+        debug!(
+            target: "vardiff",
+            "Deviation {:.2}% against a threshold of {:.2}% over {}s",
+            hashrate_delta_percentage,
+            threshold,
+            delta_time,
+        );
+
+        if (hashrate_delta_percentage as f64) < threshold {
             return Ok(None);
         }
 
-        // Reachable whenever the smoothed rate is exactly zero: blending zero into zero leaves
-        // zero, so this covers the entire life of a channel that has never delivered a share, not
-        // merely its first evaluation. Such a channel therefore still eases `÷3` per evaluation
-        // exactly as before this patch, bounded by the displacement floor below.
+        // The `÷1.5, ÷2, ÷3` zero-share arm is gone with the ladder that made it necessary. It
+        // existed because the old `>= 100.0` rung fired on a zero estimate, which would otherwise
+        // have driven the belief straight at `min_allowed_hashrate`.
         //
-        // Retained deliberately: without it a zero estimate would drive the belief straight at
-        // `min_allowed_hashrate` in a single step, because the `>= 100.0` rung fires on a zero
-        // estimate. It becomes unreachable once the decision boundary stops firing at 100%, and
-        // should be removed then rather than now.
-        if realized_share_per_min == 0.0 {
-            new_hashrate = match delta_time {
-                dt if dt <= 30 => hashrate / 1.5,
-                dt if dt < 60 => hashrate / 2.0,
-                _ => hashrate / 3.0,
-            };
-        } else if hashrate_delta_percentage > 1000.0 {
+        // The threshold above mostly covers that now, but not everywhere, and the exception is
+        // worth stating precisely. A zero estimate is a deviation of exactly 100%, so it fires
+        // wherever the threshold sits below that. At one evaluation period the dense threshold is
+        // 155% *at 30 shares a minute*, the rate `EVIDENCE_AT_ONE_MINUTE` is calibrated for, and it
+        // scales as `sqrt(spm / REFERENCE_SPM)` — so it crosses 100% at about 12.4 shares a minute,
+        // and below `SPARSE_SPM_SEAM` the sparse branch raises the bar out of reach again. Measured
+        // at a 61-second window, a zero-share evaluation fires for `6 <= spm < 12.4` and nowhere
+        // else, a band that contains this crate's own test rate of 10.
+        //
+        // When it does fire the displacement floor below bounds the result — the same `9x` the arm
+        // was bounded to, so the ceiling is unchanged. What is different until the retarget becomes
+        // partial is that the floor is reached in a single evaluation rather than the arm's two.
+        if hashrate_delta_percentage > 1000.0 {
             new_hashrate = match delta_time {
                 dt if dt <= 30 => hashrate * 10.0,
                 dt if dt < 60 => hashrate * 5.0,
