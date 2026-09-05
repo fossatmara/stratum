@@ -401,3 +401,109 @@ fn test_decline_detected_regardless_of_window_age() {
         "reaction time is 1 evaluation; a change here is a change in reaction time"
     );
 }
+
+/// Tightening requires more evidence than loosening, and this is what that costs.
+///
+/// Compares the *same* deviation in each direction. That needs care: the deviation is measured as
+/// `|estimate/belief − 1|`, which floors at −100% but has no ceiling, so equal *rate ratios* are
+/// not equal deviations — a miner at six times its target rate reads 500%, one at a sixth reads
+/// 83%. The rates below are chosen to produce the same 83% either way, leaving the multiplier as
+/// the only difference.
+///
+/// The delay is the deliberate price of the asymmetry, so it is measured rather than left implicit.
+/// Note it is not simply the multiplier: the threshold has an additive floor that does not scale,
+/// so an 8x evidence requirement stretches the window by rather more than 8x.
+#[test]
+fn test_tightening_needs_more_evidence_than_loosening() {
+    use crate::vardiff::clock::MockClock;
+    use std::sync::Arc;
+
+    // Shortest window, in whole seconds, at which the controller acts on a channel delivering
+    // `realized_spm` against a target of TEST_SHARES_PER_MINUTE.
+    let first_action_at = |realized_spm: f64| -> u64 {
+        for window in 1..=4000u64 {
+            let clock = Arc::new(MockClock::new(1_000_000));
+            let mut vardiff =
+                VardiffState::new_with_clock(TEST_MIN_ALLOWED_HASHRATE, clock.clone())
+                    .expect("Failed to create VardiffState");
+            let hashrate = TEST_INITIAL_HASHRATE;
+            let target = hash_rate_to_target(hashrate.into(), TEST_SHARES_PER_MINUTE.into())
+                .expect("valid target");
+            let shares = (realized_spm * window as f64 / 60.0).round() as u32;
+            for _ in 0..shares {
+                vardiff.increment_shares_since_last_update();
+            }
+            clock.advance(window);
+            if vardiff
+                .try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE)
+                .expect("try_vardiff failed")
+                .is_some()
+            {
+                return window;
+            }
+        }
+        u64::MAX
+    };
+
+    let deviation = 0.8333;
+    let tighten_window = first_action_at(TEST_SHARES_PER_MINUTE as f64 * (1.0 + deviation));
+    let loosen_window = first_action_at(TEST_SHARES_PER_MINUTE as f64 * (1.0 - deviation));
+
+    assert!(
+        tighten_window > loosen_window,
+        "tightening should need the longer observation: tighten at {tighten_window}s, \
+         loosen at {loosen_window}s"
+    );
+    assert_eq!(
+        (tighten_window, loosen_window),
+        (945, 68),
+        "the asymmetry delays action on an 83% over-delivery from 68s to 945s; a change here is \
+         a change in that cost"
+    );
+}
+
+/// The extra burden of proof attaches to the move being made, not to the observed share rate.
+///
+/// Those two agree only while the caller's `target` and `hashrate` describe the same difficulty,
+/// and nothing in `try_vardiff`'s signature enforces that. Here they deliberately disagree: the
+/// target implies a quarter of the stated belief, and the channel delivers twice its target rate.
+/// Reading the rate would call that a tightening and demand eight times the evidence; the move is
+/// in fact a *loosening*, halving the belief, and must be judged on the ordinary threshold.
+///
+/// Without this distinction the asymmetry inverts — it would make loosening harder, which is the
+/// opposite of the property it exists to provide.
+#[test]
+fn test_asymmetry_follows_the_move_not_the_share_rate() {
+    use crate::vardiff::clock::MockClock;
+    use std::sync::Arc;
+
+    let clock = Arc::new(MockClock::new(1_000_000));
+    let mut vardiff = VardiffState::new_with_clock(TEST_MIN_ALLOWED_HASHRATE, clock.clone())
+        .expect("Failed to create VardiffState");
+
+    let hashrate = TEST_INITIAL_HASHRATE;
+    // Target consistent with a quarter of `hashrate`, so a rate above target still implies a
+    // belief below it.
+    let target = hash_rate_to_target((hashrate / 4.0).into(), TEST_SHARES_PER_MINUTE.into())
+        .expect("valid target");
+
+    // Twice the target share rate over two minutes: 40 shares at 10 per minute expected.
+    let window = 120u64;
+    for _ in 0..40 {
+        vardiff.increment_shares_since_last_update();
+    }
+    clock.advance(window);
+
+    let outcome = vardiff
+        .try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE)
+        .expect("try_vardiff failed");
+
+    let new_hashrate = outcome.expect(
+        "a loosening move should be judged on the ordinary threshold; if the extra burden of \
+         proof were keyed on the observed rate exceeding target, this would not have fired",
+    );
+    assert!(
+        new_hashrate < hashrate,
+        "the move is a loosening: {hashrate} -> {new_hashrate}"
+    );
+}

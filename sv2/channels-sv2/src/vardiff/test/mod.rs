@@ -129,15 +129,19 @@ pub fn test_try_vardiff_low_hashrate_decrease_target<V: Vardiff>(vardiff: &mut V
             .unwrap()
             .into();
 
-    let simulation_duration = 16;
-    simulate_shares_and_wait(vardiff, 16, simulation_duration);
+    // 60 shares a minute against an expected 10, so this is an over-delivering miner and the
+    // response is to tighten. The window is 120 seconds rather than 16 because tightening now
+    // requires more evidence than loosening; 16 seconds of a 6x excess is 16 shares, which is not
+    // enough to act on. Same rate, longer observation.
+    let simulation_duration = 120;
+    simulate_shares_and_wait(vardiff, 120, simulation_duration);
 
     let result = vardiff
         .try_vardiff(initial_hashrate, &initial_target, TEST_SHARES_PER_MINUTE)
         .expect("try_vardiff failed");
     assert!(
         result.is_some(),
-        "Hashrate should update due to low share count"
+        "Hashrate should update due to high share count"
     );
     let new_hashrate = result.unwrap();
 

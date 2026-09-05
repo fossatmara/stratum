@@ -43,20 +43,40 @@ const POISSON_Z: f64 = 2.576;
 /// "how small a deviation is worth acting on" is one policy, not two.
 const MIN_THRESHOLD_FRACTION: f64 = 0.05;
 
-/// Evidence the sequential test requires, in units of one minute of observation.
+/// Deviation required after one minute of observation, as a fraction, on the dense branch.
 ///
-/// Divided by the window's length in minutes, so the threshold falls as evidence accumulates: a
-/// deviation too small to act on after one minute becomes actionable after several.
-const CUSUM_SENSITIVITY: f64 = 1.5;
+/// Divided by the window's length in minutes, so the requirement relaxes as observation
+/// accumulates: a deviation too small to act on after one minute becomes actionable after several.
+///
+/// Named for what it is rather than for a method. An earlier form of this called itself a CUSUM,
+/// after the cumulative-sum control chart, but nothing here accumulates anything — the value is a
+/// fixed requirement divided by elapsed time. Importing the name would have promised a sequential
+/// test the code does not perform.
+const EVIDENCE_AT_ONE_MINUTE: f64 = 1.5;
 
-/// Share rate at which `CUSUM_SENSITIVITY` is calibrated, in shares per minute.
+/// Share rate at which [`EVIDENCE_AT_ONE_MINUTE`] is calibrated, in shares per minute.
 ///
 /// A channel run at `k` times this rate sees `k` times as many shares per window, and a count's
 /// *relative* spread falls as `1/sqrt(count)` — so the same window carries `sqrt(k)` times the
 /// resolving power. The requirement is scaled by `sqrt(k)` to match, which keeps the false-fire
 /// rate roughly flat across deployments rather than letting a high-rate channel retarget on noise
 /// a low-rate one would ignore.
-const CUSUM_REFERENCE_SPM: f64 = 30.0;
+const REFERENCE_SPM: f64 = 30.0;
+
+/// Extra evidence required before *tightening*, as a multiple of the loosening requirement.
+///
+/// Tightening is the direction that can compound: raise the difficulty on a miner that is already
+/// slowing and it delivers still fewer shares, which reads as slower again. Loosening cannot
+/// compound that way, so the two directions do not warrant the same burden of proof.
+///
+/// Safe here only because a share is worth its own difficulty. A miner producing `H/D` shares at
+/// difficulty `D` is credited `(H/D)·D = H`, so `D` cancels and easing the difficulty pays nothing
+/// extra — measured at zero gain under difficulty-weighted accounting, against `+29.4%` under
+/// share-count accounting. The same asymmetry on a chain, where a solution pays a fixed reward
+/// regardless of difficulty, was farmed: Bitcoin Cash's Emergency Difficulty Adjustment shipped in
+/// August 2017 and was replaced within months. The mechanism is not safe in general; it is safe
+/// under this accounting.
+const TIGHTEN_MULTIPLIER: f64 = 8.0;
 
 /// Time constant of the EWMA estimator, in seconds.
 ///
@@ -262,22 +282,43 @@ impl VardiffState {
     /// [`SPARSE_SPM_SEAM`] the window holds few enough shares that the count's own spread
     /// dominates, so the threshold is widened by that spread. At or above it, enough shares arrive
     /// for a sequential test to be tighter.
-    fn threshold(&self, dt_secs: u64, shares_per_minute: f32) -> f64 {
-        if shares_per_minute < SPARSE_SPM_SEAM {
-            Self::poisson_threshold(dt_secs, shares_per_minute)
+    ///
+    /// Whichever branch sizes it, tightening then requires [`TIGHTEN_MULTIPLIER`] times as much,
+    /// because tightening is the direction that can compound.
+    fn threshold(&self, dt_secs: u64, shares_per_minute: f32, tightening: bool) -> f64 {
+        let base = if shares_per_minute < SPARSE_SPM_SEAM {
+            Self::sparse_threshold(dt_secs, shares_per_minute)
         } else {
-            Self::cusum_threshold(dt_secs, shares_per_minute)
+            Self::dense_threshold(dt_secs, shares_per_minute)
+        };
+
+        // Applied here rather than inside each branch: the direction that needs resisting does not
+        // depend on which branch sized the threshold, so it belongs once, after the dispatch.
+        //
+        // `tightening` is read from the move the controller is about to make, not from whether the
+        // observed rate exceeds the target. Those agree only while the caller's `target` and
+        // `hashrate` describe the same difficulty, which nothing in this signature enforces — and
+        // if they disagree, deciding from the rate would apply the extra burden of proof to a
+        // loosening move and withhold it from a tightening one, inverting the property.
+        if tightening {
+            base * TIGHTEN_MULTIPLIER
+        } else {
+            base
         }
     }
 
     /// Sparse branch: widen the threshold by the sampling spread of the expected share count.
+    ///
+    /// Share arrivals are Poisson, which is the one piece of statistics this needs: the count in a
+    /// window has variance equal to its mean, so its standard deviation is the square root of the
+    /// mean.
     ///
     /// With `lambda` shares expected in the window, the count's standard deviation is
     /// `sqrt(lambda)`, so a deviation of `z·sqrt(lambda)` shares is within ordinary variation. As a
     /// fraction of `lambda` that is `z/sqrt(lambda)`, which shrinks as the window lengthens — the
     /// threshold tightens on its own as evidence accumulates. The `+0.5` is the continuity
     /// correction for treating a discrete count as continuous.
-    fn poisson_threshold(dt_secs: u64, shares_per_minute: f32) -> f64 {
+    fn sparse_threshold(dt_secs: u64, shares_per_minute: f32) -> f64 {
         let lambda = (shares_per_minute as f64 / 60.0) * dt_secs as f64;
         if lambda <= 0.0 {
             // No evidence can arrive in a zero-length window; refuse to act.
@@ -286,20 +327,21 @@ impl VardiffState {
         ((POISSON_Z * lambda.sqrt() + 0.5) / lambda + MIN_THRESHOLD_FRACTION) * 100.0
     }
 
-    /// Dense branch: require a fixed quantity of evidence, spread over however long it takes.
+    /// Dense branch: require a fixed deviation after one minute, relaxed in proportion to the
+    /// window.
     ///
     /// The requirement is divided by the length of the window in minutes, so a deviation too small
     /// to act on after one minute becomes actionable after several. Deliberately *not* clamped at
     /// one minute: a shorter window then yields a proportionally higher threshold, which is what
     /// makes a separate minimum-interval guard unnecessary. A one-second window demands roughly
     /// 9000%, so noise measured over a moment cannot move the difficulty.
-    fn cusum_threshold(dt_secs: u64, shares_per_minute: f32) -> f64 {
+    fn dense_threshold(dt_secs: u64, shares_per_minute: f32) -> f64 {
         let window_minutes = dt_secs as f64 / 60.0;
         if window_minutes <= 0.0 {
             return f64::INFINITY;
         }
-        let spm_factor = (shares_per_minute as f64 / CUSUM_REFERENCE_SPM).sqrt();
-        (CUSUM_SENSITIVITY * spm_factor / window_minutes + MIN_THRESHOLD_FRACTION) * 100.0
+        let spm_factor = (shares_per_minute as f64 / REFERENCE_SPM).sqrt();
+        (EVIDENCE_AT_ONE_MINUTE * spm_factor / window_minutes + MIN_THRESHOLD_FRACTION) * 100.0
     }
 
     /// Rescales the EWMA after a retarget so its stored rate refers to the new difficulty.
@@ -486,7 +528,8 @@ impl Vardiff for VardiffState {
             hashrate,
         );
 
-        let threshold = self.threshold(delta_time, shares_per_minute);
+        let threshold =
+            self.threshold(delta_time, shares_per_minute, estimated_hashrate > hashrate);
 
         debug!(
             target: "vardiff",
