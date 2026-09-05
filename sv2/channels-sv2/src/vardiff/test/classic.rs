@@ -227,49 +227,146 @@ fn test_silent_channel_ease_displacement_is_bounded() {
 // Otherwise a long-lived channel that goes briefly quiet many times would eventually exhaust it
 // and stop easing for a genuine decline.
 #[test]
-fn test_share_activity_clears_the_silence_budget() {
+fn test_share_activity_rearms_the_silence_bound() {
     let mut vardiff = new_test_vardiff_state().expect("Failed to create VardiffState");
+    let mut hashrate = TEST_INITIAL_HASHRATE;
+    let mut target =
+        hash_rate_to_target(hashrate.into(), TEST_SHARES_PER_MINUTE.into()).expect("valid target");
+
+    // 1. Sustained silence settles at the bound: 9x below the belief that last had evidence.
+    for _ in 0..40 {
+        simulate_shares_and_wait(&mut vardiff, 0, 61);
+        if let Ok(Some(updated)) = vardiff.try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE) {
+            hashrate = updated;
+            target = hash_rate_to_target(hashrate.into(), TEST_SHARES_PER_MINUTE.into())
+                .expect("valid target");
+        }
+    }
+    let first_bound = TEST_INITIAL_HASHRATE / 9.0;
+    assert!(
+        (hashrate / first_bound - 1.0).abs() < 1e-3,
+        "silence should settle at {first_bound} H/s, got {hashrate}"
+    );
+
+    // 2. Evidence arrives at the lowered belief, re-anchoring the bound to it.
+    simulate_shares_and_wait(&mut vardiff, TEST_SHARES_PER_MINUTE as u32, 61);
+    if let Ok(Some(updated)) = vardiff.try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE) {
+        hashrate = updated;
+        target = hash_rate_to_target(hashrate.into(), TEST_SHARES_PER_MINUTE.into())
+            .expect("valid target");
+    }
+    let rearmed_from = hashrate;
+
+    // 3. Silence may now descend past the previous bound, because the bound is relative to the
+    //    last evidenced belief rather than an absolute floor. Without the re-anchor the channel
+    //    would be stuck at `first_bound` forever, unable to follow a miner that really had slowed.
+    for _ in 0..40 {
+        simulate_shares_and_wait(&mut vardiff, 0, 61);
+        if let Ok(Some(updated)) = vardiff.try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE) {
+            hashrate = updated;
+            target = hash_rate_to_target(hashrate.into(), TEST_SHARES_PER_MINUTE.into())
+                .expect("valid target");
+        }
+    }
+    assert!(
+        hashrate < first_bound,
+        "activity did not re-arm the bound: still at {hashrate} H/s, no lower than the earlier \
+         bound of {first_bound} H/s despite evidence at {rearmed_from} H/s"
+    );
+    assert!(
+        hashrate >= rearmed_from / 9.0 * (1.0 - 1e-3),
+        "descent went past the re-armed bound: {hashrate} H/s is below {} H/s",
+        rearmed_from / 9.0
+    );
+}
+
+/// The estimator must forget on the clock, by `e^(−Δt/tau)`, which is the property the cumulative
+/// mean lacked and the reason it entrenched.
+///
+/// Asserted at the mechanism rather than end-to-end because the shared harness cannot express a
+/// growing evaluation window: `simulate_shares_and_wait` re-anchors the window on every call, so a
+/// sequence of non-retargeting evaluations — the situation in which the old estimator entrenches —
+/// is not reachable through it. An end-to-end entrenchment test needs a harness able to advance the
+/// evaluation clock independently of the retarget clock.
+///
+/// The intervals below are chosen to stay under the decision boundary, so no retarget intervenes.
+/// That matters: on a retarget `rescale_ewma` re-expresses the rate against the new difficulty, so
+/// the stored rate returns to roughly its pre-decay value — correct, but it hides the decay from
+/// an observer reading the rate afterwards.
+#[test]
+fn test_estimator_forgets_on_the_clock() {
     let hashrate = TEST_INITIAL_HASHRATE;
     let target =
         hash_rate_to_target(hashrate.into(), TEST_SHARES_PER_MINUTE.into()).expect("valid target");
 
-    // Spend the whole budget in silence, then submit, three times over. `2` is
-    // MAX_CONSECUTIVE_SILENT_EASES, as a literal so this also compiles against a tree without it.
-    for _ in 0..3 {
-        for _ in 0..2 {
-            simulate_shares_and_wait(&mut vardiff, 0, 61);
-            let _ = vardiff.try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE);
-        }
-        simulate_shares_and_wait(&mut vardiff, 20, 61);
-        let _ = vardiff.try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE);
-    }
+    let seed = |vardiff: &mut VardiffState| {
+        simulate_shares_and_wait(vardiff, TEST_SHARES_PER_MINUTE as u32, 60);
+        let fired = vardiff
+            .try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE)
+            .expect("try_vardiff failed");
+        assert!(fired.is_none(), "on-target seeding should not retarget");
+    };
 
-    // A fresh silent evaluation must still ease, which it cannot do if activity left the
-    // accumulated silence in place.
-    simulate_shares_and_wait(&mut vardiff, 0, 61);
-    let eased = vardiff.try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE);
+    // Seeding takes the first observation whole rather than blending it against a zero prior.
+    let mut single = new_test_vardiff_state().expect("Failed to create VardiffState");
+    seed(&mut single);
+    let seeded = single.ewma_rate();
     assert!(
-        matches!(eased, Ok(Some(h)) if h < hashrate),
-        "activity did not clear the silence budget: {eased:?}"
+        (seeded - TEST_SHARES_PER_MINUTE as f64).abs() < 1e-2,
+        "seeding should take the first observation whole, got {seeded}"
+    );
+
+    // Half a time constant of silence discards `1 − e^(−1/2)` of the stored rate.
+    simulate_shares_and_wait(&mut single, 0, 180);
+    let fired = single
+        .try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE)
+        .expect("try_vardiff failed");
+    assert!(fired.is_none(), "a 180s gap should stay under the boundary");
+    let expected = seeded * (-0.5f64).exp();
+    let decayed = single.ewma_rate();
+    assert!(
+        (decayed / expected - 1.0).abs() < 1e-3,
+        "after half a tau the rate should be {expected}, got {decayed}"
+    );
+
+    // Decay tracks elapsed time, not the number of evaluations: two quarter-tau gaps must land
+    // where one half-tau gap did. A per-evaluation constant would forget twice as much here, which
+    // is how an irregular cadence silently changes a filter's memory.
+    let mut split = new_test_vardiff_state().expect("Failed to create VardiffState");
+    seed(&mut split);
+    for _ in 0..2 {
+        simulate_shares_and_wait(&mut split, 0, 90);
+        let fired = split
+            .try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE)
+            .expect("try_vardiff failed");
+        assert!(fired.is_none(), "a 90s gap should stay under the boundary");
+    }
+    assert!(
+        (split.ewma_rate() / decayed - 1.0).abs() < 1e-3,
+        "two quarter-tau gaps ({}) should decay the same as one half-tau ({decayed})",
+        split.ewma_rate()
     );
 }
 
-/// How long a decline goes unnoticed on a channel that has not retargeted for an hour.
+/// A decline is detected in the same few evaluations whatever the channel's age.
 ///
-/// Documents shipped behaviour, not desired behaviour. The estimator averages every share since
-/// the last retarget, and the window is cleared only by a retarget, so it grows for exactly as
-/// long as the controller declines to act. An hour of healthy history then swamps a fresh
-/// decline: the miner drops to a tenth of its rate and **thirteen** evaluations pass before the
-/// deviation clears the lowest rung of the threshold ladder.
+/// This is the patch's headline claim, end to end. The previous estimator averaged every share
+/// since the last retarget and cleared that window only on a retarget, so the window grew for
+/// exactly as long as the controller declined to act, and an hour of healthy history swamped a
+/// fresh decline. Against the same scenario it took **thirteen** evaluations to react; the
+/// clock-decayed average takes **two**, because evidence ages whether or not the controller
+/// fires.
 ///
-/// Only reachable with a controllable clock. `simulate_shares_and_wait` re-anchors the window on
-/// every call, so it can express "the window is an hour long" but not "an hour arrived as sixty
-/// separate evaluations" — and the second is what grows the window. That is why this test needs
-/// [`MockClock`] and why the clock is injectable.
+/// Both figures are asserted exactly rather than as bounds. Reaction time is the quantity these
+/// patches trade against each other, so a change to it should appear as a change to this line.
+///
+/// Needs a controllable clock: `simulate_shares_and_wait` re-anchors the window on every call, so
+/// it can express "the window is an hour long" but not "an hour arrived as sixty separate
+/// evaluations" — and the second is what grows the window.
 ///
 /// [`MockClock`]: crate::vardiff::clock::MockClock
 #[test]
-fn test_long_window_delays_decline_detection() {
+fn test_decline_detected_regardless_of_window_age() {
     use crate::vardiff::clock::MockClock;
     use std::sync::Arc;
 
@@ -310,11 +407,12 @@ fn test_long_window_delays_decline_detection() {
     }
 
     assert!(
-        evaluations_to_react > 10,
-        "a decline on an hour-old window should go unnoticed for many evaluations, took {evaluations_to_react}"
+        evaluations_to_react <= 3,
+        "an hour-old window must not delay detection; took {evaluations_to_react} evaluations \
+         (the cumulative estimator took 13)"
     );
     assert_eq!(
-        evaluations_to_react, 13,
-        "shipped behaviour is 13 evaluations; a change here is a change in reaction time"
+        evaluations_to_react, 2,
+        "reaction time is 2 evaluations; a change here is a change in reaction time"
     );
 }
