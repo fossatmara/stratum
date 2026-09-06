@@ -918,3 +918,27 @@ fn test_the_step_bound_does_not_slow_the_response_to_a_decline() {
         );
     }
 }
+
+/// The fingerprint must carry the constants, or a run cannot be attributed from its logs.
+///
+/// The failure this guards is a literal in the format string drifting from the constant it
+/// describes -- which would make the line actively misleading rather than merely absent. Only the
+/// constants already visible to this module are checked; that is enough to catch the drift, since
+/// they are formatted through the same path as the rest.
+#[test]
+fn test_parameter_fingerprint_carries_the_constants() {
+    let f = VardiffState::parameter_fingerprint();
+    for expected in [
+        format!("tau={EWMA_TAU_SECS}s"),
+        format!("discount_per_obs={DIRECTION_DISCOUNT_PER_OBSERVATION}"),
+        format!("max_discount={MAX_DIRECTION_DISCOUNT}"),
+        format!(
+            "step_fraction={STEP_FRACTION_BASE}..{STEP_FRACTION_MAX} by {STEP_FRACTION_GROWTH}"
+        ),
+    ] {
+        assert!(
+            f.contains(&expected),
+            "fingerprint is missing or has drifted from `{expected}`: {f}"
+        );
+    }
+}

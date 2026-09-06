@@ -1,6 +1,6 @@
 use crate::target::hash_rate_from_target;
 use bitcoin::Target;
-use tracing::debug;
+use tracing::{debug, info};
 
 /// Default minimum hashrate (H/s) if not specified.
 const DEFAULT_MIN_HASHRATE: f32 = 1.0;
@@ -309,6 +309,53 @@ impl VardiffState {
         Self::new_with_clock(min_allowed_hashrate, Arc::new(SystemClock))
     }
 
+    /// The controller's full parameter vector, as one line.
+    ///
+    /// Every constant that changes a decision appears here, so two builds that differ in any
+    /// one of them produce different text. Formatted from the constants themselves rather than
+    /// from literals, so the line cannot drift from the behaviour it describes.
+    pub(crate) fn parameter_fingerprint() -> String {
+        format!(
+            "tau={}s evidence_at_1min={} reference_spm={} sparse_seam={}spm poisson_z={} \
+             min_threshold={} tighten_mult={} discount_per_obs={} max_discount={} \
+             step_fraction={}..{} by {} max_step_ratio={} max_silent_displacement={}",
+            EWMA_TAU_SECS,
+            EVIDENCE_AT_ONE_MINUTE,
+            REFERENCE_SPM,
+            SPARSE_SPM_SEAM,
+            POISSON_Z,
+            MIN_THRESHOLD_FRACTION,
+            TIGHTEN_MULTIPLIER,
+            DIRECTION_DISCOUNT_PER_OBSERVATION,
+            MAX_DIRECTION_DISCOUNT,
+            STEP_FRACTION_BASE,
+            STEP_FRACTION_MAX,
+            STEP_FRACTION_GROWTH,
+            MAX_STEP_RATIO,
+            MAX_SILENT_DISPLACEMENT,
+        )
+    }
+
+    /// Emits [`VardiffState::parameter_fingerprint`] once per process.
+    ///
+    /// Why this exists: two arms of an A/B test that differ only in a private constant are
+    /// indistinguishable from outside. No exported symbol differs, and none of the
+    /// per-evaluation log lines carries a parameter — they report the deviation, the threshold
+    /// and the window, all of which are functions of the *channel*, not of the build. So the
+    /// deployment record is the only arm identity, and a run attributed from logs alone cannot
+    /// be attributed at all. This line makes the numbers the fingerprint.
+    ///
+    /// `info!` rather than `debug!` deliberately: which controller is running should not depend
+    /// on whether debug logging happened to be switched on. Once per process rather than once
+    /// per channel because it describes the build, not the channel — and because the
+    /// per-evaluation lines are already the per-channel record.
+    fn log_parameters_once() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            info!(target: "vardiff", "vardiff parameters: {}", Self::parameter_fingerprint());
+        });
+    }
+
     /// Creates a new `VardiffState` reading time from `clock`.
     ///
     /// The controller's behaviour is a function of elapsed time — which window has passed, how
@@ -324,6 +371,8 @@ impl VardiffState {
         min_allowed_hashrate: f32,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, VardiffError> {
+        Self::log_parameters_once();
+
         let timestamp_secs = clock.now_secs()?;
 
         let min_allowed_hashrate = if min_allowed_hashrate.is_finite() && min_allowed_hashrate > 0.0
