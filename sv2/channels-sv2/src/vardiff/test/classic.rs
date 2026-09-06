@@ -13,7 +13,7 @@ use super::{
     test_try_vardiff_with_shares_less_than_30, test_try_vardiff_with_shares_more_than_60s, Vardiff,
 };
 use crate::vardiff::classic::{
-    DIRECTION_DISCOUNT_PER_OBSERVATION, MAX_DIRECTION_DISCOUNT, STEP_FRACTION_BASE,
+    DIRECTION_DISCOUNT_PER_OBSERVATION, EWMA_TAU_SECS, MAX_DIRECTION_DISCOUNT, STEP_FRACTION_BASE,
     STEP_FRACTION_GROWTH, STEP_FRACTION_MAX,
 };
 
@@ -311,17 +311,32 @@ fn test_estimator_forgets_on_the_clock() {
         "seeding should take the first observation whole, got {seeded}"
     );
 
-    // A quarter of a time constant of silence discards `1 − e^(−1/4)` of the stored rate.
-    simulate_shares_and_wait(&mut single, 0, 90);
+    // A gap of `GAP` seconds of silence discards `1 − e^(−GAP/tau)` of the stored rate. The gap is
+    // an absolute duration rather than a fraction of `tau`, deliberately: a fraction would grow with
+    // `tau` until it crossed the decision boundary and the test would start measuring the boundary
+    // instead of the decay. The *expectation* is what carries `tau`.
+    const GAP: u64 = 90;
+    let decay = -(GAP as f64) / EWMA_TAU_SECS as f64;
+    // Self-check: a `tau` large enough to make the gap's decay unmeasurable would leave the
+    // assertions below true of any filter, so require the effect to be worth asserting.
+    assert!(
+        decay.exp() < 0.99,
+        "a {GAP}s gap decays only {:.4}x at tau={EWMA_TAU_SECS}s, too little to test a decay law",
+        decay.exp()
+    );
+    simulate_shares_and_wait(&mut single, 0, GAP);
     let fired = single
         .try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE)
         .expect("try_vardiff failed");
-    assert!(fired.is_none(), "a 90s gap should stay under the boundary");
-    let expected = seeded * (-0.25f64).exp();
+    assert!(
+        fired.is_none(),
+        "a {GAP}s gap should stay under the boundary"
+    );
+    let expected = seeded * decay.exp();
     let decayed = single.ewma_rate();
     assert!(
         (decayed / expected - 1.0).abs() < 1e-3,
-        "after a quarter of a tau the rate should be {expected}, got {decayed}"
+        "after {GAP}s at tau={EWMA_TAU_SECS}s the rate should be {expected}, got {decayed}"
     );
 
     // Decay tracks elapsed time, not the number of evaluations: two eighth-tau gaps must land
@@ -330,15 +345,20 @@ fn test_estimator_forgets_on_the_clock() {
     let mut split = new_test_vardiff_state().expect("Failed to create VardiffState");
     seed(&mut split);
     for _ in 0..2 {
-        simulate_shares_and_wait(&mut split, 0, 45);
+        simulate_shares_and_wait(&mut split, 0, GAP / 2);
         let fired = split
             .try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE)
             .expect("try_vardiff failed");
-        assert!(fired.is_none(), "a 45s gap should stay under the boundary");
+        assert!(
+            fired.is_none(),
+            "a {}s gap should stay under the boundary",
+            GAP / 2
+        );
     }
     assert!(
         (split.ewma_rate() / decayed - 1.0).abs() < 1e-3,
-        "two eighth-tau gaps ({}) should decay the same as one quarter-tau ({decayed})",
+        "two {}s gaps ({}) should decay the same as one {GAP}s gap ({decayed})",
+        GAP / 2,
         split.ewma_rate()
     );
 }
@@ -557,15 +577,26 @@ fn test_same_direction_run_accumulates_resets_and_clears() {
         );
     }
 
-    // One evaluation delivering well over target reverses the direction and restarts the count.
-    for _ in 0..60 {
-        vardiff.increment_shares_since_last_update();
+    // Over-target delivery eventually reverses the direction, and the moment it does the count
+    // must restart at 1 rather than continue the loosening run. Driven to the crossover rather
+    // than assuming one evaluation reaches it: a single observation carries weight
+    // `1 − e^(−dt/EWMA_TAU_SECS)` in the estimate, so how many evaluations it takes to pull the
+    // estimate above the belief is a function of `tau`, while the property under test is not.
+    let mut at_reversal = None;
+    for _ in 0..40 {
+        for _ in 0..(TEST_SHARES_PER_MINUTE as u32 * 6) {
+            vardiff.increment_shares_since_last_update();
+        }
+        clock.advance(60);
+        let _ = vardiff.try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE);
+        if vardiff.direction_run().0 == 1 {
+            at_reversal = Some(vardiff.direction_run());
+            break;
+        }
     }
-    clock.advance(60);
-    let _ = vardiff.try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE);
     assert_eq!(
-        vardiff.direction_run(),
-        (1, 1),
+        at_reversal,
+        Some((1, 1)),
         "a reversal should restart the run rather than continue it"
     );
 

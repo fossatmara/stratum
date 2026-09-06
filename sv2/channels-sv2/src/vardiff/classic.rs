@@ -214,7 +214,7 @@ const MAX_STEP_RATIO: f32 = 2.0;
 /// the reference rate. Below it the bar is a fraction of a sigma and the controller retargets on
 /// noise: at 8 shares a minute the same floor is `0.42·sigma`, which is a measured 2.5 retargets an
 /// hour on a channel that is exactly on target.
-const EWMA_TAU_SECS: u64 = 360;
+pub(crate) const EWMA_TAU_SECS: u64 = 360;
 
 use super::{
     clock::{Clock, SystemClock},
