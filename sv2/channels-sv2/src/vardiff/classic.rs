@@ -214,7 +214,16 @@ const MAX_STEP_RATIO: f32 = 2.0;
 /// the reference rate. Below it the bar is a fraction of a sigma and the controller retargets on
 /// noise: at 8 shares a minute the same floor is `0.42·sigma`, which is a measured 2.5 retargets an
 /// hour on a channel that is exactly on target.
-pub(crate) const EWMA_TAU_SECS: u64 = 360;
+///
+/// `1200` rather than `360` for that reason. The decline-safety gate is what bounds it from above --
+/// the estimator's lag becomes a settled tracking error on a sustained decline -- and measured
+/// through the gate's own harness against *this* controller the worst cell runs `−5.78%` at `360`,
+/// `−0.28%` at `1200` and `+7.48%` at `2400`, so the ceiling is near `2000` and `1200` sits at
+/// `5.3` percentage points of margin while very nearly eliminating the settled bias. Suppressing the
+/// noise *entirely* would need `tau` near `5500`, which the gate forbids, so this reduces
+/// noise-driven retargeting rather than removing it; removing it needs a decision timescale
+/// separate from the move timescale, which is not attempted here.
+pub(crate) const EWMA_TAU_SECS: u64 = 1200;
 
 use super::{
     clock::{Clock, SystemClock},
