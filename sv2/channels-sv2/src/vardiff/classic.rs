@@ -129,9 +129,18 @@ pub(crate) const STEP_FRACTION_GROWTH: f32 = 0.05;
 
 /// Ceiling on the fraction a single retarget may close.
 ///
-/// Defensive rather than load-bearing: it takes nine consecutive same-direction retargets to reach,
-/// and the longest run observed in a measured `3x` step response was six, so in that scenario the
-/// ceiling never binds and the effective range is `0.2` to `0.45`.
+/// Load-bearing in steady state, contrary to what an earlier version of this comment said. It takes
+/// nine consecutive same-direction retargets to reach, and a measured `3x` step response never ran
+/// longer than six — but a step response is a transient. In steady state at 6 to 10 shares a minute
+/// the mean retarget run is `9.00`, the clamp, because the asymmetry makes almost every noise-driven
+/// fire an ease and so an unbroken run: measured over 4000 evaluations per rate, the run sits at the
+/// ceiling for every rate from 4 to 10 shares a minute, falling below it only past ~20.
+///
+/// So this is the operative step fraction in steady state, not a bound the code stays clear of, and
+/// the effective range is `0.2` on a first move and `0.6` thereafter rather than `0.2` to `0.45`.
+/// Two consequences worth knowing before changing it: it is what the persistence discount compounds
+/// with (that saturates too, so the ease bar is nearer 3% than [`MIN_THRESHOLD_FRACTION`]'s 5%), and
+/// it is reached by *repetition*, so anything that breaks up same-direction runs lowers it.
 pub(crate) const STEP_FRACTION_MAX: f32 = 0.6;
 
 /// Consecutive same-direction retargets at which the step fraction reaches [`STEP_FRACTION_MAX`].
@@ -184,6 +193,27 @@ const MAX_STEP_RATIO: f32 = 2.0;
 ///
 /// Old evidence decays on the clock at `e^(−Δt/tau)`, which is what makes the window unable to
 /// entrench: it forgets whether or not the controller ever decides to act.
+///
+/// It also fixes the estimator's precision, and that is the other half of choosing it. A filter with
+/// per-step retention `alpha = e^(−Δt/tau)` keeps a fraction `(1−alpha)/(1+alpha)` of a single
+/// observation's variance, which is `Δt/2tau` for `Δt << tau`, so the smoothed rate's relative
+/// standard error is
+///
+/// ```text
+///     sigma = sqrt( 30 / (r* · tau) )        r* in shares/min, tau in seconds
+/// ```
+///
+/// The `Δt` cancels: **the estimate's precision depends on `r*·tau` alone, not on how often
+/// `try_vardiff` is called.** Evaluating more often does not buy a better estimate. Measured against
+/// this revision over `r*` 4–60 and `tau` 360–2000, the closed form is within 3–8% relative.
+///
+/// The pairing that matters is with [`MIN_THRESHOLD_FRACTION`]: once a window is long enough that
+/// the evidence term has vanished, the controller is comparing a deviation carrying `sigma` of noise
+/// against a fixed bar. `0.05` is exactly `1·sigma` at `r*·tau = 12000` — i.e. at 33 shares a minute
+/// with this `tau`, which is [`REFERENCE_SPM`] — so the floor was calibrated, knowingly or not, at
+/// the reference rate. Below it the bar is a fraction of a sigma and the controller retargets on
+/// noise: at 8 shares a minute the same floor is `0.42·sigma`, which is a measured 2.5 retargets an
+/// hour on a channel that is exactly on target.
 const EWMA_TAU_SECS: u64 = 360;
 
 use super::{
